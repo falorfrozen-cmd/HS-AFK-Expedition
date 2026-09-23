@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+obj/
+obj_*/
+*.dll
+*.exe
+*.obj
+*.exp
+*.lib
+*.pdb
+*.log
+dist/
+*-plan.md
+
+# Upstream AGPL-3.0 headers (YYToolkit, Aurie, FunctionWrapper): placed by
+# tools/prepare_toolchain.py, never committed.
+plugin_build/include/
+
+# decompiler artifacts never enter the repository (hub AGENTS.md, Legal)
+*.gpr
+*.i64
+*.idb
+Export/
+
+# Local live-test backups contain complete player saves and installed binaries.
+verification/**/before-live.zip
+
+# Local release verification includes complete equipped-item snapshots.
+verification/release-*/

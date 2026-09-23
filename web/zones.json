@@ -1,0 +1,370 @@
+[
+  {
+    "room": "Act_01_01",
+    "name": "Outskirts of Inoya",
+    "act": 1,
+    "world": "old",
+    "x": 16.9,
+    "y": 69.2
+  },
+  {
+    "room": "Act_01_02",
+    "name": "Fields of Battle",
+    "act": 1,
+    "world": "old",
+    "x": 15.8,
+    "y": 62.6
+  },
+  {
+    "room": "Act_01_03",
+    "name": "The Pumpkin Patch",
+    "act": 1,
+    "world": "old",
+    "x": 10.7,
+    "y": 56.8
+  },
+  {
+    "room": "Act_01_04",
+    "name": "Woodhill Plains",
+    "act": 1,
+    "world": "old",
+    "x": 15,
+    "y": 52.3
+  },
+  {
+    "room": "Act_01_05",
+    "name": "King's Garden",
+    "act": 1,
+    "world": "old",
+    "x": 19.4,
+    "y": 46.3
+  },
+  {
+    "room": "Act_02_01",
+    "name": "Crystal Village",
+    "act": 2,
+    "world": "old",
+    "x": 15.3,
+    "y": 38.5
+  },
+  {
+    "room": "Act_02_02",
+    "name": "Chilling Lake",
+    "act": 2,
+    "world": "old",
+    "x": 4.5,
+    "y": 39.3
+  },
+  {
+    "room": "Act_02_03",
+    "name": "Arctic Tundra",
+    "act": 2,
+    "world": "old",
+    "x": 9.4,
+    "y": 35.3
+  },
+  {
+    "room": "Act_02_04",
+    "name": "Snowy Mountains",
+    "act": 2,
+    "world": "old",
+    "x": 13.9,
+    "y": 29.3
+  },
+  {
+    "room": "Act_02_05",
+    "name": "The Glacial Trail",
+    "act": 2,
+    "world": "old",
+    "x": 22.5,
+    "y": 35.5
+  },
+  {
+    "room": "Act_03_01",
+    "name": "Corrupted Oasis",
+    "act": 3,
+    "world": "old",
+    "x": 37.4,
+    "y": 33.5
+  },
+  {
+    "room": "Act_03_02",
+    "name": "Dry Hills",
+    "act": 3,
+    "world": "old",
+    "x": 36.2,
+    "y": 41.1
+  },
+  {
+    "room": "Act_03_03",
+    "name": "Mos'Arathim Desert",
+    "act": 3,
+    "world": "old",
+    "x": 31.8,
+    "y": 51.7
+  },
+  {
+    "room": "Act_03_04",
+    "name": "Pyramid Level 1",
+    "act": 3,
+    "world": "old",
+    "x": 39,
+    "y": 58
+  },
+  {
+    "room": "Act_03_05",
+    "name": "Pyramid Level 2",
+    "act": 3,
+    "world": "old",
+    "x": 41,
+    "y": 51.3
+  },
+  {
+    "room": "Act_04_01",
+    "name": "Old Mining Village",
+    "act": 4,
+    "world": "old",
+    "x": 11.7,
+    "y": 85.5
+  },
+  {
+    "room": "Act_04_02",
+    "name": "The Highland Mines",
+    "act": 4,
+    "world": "old",
+    "x": 20.6,
+    "y": 77.3
+  },
+  {
+    "room": "Act_04_03",
+    "name": "Corrupted Cave",
+    "act": 4,
+    "world": "old",
+    "x": 26.1,
+    "y": 84.6
+  },
+  {
+    "room": "Act_04_04",
+    "name": "The Nightmare",
+    "act": 4,
+    "world": "old",
+    "x": 26.7,
+    "y": 74.7
+  },
+  {
+    "room": "Act_04_05",
+    "name": "The Devil's Breach",
+    "act": 4,
+    "world": "old",
+    "x": 32.2,
+    "y": 71.4
+  },
+  {
+    "room": "Act_05_01",
+    "name": "Mt. Fuji",
+    "act": 5,
+    "world": "old",
+    "x": 39.6,
+    "y": 80.4
+  },
+  {
+    "room": "Act_05_02",
+    "name": "Misty Swamp",
+    "act": 5,
+    "world": "old",
+    "x": 47.3,
+    "y": 83
+  },
+  {
+    "room": "Act_05_03",
+    "name": "Fuji Coast",
+    "act": 5,
+    "world": "old",
+    "x": 52.4,
+    "y": 72.5
+  },
+  {
+    "room": "Act_05_04",
+    "name": "Sea of Karponia",
+    "act": 5,
+    "world": "old",
+    "x": 57.5,
+    "y": 79.6
+  },
+  {
+    "room": "Act_05_05",
+    "name": "Temple of Zamjo",
+    "act": 5,
+    "world": "old",
+    "x": 65.3,
+    "y": 85.3
+  },
+  {
+    "room": "Act_06_01",
+    "name": "Highland Graveyard",
+    "act": 6,
+    "world": "old",
+    "x": 48.5,
+    "y": 48.2
+  },
+  {
+    "room": "Act_06_02",
+    "name": "The Cathedral",
+    "act": 6,
+    "world": "old",
+    "x": 53,
+    "y": 41.8
+  },
+  {
+    "room": "Act_06_03",
+    "name": "Prison Dungeon",
+    "act": 6,
+    "world": "old",
+    "x": 51.6,
+    "y": 31.2
+  },
+  {
+    "room": "Act_06_04",
+    "name": "Steam Train",
+    "act": 6,
+    "world": "old",
+    "x": 57.5,
+    "y": 33.2
+  },
+  {
+    "room": "Act_06_05",
+    "name": "The Depths of Hell",
+    "act": 6,
+    "world": "old",
+    "x": 58.8,
+    "y": 49.2
+  },
+  {
+    "room": "Act_07_01",
+    "name": "Deep Space",
+    "act": 7,
+    "world": "old",
+    "x": 65,
+    "y": 33.8
+  },
+  {
+    "room": "Act_07_02",
+    "name": "Event Horizon",
+    "act": 7,
+    "world": "old",
+    "x": 68,
+    "y": 44.1
+  },
+  {
+    "room": "Act_07_03",
+    "name": "The Black Hole",
+    "act": 7,
+    "world": "old",
+    "x": 60.5,
+    "y": 57.3
+  },
+  {
+    "room": "Act_07_04",
+    "name": "Parallel Dimension",
+    "act": 7,
+    "world": "old",
+    "x": 65.3,
+    "y": 62
+  },
+  {
+    "room": "Act_07_05",
+    "name": "Subconscious Mind",
+    "act": 7,
+    "world": "old",
+    "x": 67.3,
+    "y": 71.3
+  },
+  {
+    "room": "Act_08_01",
+    "name": "Forest of the Slain",
+    "act": 8,
+    "world": "old",
+    "x": 79,
+    "y": 31.6
+  },
+  {
+    "room": "Act_08_02",
+    "name": "Flooded Plains",
+    "act": 8,
+    "world": "old",
+    "x": 84.2,
+    "y": 36.2
+  },
+  {
+    "room": "Act_08_03",
+    "name": "Forgotten Caves",
+    "act": 8,
+    "world": "old",
+    "x": 92,
+    "y": 43.8
+  },
+  {
+    "room": "Act_08_04",
+    "name": "Camp of Souls",
+    "act": 8,
+    "world": "old",
+    "x": 84.5,
+    "y": 54.3
+  },
+  {
+    "room": "Act_08_05",
+    "name": "Helheim",
+    "act": 8,
+    "world": "old",
+    "x": 90.5,
+    "y": 58.8
+  },
+  {
+    "room": "Act_09_01",
+    "name": "Abyss Jungle",
+    "act": 9,
+    "world": "new",
+    "x": 59.6,
+    "y": 55
+  },
+  {
+    "room": "Act_09_02",
+    "name": "Shipwreck Cove",
+    "act": 9,
+    "world": "new",
+    "x": 65.3,
+    "y": 74.5
+  },
+  {
+    "room": "Act_09_03",
+    "name": "Tormented Reef",
+    "act": 9,
+    "world": "new",
+    "x": 26.5,
+    "y": 78
+  },
+  {
+    "room": "Act_09_04",
+    "name": "Boreal Island",
+    "act": 9,
+    "world": "new",
+    "x": 19.3,
+    "y": 45
+  },
+  {
+    "room": "Act_09_05",
+    "name": "Volcanic Island",
+    "act": 9,
+    "world": "new",
+    "x": 34.9,
+    "y": 17.5
+  },
+  {
+    "room": "Act_09_06",
+    "name": "Abyss Realm",
+    "act": 9,
+    "world": "new",
+    "x": 85,
+    "y": 42
+  }
+]

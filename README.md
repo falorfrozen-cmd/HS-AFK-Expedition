@@ -1,0 +1,151 @@
+# AFK FARM · Hero Siege
+
+A Windows companion that plans timed expeditions using your offline hero’s measured
+farming pace. **0.5.1 — measured farming / beta release.** Kill rates come from your
+calibration; the game generates loot when you claim your rewards.
+
+Start from a saved eligible profile with the game closed or another hero loaded.
+The selected hero, live hero and past recording are shown separately. Changing
+the selection does not change an active expedition.
+
+Keep the recorded hero in its region while claiming. Reward delivery can take
+several minutes; Explore and Loot show its live progress. Only after delivery
+finishes are the game save and Vault transfer marked complete.
+
+## Getting started
+
+Extract the entire ZIP to a folder and open **AFK FARM.exe**.
+The local panel opens in your browser. No Python installation, pip or account is needed.
+Keep `runtime`, `app` and `hs-game-sdk` alongside the EXE; do not move the EXE alone.
+All interface text, messages and launcher dialogs are in English.
+
+The world map supports click-and-drag panning, pointer-centered wheel zoom and
+keyboard navigation. Region markers can be grabbed without accidentally selecting
+them. Use ◎ to return to the selected region.
+
+1. In **Settings**, select the `bin` folder containing `Hero_Siege.exe`.
+2. Close the game and click **Install AFK plugin**. Aurie and YYToolkit must already
+   be installed; they and the game are not included. Your previous AFK DLL is backed up.
+3. Select your offline hero at the top and click **Launch game**. Wait for the hero
+   to load in town.
+4. Enter a regular Act region. In **Calibration**, click **Start calibration**, play
+   your usual route, then click **Finish and save profile**.
+5. Save independent MF, XP, Gold and drop settings in **Modifiers**. Defaults are ×1.
+   In **Explore**, select the calibrated region and a duration from 15 minutes to
+   8 hours, then click **Start expedition**. No game connection is required to start.
+   Play another hero or close the game and panel while time continues.
+6. Return to the same region with the same hero and loadout. Click **Claim rewards**.
+   If Item Editor is offline, items wait locally. Use **Loot → Transfer to Vault**
+   when Item Editor is available again.
+
+## What calibration measures
+
+Combat, walking and idle time in the region all count. Time in town is excluded
+from the selected region. Use **Restart region** in Calibration to return through town and reopen the region.
+Loading pauses the same recording; a changed loadout still invalidates it.
+Finish recording before taking a break. At least 1 minute,
+30 kills and 95% capture coverage are required; these are minimum thresholds, not
+accuracy guarantees. Complete your normal route a few times. You do not need to
+wait for a rare item to drop, but its monster/event source must be covered.
+
+Active equipment definitions, the selected equipment set, talents, character level,
+difficulty and ForgePact combat settings are fingerprinted. Changes require a new
+calibration. Independent reward settings can change between expeditions without
+remeasuring pace. Keep settings unchanged during a recording. Game updates do not
+automatically validate older profiles. Legacy
+profiles are retained, but cannot be used by the panel until recalibrated.
+
+## Current limits
+
+- Offline mode, one local player and one regular Act region per expedition.
+- Event completion rewards, guaranteed boss drops, ForgePact kill-trigger rolls and
+  Tracker statistic transfers are not fully reproduced.
+- Temporary buffs contribute to the measured average; they are not simulated separately.
+- Completed native saves can be recovered without replay when plan, checkpoint and spool agree.
+  Uncertain partial crashes remain blocked and expose a recovery report.
+- Item transfers require Item Editor / Infinite Vault. XP/gold saves and item transfers
+  are tracked as separate stages.
+- Automatic equipped-character rendering is not available. You can associate a PNG
+  screenshot with each character; it remains visible while the game is closed.
+- Automatic character setup is tied to the verified game EXE. This package has not
+  been validated against every game version.
+- A short live calibration-to-claim test passed before 0.5.0 for Suh on the verified build, including
+  saved XP/gold after relaunch and Vault deduplication. Independent farming-rate and
+  rare-drop accuracy remain unproven; this is not validation for every hero/build.
+
+## Source development
+
+From a source checkout, run `py -3 -B tools/panel.py` with Python 3.13 (stdlib only).
+`plugin_build/build.bat` builds the DLL; `launcher/build.bat` builds the launcher.
+`py -3 -B tools/build_release.py` creates the portable package using local Python 3.13.
+Run `py -3 -B -m unittest discover -s tests -p "test_*.py"` and
+`tests/build_and_run.bat` for regression checks.
+Frontend state regressions use `node --test tests/test_panel_ui.cjs` (Node is a
+development test tool only, not a product dependency). The isolated manual browser
+fixture is `py -3 -B tests/serve_panel_fixture.py`; it serves port 9567 and writes
+its temporary directory and stop sentinel to `verification/independent-rewards-0.5.0/fixture-info.json`.
+It only permits timer start/cancel and modifier settings; it never connects to the game or real save data.
+
+See [0.5.0 verification](verification/independent-rewards-0.5.0/REPORT.md) for independent
+rewards and [0.4.1 verification](verification/offline-start-0.4.1/REPORT.md) for earlier
+offline-start, character-display and polling checks.
+
+Source documentation: [UI contract](docs/UI_CONTRACT.md), [architecture](docs/DESIGN.md),
+[handover](docs/CHATGPT_HANDOVER.md), [background game setup](docs/TEST_SESSIONS.md).
+Runtime data is stored under `%LOCALAPPDATA%/Hero_Siege/afk`.
+Previous combat research is archived outside the source tree at
+`../../AFK-Research-Archive/2026-09-21`.
+
+## Measurement quality and independent validation
+
+Calibration compares complete one-minute region-clock windows, including zero-kill
+windows. The chart shows observed variation, not a confidence interval. Ten minutes,
+200 kills, variation at most 25% and first/second-half drift at most 20% are engineering
+recommendations for a steady sample, not proof of accuracy. A variable or short
+sample is labelled explicitly. The original 3-minute / 30-kill eligibility minimum remains.
+
+Use **Record validation run** to freeze a forecast before recording a separate
+session. Finish with the recording button. Validation preserves the original
+profile and compares kills and XP against a declared 20% error target; both samples
+must reach 10 minutes / 200 kills / 95% usable packet coverage for a passing result.
+A short sample, mismatched loadout or same-session comparison cannot report a pass.
+Rare-drop probability and live gold parity are not established by this check.
+
+## Recovery, loot and setup
+
+**Recover saved claim** reconciles a completed native save and matching complete
+spool without issuing a reward command. The game need not be running. Vault transfer
+is a separate retryable step. A failure sidecar, changed plan, unsaved or partial
+checkpoint, incomplete spool or inconsistent totals blocks recovery and transfer.
+The recovery report explains the missing evidence; no automatic rollback edits saves.
+Older receipts that confirm only the controller's room-end save need review: that
+path did not reliably persist character XP. The corrected path explicitly saves
+both the character and account through native game routines.
+
+Loot shows recent expedition totals, native item cards, search, rarity and game-filter
+controls, and local favorites. Up to 500 items per expedition are previewed; the full
+spool is preserved and transferred. Native rarity labels are never guessed for unknown
+tiers. Existing Item Editor display names and PNG icons are reused with provenance
+in `web/assets/items/SOURCE.json`. Settings separately checks the game build, Aurie,
+YYToolkit and installed AFK DLL and lists the supported and unsupported mechanics.
+
+The five-step progress and live evidence are in
+[the 0.4.0 report](verification/release-0.4.0/REPORT.md).
+
+## Independent reward settings
+
+See [Independent rewards](docs/INDEPENDENT_REWARDS.md) for modifier behavior, native MF
+rounding, one-time recalibration and optional ForgePact compatibility.
+
+
+### Calibration versus an offline expedition
+
+Calibration records the hero currently being played in Hero Siege. Selecting a
+hero in AFK FARM selects a saved profile; it does not change the hero in the game.
+Use **Explore → Start expedition** with a usable profile to start the timer while
+the game is closed or another hero is loaded. The game is needed for the initial
+recording and again to generate/claim rewards.
+
+The calibration page links directly to **Open expedition planner**. Game-launch
+actions are offered only with the game closed or on a confirmed main/character
+selection menu; they do not replace a loaded character.

@@ -1,0 +1,517 @@
+"""AFK FARM local panel. Python 3.13 standard library; localhost only."""
+from __future__ import annotations
+import argparse, base64, hashlib, json, math, os, re, secrets, shutil, subprocess, sys, threading, time, uuid, webbrowser, zlib
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlsplit, unquote
+import afk
+import reward_modifiers
+import ingest_spool
+import calibration, recovery, validate_farm
+from product_data import Presentation, SUPPORT, support_warnings
+
+ROOT=Path(__file__).resolve().parents[1]
+WEB=ROOT/'web'
+CLASSES={i+1:n for i,n in enumerate(('Viking','Pyromancer','Marksman','Pirate','Nomad','Redneck','Necromancer','Samurai','Paladin','Amazon','Demon Slayer','Demonspawn','Shaman','White Mage','Marauder','Plague Doctor','Shield Lancer','Illusionist','Jotunn','Exo','Butcher','Stormweaver','Bard','Prophet'))}
+XOR=bytes.fromhex('e3953db1016bb65854383f46a17429cc454551f2a7f7abb726f137a88191e67e')
+VERSION='0.5.1'
+IDENTIFIER=re.compile(r'[A-Za-z0-9_-]{1,120}\Z')
+
+def require(ok,message):
+    if not ok: raise ValueError(message)
+
+def read(path,default=None):
+    return afk.read_json(path,default)
+
+def characters(data):
+    """Read names/classes only. The HSS codec matches the sibling Item Editor.
+    Never write, migrate or repair a save from the panel.
+    """
+    result=[]
+    for p in (data.parent/'hs2saves').glob('herosiege*.hss'):
+        m=re.fullmatch(r'herosiege(\d+)\.hss',p.name)
+        if not m or p.stat().st_size<1000: continue
+        try:
+            raw=zlib.decompress(base64.b64decode(''.join(p.read_text(encoding='utf-8').split()).replace('\0',''),validate=True))
+            txt=bytes(b^XOR[i%len(XOR)] for i,b in enumerate(raw)).decode('utf-16-le')
+            def field(name):
+                match=re.search(r'(?:^|\n)'+name+r'="?([^"\r\n]*)',txt)
+                return match.group(1) if match else ''
+            name=field('name'); cls=int(float(field('class'))); level=int(float(field('level')))
+            if name: result.append(dict(slot=int(m[1]),name=name,**{'class':cls},class_name=CLASSES.get(cls,f'Class {cls}'),level=level,identity_version=2))
+        except (OSError,ValueError,zlib.error,UnicodeError): continue
+    return sorted(result,key=lambda c:c['slot'])
+
+def valid_identity(c):
+    try: afk.character_key(c); return True
+    except SystemExit: return False
+
+def same_character(a,b):
+    return valid_identity(a) and valid_identity(b) and afk.character_key(a)==afk.character_key(b)
+
+def profile_problems(p,build=None):
+    issues=[]
+    if not valid_identity(p.get('character')): issues.append('Legacy character identity · recalibration required')
+    if not re.fullmatch(r'Act_\d{2}_\d{2}',p.get('room','')): issues.append('This activity is not supported in the initial release')
+    context=p.get('farm_context') or {}
+    if context.get('schema')!=1 or not re.fullmatch(r'[a-f0-9]{64}',context.get('hash','')): issues.append('Missing equipment and talent fingerprint')
+    if p.get('rate_basis')!='farm-clock': issues.append('Recalibrate using the current region timer')
+    if build and p.get('game_build')!=build: issues.append('Game version has changed')
+    if not (p.get('reward_baseline') or {}).get('complete'): issues.append('Record a new route with the current plugin to enable independent rewards')
+    if p.get('coverage',0)<.95: issues.append('Kill capture coverage is below 95%')
+    if (p.get('quality') or {}).get('status')=='invalid': issues.append('The recording contains an invalid context or timer')
+    if p.get('basis_seconds',0)<calibration.MIN_PROFILE_SECONDS or p.get('kills',0)<calibration.MIN_PROFILE_KILLS: issues.append('A sample of at least 1 minute and 30 kills is required')
+    if not p.get('packets'): issues.append('No reward records')
+    # These fields are native monster rank labels. Only the established ordinary
+    # replay is exposed here; boss/event packages remain research evidence.
+    if any(q.get('rank') not in (1,2,3,4) for q in p.get('packets',[]) if q.get('kind')=='kill'):
+        issues.append('The sample contains an unverified special monster packet')
+    return issues
+
+def capture_outcome(capture,stats,running,profiles):
+    """Describe a recording from JSON evidence, never from a successful CLI exit."""
+    seconds=stats.get('seconds',0);kills=stats.get('kills',0)
+    remaining_seconds=max(0,math.ceil(calibration.MIN_PROFILE_SECONDS-seconds))
+    remaining_kills=max(0,calibration.MIN_PROFILE_KILLS-kills)
+    result=dict(min_seconds=calibration.MIN_PROFILE_SECONDS,min_kills=calibration.MIN_PROFILE_KILLS,
+                remaining_seconds=remaining_seconds,remaining_kills=remaining_kills,
+                minimum_ready=not (remaining_seconds or remaining_kills))
+    def outcome(status,title,message,**extra):return dict(result,status=status,title=title,message=message,**extra)
+    if capture.get('validation_reference'):
+        return outcome('validation','Independent validation recording',
+                       'This separate check does not create or replace a farming profile. See the validation result below.')
+    if stats.get('invalid') or (stats.get('quality') or {}).get('status')=='invalid':
+        return outcome('invalid','Recording cannot be used','The loadout changed or the region timer is invalid. Start a new recording with a stable loadout.')
+    if running:
+        if result['minimum_ready']:
+            return outcome('ready','Ready to check and save','The time and kill minimums are met. Finish to check reward records and save the profile; this does not guarantee pace accuracy.')
+        return outcome('recording','Keep recording',
+                       f'{remaining_seconds} more seconds in this region and {remaining_kills} more kills are needed. Use Restart region when the map is cleared; town and loading time do not count.')
+    matching=[p for p in profiles if p.get('session')==capture.get('session') and p.get('room')==capture.get('room')
+              and same_character(p.get('character'),capture.get('character'))]
+    saved=next((p for p in matching if p.get('usable')),None)
+    if saved:
+        return outcome('saved','Calibration saved','Your profile is ready. Open this recorded region in the expedition planner to start farming.',profile_id=saved['id'])
+    if matching:
+        return outcome('rejected','Profile is not usable',' · '.join(matching[0].get('problems') or ['The saved profile did not pass eligibility checks.']))
+    if not result['minimum_ready']:
+        return outcome('insufficient','No profile saved — below the minimum',
+                       f'Recorded {seconds:.0f} of {calibration.MIN_PROFILE_SECONDS} required seconds and {kills} of {calibration.MIN_PROFILE_KILLS} required kills. '
+                       'The raw recording is preserved. Start a new recording and keep it running across region restarts until both minimums are met.')
+    if capture.get('stopped_without_profile'):
+        return outcome('unsaved','Recording stopped — no profile saved','You stopped without saving a profile. The raw recording is preserved.')
+    return outcome('unsaved','No usable profile saved',capture.get('save_error') or
+                   'The recording ended without a saved profile for this session. Open the activity log for details; the raw recording is preserved.')
+
+
+def progress_view(data,expedition):
+    failure=read(data/'sessions'/f'{expedition}.failure.json')
+    p=failure or read(data/'sessions'/f'{expedition}.progress.json') or {}
+    total=p.get('calls_total',0); done=p.get('calls_done',0)
+    p=dict(p,percent=max(0,min(100,100*done/total)) if total else 0)
+    if failure: p['reconciliation_required']=True
+    if p.get('state')=='error': p['reconciliation_required']=True
+    return p
+
+class Panel:
+    def __init__(self,data=afk.DATA):
+        self.data=Path(data); self.token=secrets.token_urlsafe(32)
+        self.lock=threading.Lock(); self.job_lock=threading.Lock(); self.state_lock=threading.Lock(); self.closed=threading.Event()
+        self.capture_lock=threading.Lock(); self.capture_cache=None
+        self.job=None; self.live=None; self.live_at=0; self.game_running=False; self.connection_error=None
+        self.editor=None; self.editor_at=0; self.last_profiles=0; self.profiles=[]; self.chars=[]
+        self.calibration=read(self.data/'panel-calibration.json',{}) or {}
+        self.presentation=Presentation(ROOT)
+        self.recovery_cache=None; self.recovery_checked_at=0
+        self.refresh_profiles()
+
+    def game_bin(self):
+        value=(read(self.data/'config.json',{}) or {}).get('game_bin','')
+        p=Path(value)
+        require(value and (p/'Hero_Siege.exe').is_file(),'Choose your Hero Siege game folder in Settings.')
+        return p
+
+    def refresh_profiles(self):
+        profiles=[]; seen=set(); build=(read(self.data/'build.json',{}) or {}).get('game_build')
+        for f in sorted((self.data/'profiles').glob('*.json')):
+            p=read(f,{})
+            if not isinstance(p,dict): continue
+            key=json.dumps([p.get('profile_id'),p.get('room'),p.get('character'),p.get('built_at')],sort_keys=True)
+            if key in seen: continue
+            seen.add(key); problems=profile_problems(p,build)
+            profiles.append(dict(p,id=f.stem,problems=problems,usable=not problems))
+        self.profiles=profiles; self.chars=characters(self.data); self.last_profiles=time.monotonic()
+
+    def monitor(self):
+        from game_session import Session,running
+        while not self.closed.wait(3):
+            if self.lock.acquire(blocking=False):
+                try:
+                    folder=self.game_bin(); pid=running(folder/'Hero_Siege.exe')
+                    self.game_running=pid is not None
+                    if pid:
+                        self.live=Session(folder,self.data).state(pid);self.live_at=time.monotonic();self.connection_error=None
+                    else: self.live=None;self.connection_error=None
+                except (Exception,SystemExit) as e:
+                    self.live=None;self.connection_error=str(e)
+                finally:self.lock.release()
+            if time.monotonic()-self.editor_at>20:
+                self.editor=ingest_spool.discover_editor(.1);self.editor_at=time.monotonic()
+
+    def current_live(self):
+        return self.live if time.monotonic()-self.live_at<15 else None
+
+    def capture_view(self):
+        capture=dict(self.calibration);path=capture.get('session')
+        if not path:return None
+        p=Path(path).resolve()
+        if not p.is_relative_to((self.data/'sessions').resolve()):return dict(error='Calibration recording not found')
+        try:stat=p.stat()
+        except OSError:return dict(error='Calibration recording not found')
+        room=capture.get('room');stamp=(str(p),room,stat.st_mtime_ns,stat.st_size)
+        # Display cache only. Saving/validation still reads and verifies the source.
+        with self.capture_lock:
+            if not self.capture_cache or self.capture_cache[0]!=stamp:
+                records=afk.read_ndjson(p)
+                ticks=[r for r in records if r.get('kind')=='farm_clock' and r.get('room')==room]
+                kills=[r for r in records if r.get('kind')=='kill' and r.get('room')==room]
+                seconds=sum(float(r.get('seconds',0)) for r in ticks)
+                stats=dict(seconds=seconds,kills=len(kills),rate=60*len(kills)/seconds if seconds else 0,
+                           quality=calibration.quality(records,room),
+                           invalid=any(r.get('kind')=='context_invalid' for r in records))
+                self.capture_cache=(stamp,stats)
+            stats=self.capture_cache[1]
+        live=self.current_live()
+        running=bool(not capture.get('stopped_at') and live and live.get('capture_on') and live.get('capture_file')==path)
+        return dict(capture,**stats,running=running,outcome=capture_outcome(capture,stats,running,self.profiles))
+
+    def snapshot(self):
+        if time.monotonic()-self.last_profiles>3:self.refresh_profiles()
+        state=read(self.data/'state.json',{}) or {}; armed=state.get('armed'); plan=None; progress={}
+        if armed:
+            plan=read(Path(armed['plan']))
+            progress=progress_view(self.data,armed['expedition_id']+'_claim')
+        rewards=[]
+        for f in sorted((self.data/'sessions').glob('*.result.json'),key=lambda p:p.stat().st_mtime,reverse=True):
+            result=read(f,{}) or {}; ident=f.name.removesuffix('.result.json')
+            plan_record=read(self.data/'plans'/f'{ident}.json',{}) or {}
+            if not plan_record.get('panel_version'):continue
+            rewards.append(dict(result,id=ident,character=plan_record.get('character'),room=(plan_record.get('zones') or [{}])[0].get('room'),
+                                save_confirmed=result.get('rewards_saved') is True and result.get('saved')=='saved (character and account save performed)',
+                                loot=self.presentation.loot(self.data,ident)))
+            if len(rewards)>=20:break
+        cfg=read(self.data/'config.json',{}) or {}
+        with self.state_lock: job=json.loads(json.dumps(self.job)) if self.job else None
+        live=self.current_live()
+        review=None
+        if armed:
+            ident=armed['expedition_id']+'_claim'
+            # Display cache only: reward/recovery actions always inspect fresh files.
+            if not self.recovery_cache or self.recovery_cache['id']!=ident or time.monotonic()-self.recovery_checked_at>2:
+                self.recovery_cache=recovery.inspect(self.data,ident);self.recovery_checked_at=time.monotonic()
+            review=self.recovery_cache
+        validations=[read(f,{}) for f in sorted((self.data/'validations').glob('*.result.json'),key=lambda p:p.stat().st_mtime,reverse=True)][:20]
+        modifier_error=None
+        try: modifiers=reward_modifiers.load(self.data/'reward-modifiers.json')
+        except ValueError as error:
+            modifiers=reward_modifiers.normalize();modifier_error=str(error)
+        return dict(version=VERSION,server_time=datetime.now(timezone.utc).isoformat(),characters=self.chars,profiles=self.profiles,
+                    live=live,game_running=self.game_running,connection_error=self.connection_error,armed=armed,plan=plan,
+                    progress=progress,last_claim=state.get('last_claim'),rewards=rewards,calibration=self.capture_view(),
+                    job=job,editor=self.editor,config=dict(game_bin=cfg.get('game_bin',''),auto_capture=cfg.get('auto_capture',False)),
+                    installation=self.installation(),recovery=review,support=SUPPORT,validations=validations,
+                    reward_modifiers=modifiers,reward_modifiers_error=modifier_error,
+                    modifier_fields=[dict(key=k,label=l,description=d) for k,l,d in reward_modifiers.FIELDS],
+                    claim_context_matches=reward_modifiers.context_matches((plan or {}).get('farm_context'),(live or {}).get('farm_context'),bool((plan or {}).get('reward_modifiers'))),
+                    support_warnings=support_warnings((live or {}).get('forgepact')),
+                    portraits={str(c['slot']):self.portrait_key(c) for c in self.chars if (self.data/'portraits'/(self.portrait_key(c)+'.png')).is_file()})
+
+    def installation(self):
+        try:
+            b=self.game_bin()
+            return self.presentation.setup(b)
+        except ValueError:return self.presentation.setup(None)
+
+    def portrait_key(self,c):
+        return hashlib.sha256(json.dumps(afk.character_key(c)).encode()).hexdigest()
+
+    def fresh(self):
+        from game_session import Session,running
+        folder=self.game_bin();pid=running(folder/'Hero_Siege.exe');require(pid,'Launch the game and load your character first.')
+        s=Session(folder,self.data).state(pid);self.live=s;self.live_at=time.monotonic();self.game_running=True
+        require(s.get('online') is False,'AFK FARM supports local / offline characters only.')
+        require(s.get('player_count')==1 and valid_identity(s.get('character')),'Your local character has not loaded.')
+        require(s.get('hook_native') is True,'Install the current AFK plugin in Settings and restart the game.')
+        require(s.get('farm_context') is not None,'Could not read the loadout. Expeditions are unavailable for this character.')
+        return s
+
+    def log(self,message):
+        with self.state_lock:self.job['output']=(self.job['output']+str(message)+'\n')[-40000:]
+
+    def cli(self,*args):
+        env=os.environ.copy();env['PYTHONIOENCODING']='utf-8';env['PYTHONDONTWRITEBYTECODE']='1'
+        flags=getattr(subprocess,'CREATE_NO_WINDOW',0)
+        process=subprocess.Popen([sys.executable,'-B','-u',str(ROOT/'tools/afk.py'),*map(str,args)],cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8',errors='replace',env=env,creationflags=flags)
+        for line in process.stdout:self.log(line.rstrip())
+        code=process.wait(); require(code==0,f'Action failed (exit code {code}). See the activity log for details.')
+
+    def submit(self,action,args):
+        require(self.job_lock.acquire(blocking=False),'Another action is in progress.')
+        with self.state_lock:self.job=dict(id=uuid.uuid4().hex,action=action,state='running',output='',error=None,started_at=time.time())
+        def run():
+            try:
+                if action in ('plan','start','cancel','recover','ingest','portrait','configure','save_modifiers'):
+                    self.action(action,args)
+                else:
+                    with self.lock:self.action(action,args)
+                with self.state_lock:self.job['state']='done'
+            except (Exception,SystemExit) as e:
+                with self.state_lock:self.job.update(state='error',error=str(e))
+            finally:
+                try:self.refresh_profiles()
+                finally:self.job_lock.release()
+        threading.Thread(target=run,daemon=True).start()
+        return {'accepted':True}
+
+    def selected(self,args):
+        slot=args.get('slot'); c=next((c for c in characters(self.data) if c['slot']==slot),None)
+        require(c is not None,'Character not found. Refresh the list.'); return c
+
+    def profile(self,args):
+        self.refresh_profiles();p=next((p for p in self.profiles if p['id']==args.get('profile')),None)
+        require(p is not None,'Calibration profile not found.');require(p['usable'],' · '.join(p['problems']))
+        require(same_character(p['character'],self.selected(args)),'This profile belongs to another character.');return p
+
+    def context_matches(self,p,s):
+        require(same_character(p['character'],s['character']),f"Load {p['character']['name']} (slot {p['character']['slot']+1}) to use this profile in the game. Currently loaded: {s['character']['name']}.")
+        require(p['game_build']==s['game_build'],'The game version changed. Recalibration is required.')
+        require(reward_modifiers.context_matches(p.get('farm_context'),s.get('farm_context'),bool(p.get('reward_modifiers'))),'Gear, talents, level or combat settings changed. Recalibration is required.')
+
+    def action(self,name,args):
+        if name=='save_modifiers':
+            settings=reward_modifiers.normalize(args.get('settings'))
+            afk.write_json(self.data/'reward-modifiers.json',settings)
+            self.log('Reward settings saved for future expeditions. Active expeditions keep their recorded settings.');return
+        if name=='configure':
+            path=Path(str(args.get('game_bin',''))).resolve();require((path/'Hero_Siege.exe').is_file(),'Select the bin folder containing Hero_Siege.exe.')
+            cfg=read(self.data/'config.json',{}) or {};cfg['game_bin']=str(path);afk.write_json(self.data/'config.json',cfg);self.log('Game folder saved.');return
+        if name=='install':
+            from game_session import running
+            b=self.game_bin();require(running(b/'Hero_Siege.exe') is None,'Close the game before installing the plugin.')
+            setup=self.installation()
+            require(setup.get('verified_build'),'This executable has not been verified for automatic setup.')
+            require(setup['aurie'] and setup['yytk'],'Aurie and YYToolkit are required. Install both components first.')
+            source=ROOT/'plugin_build/HSAfkExpeditionPlugin.dll';require(source.is_file(),'AFK plugin not found in the distribution.')
+            target=b/'mods/aurie/HSAfkExpeditionPlugin.dll'
+            if target.exists():
+                backup=self.data/'plugin-backups'/f'{int(time.time())}-HSAfkExpeditionPlugin.dll';backup.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(target,backup)
+            shutil.copy2(source,target);self.log('AFK plugin installed. The previous DLL was backed up in the data folder.');return
+        if name in ('launch','close'):
+            from game_session import Session
+            session=Session(self.game_bin(),self.data)
+            if name=='close':self.log(json.dumps(session.close()));self.live=None;self.game_running=False
+            else:
+                c=self.selected(args);result=session.prepare(c['slot'],c['name'],c['class'],120);self.log(json.dumps(result,ensure_ascii=False));self.fresh()
+            return
+        if name=='restart_region':
+            from game_session import Session,travel_target
+            s=self.fresh();c=self.selected(args)
+            require(same_character(c,s['character']),'Load the selected hero first.')
+            require(not s['replay_running'],'Wait for reward delivery to finish.')
+            match=re.fullmatch(r'Act_(\d{2})_\d{2}',s['room']);require(match,'Enter a regular Act region first.')
+            town=travel_target('Town_'+match[1]+'_rm')
+            session=Session(self.game_bin(),self.data)
+            session.travel(town,c['slot'],c['name'],c['class'],120)
+            session.travel(s['room'],c['slot'],c['name'],c['class'],120)
+            self.fresh();self.log('Region restarted through town. Equipment and skills were not changed.');return
+        if name in ('capture_start','validate_start'):
+            s=self.fresh();c=self.selected(args);require(same_character(c,s['character']),'The selected character is not loaded in the game.')
+            require(re.fullmatch(r'Act_\d{2}_\d{2}',s['room']),'Enter a regular Act region to calibrate.')
+            require(not s['replay_running'],'Calibration cannot start while rewards are being delivered.')
+            require(not s.get('capture_on'),'Finish the current recording first.')
+            require((s.get('reward_baseline') or {}).get('available'),(s.get('reward_baseline') or {}).get('error','Update the AFK plugin before calibrating.'))
+            reference=None
+            if name=='validate_start':
+                p=self.profile(args);self.context_matches(p,s)
+                require(p['room']==s['room'],'Return to the profile region first.')
+                reference=self.data/'validations'/('validation_'+uuid.uuid4().hex+'.reference.json')
+                validate_farm.freeze(p,reference)
+                time.sleep(1.05)  # Capture timestamps have one-second resolution.
+            self.cli('capture','auto','off');self.cli('capture','off');self.cli('capture','on');s=self.fresh()
+            require(s.get('capture_on') and s.get('capture_file'),'Could not start calibration. Check the activity log.')
+            self.calibration=dict(session=s['capture_file'],room=s['room'],character=s['character'],started_at=s['captured_at'])
+            if reference:self.calibration['validation_reference']=str(reference)
+            afk.write_json(self.data/'panel-calibration.json',self.calibration);return
+        if name=='capture_stop':
+            require(self.calibration.get('session'),'No calibration was started from this panel.')
+            self.cli('capture','auto','off');self.cli('capture','off')
+            self.calibration['stopped_at']=datetime.now(timezone.utc).isoformat()
+            self.calibration.pop('save_error',None)
+            self.calibration['stopped_without_profile']=args.get('save_profile') is False
+            afk.write_json(self.data/'panel-calibration.json',self.calibration)
+            if self.calibration['stopped_without_profile']:
+                self.log('Recording stopped without saving a profile. The raw recording is preserved.');return
+            try:
+                if self.calibration.get('validation_reference'):
+                    reference=Path(self.calibration['validation_reference'])
+                    result=validate_farm.evaluate(read(reference),Path(self.calibration['session']))
+                    afk.write_json(reference.with_name(reference.name.replace('.reference.json','.result.json')),result)
+                    self.log('Independent validation: '+result['status'])
+                else:
+                    self.cli('profile','build','--session',self.calibration['session'],'--room',self.calibration['room'],
+                             '--min-seconds',str(calibration.MIN_PROFILE_SECONDS),'--min-events',str(calibration.MIN_PROFILE_KILLS))
+                    self.refresh_profiles()
+                    outcome=(self.capture_view() or {}).get('outcome',{})
+                    require(outcome.get('status')=='saved',outcome.get('message','No usable calibration profile was saved.'))
+                    self.log('Calibration saved and checked: '+outcome['profile_id'])
+            except (Exception,SystemExit) as error:
+                self.calibration['save_error']=str(error)
+                afk.write_json(self.data/'panel-calibration.json',self.calibration)
+                raise
+            return
+        if name in ('plan','start'):
+            # Starting freezes a saved profile and arms a local clock. It must not
+            # require the game, another hero's context, or a responsive IPC channel.
+            p=self.profile(args)
+            require(not (read(self.data/'state.json',{}) or {}).get('armed'),'An expedition is already active.')
+            hours=float(args.get('hours',1));require(math.isfinite(hours) and .25<=hours<=8,'Duration must be between 15 minutes and 8 hours.')
+            ident='farm_'+datetime.now().strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:6]
+            plan=afk.make_plan(hours,[(p['room'],1)],ident,40,'pickup',profile_overrides={p['room']:p})
+            plan['farm_context']=p['farm_context'];plan['panel_version']=VERSION
+            reward_modifiers.apply_to_plan(plan,p,reward_modifiers.load(self.data/'reward-modifiers.json'))
+            afk.rebuild_preview(plan)
+            path=self.data/'plans'/f'{ident}.json';afk.write_json(path,plan)
+            self.cli('start',path);return
+        if name=='claim':
+            armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active expedition.')
+            plan=read(Path(armed['plan']));require(plan,'Could not read the expedition plan.')
+            review=recovery.inspect(self.data,armed['expedition_id']+'_claim')
+            if review['recoverable']:
+                with recovery.data_lock(self.data):recovery.settle(self.data,review['id'])
+                self.log('Recovered the saved claim. No rewards were replayed. Transfer queued items from Loot.');return
+            pr=progress_view(self.data,armed['expedition_id']+'_claim')
+            require(not pr.get('reconciliation_required'),'The claim has an uncertain outcome. Rewards were not repeated. The records need review.')
+            if pr.get('state') in ('running','paused'):raise ValueError('The previous claim is incomplete. It was not retried automatically.')
+            s=self.fresh();self.context_matches(plan,s)
+            require(s['room']==plan['zones'][0]['room'],'Return to the calibrated region to claim rewards: '+plan['zones'][0]['room'])
+            self.cli('claim');return
+        if name=='recover':
+            armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active claim to reconcile.')
+            with recovery.data_lock(self.data):recovery.settle(self.data,armed['expedition_id']+'_claim')
+            self.log('Saved rewards reconciled without replay. Queued items can be transferred from Loot.');return
+        if name=='cancel':
+            armed=(read(self.data/'state.json',{}) or {}).get('armed')
+            require(not armed or not progress_view(self.data,armed['expedition_id']+'_claim').get('state'),'An expedition cannot be cancelled here once delivery has started.')
+            self.cli('cancel');return
+        if name=='ingest':
+            ident=args.get('id','');require(bool(IDENTIFIER.fullmatch(ident)),'Invalid reward ID.')
+            spool=self.data/'spool'/f'{ident}.ndjson';require(spool.is_file(),'Reward file not found.')
+            review=recovery.inspect(self.data,ident);require(review['recoverable'],'Only complete, saved and consistent rewards can be transferred.')
+            with recovery.data_lock(self.data):self.cli('ingest',spool)
+            path=self.data/'sessions'/f'{ident}.result.json';result=read(path)
+            if result:
+                result.setdefault('stages',{})['ingest']='done'
+                result['success']=afk.run_succeeded(result)
+                afk.write_json(path,result)
+            return
+        if name=='portrait':
+            c=self.selected(args);raw=base64.b64decode(args.get('png',''),validate=True)
+            require(32<=len(raw)<=4*1024*1024 and raw.startswith(b'\x89PNG\r\n\x1a\n'),'Choose a PNG screenshot, up to 4 MB.')
+            import struct
+            width,height=struct.unpack('>II',raw[16:24]);require(0<width<=4096 and 0<height<=4096,'Portrait dimensions must be 4096 pixels or smaller.')
+            path=self.data/'portraits'/(self.portrait_key(c)+'.png');path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_bytes(raw);self.log('Character screenshot saved locally. It does not change the game save.');return
+        raise ValueError('Unknown action.')
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self,*args):pass
+    @property
+    def app(self):return self.server.app
+    def send(self,status,body,kind='application/json; charset=utf-8'):
+        if isinstance(body,(dict,list)):body=json.dumps(body,ensure_ascii=False,allow_nan=False).encode('utf-8')
+        elif isinstance(body,str):body=body.encode('utf-8')
+        self.send_response(status);self.send_header('Content-Type',kind);self.send_header('Content-Length',str(len(body)))
+        self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff')
+        self.send_header('Content-Security-Policy',"default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'; connect-src 'self'; frame-ancestors 'none'")
+        try:
+            self.end_headers();self.wfile.write(body)
+        except ConnectionError:
+            # Closing/reloading the browser may cancel an in-flight state poll.
+            # The response is abandoned; do not try to send a second HTTP error.
+            pass
+    def allowed(self):
+        return self.headers.get('Host') in (f'127.0.0.1:{self.server.server_port}',f'localhost:{self.server.server_port}')
+    def do_GET(self):
+        if not self.allowed():return self.send(403,{'error':'Host rejected'})
+        try:
+            route=urlsplit(self.path).path
+            if route=='/api/state':return self.send(200,self.app.snapshot())
+            if route=='/api/instance':return self.send(200,dict(application='hero-siege-afk-farm',version=VERSION))
+            if route=='/api/recovery-report':
+                from urllib.parse import parse_qs
+                ident=parse_qs(urlsplit(self.path).query).get('id',[''])[0]
+                report=recovery.inspect(self.app.data,ident)
+                report['checkpoint']=read(self.app.data/'sessions'/f'{ident}.progress.json')
+                report['failure']=read(self.app.data/'sessions'/f'{ident}.failure.json')
+                return self.send(200,report)
+            if route.startswith('/portraits/'):
+                name=route.rsplit('/',1)[-1];require(bool(re.fullmatch('[a-f0-9]{64}\\.png',name)),'Invalid portrait')
+                return self.send(200,(self.app.data/'portraits'/name).read_bytes(),'image/png')
+            if route in ('/','/index.html'):
+                return self.send(200,(WEB/'index.html').read_text(encoding='utf-8').replace('__TOKEN__',self.app.token),'text/html; charset=utf-8')
+            path=(WEB/unquote(route.lstrip('/'))).resolve()
+            require(path.is_relative_to(WEB.resolve()) and path.is_file(),'File not found')
+            kind={'.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.png':'image/png','.svg':'image/svg+xml','.json':'application/json; charset=utf-8','.woff2':'font/woff2'}.get(path.suffix,'application/octet-stream')
+            self.send(200,path.read_bytes(),kind)
+        except (OSError,ValueError) as e:self.send(404,{'error':str(e)})
+    def do_POST(self):
+        origin=self.headers.get('Origin')
+        expected=f'http://{self.headers.get("Host","")}'
+        if not self.allowed() or (origin and origin!=expected) or self.headers.get('X-AFK-Token')!=self.app.token:return self.send(403,{'error':'Request verification failed'})
+        try:
+            require(urlsplit(self.path).path=='/api/action','Unknown route')
+            size=int(self.headers.get('Content-Length','0'));require(0<size<6*1024*1024,'Invalid request size')
+            args=json.loads(self.rfile.read(size));require(isinstance(args,dict),'Invalid request')
+            self.send(202,self.app.submit(args.pop('action',''),args))
+        except (ValueError,TypeError) as e:self.send(400,{'error':str(e)})
+
+
+class LocalPanelServer(ThreadingHTTPServer):
+    # SO_REUSEADDR on Windows permits two listeners on one address. Never let
+    # an older panel compete with an update for the same localhost port.
+    allow_reuse_address=False
+    def server_bind(self):
+        import socket
+        if hasattr(socket,'SO_EXCLUSIVEADDRUSE'):
+            self.socket.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)
+        super().server_bind()
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--port',type=int,default=8787);parser.add_argument('--no-browser',action='store_true');args=parser.parse_args()
+    # Reuse this version only. An older panel must not silently hide an update.
+    import urllib.request
+    occupied=set()
+    for port in range(args.port,args.port+10):
+        try:
+            with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/instance',timeout=.15) as response:
+                occupied.add(port)
+                instance=json.load(response)
+            if instance.get('application')=='hero-siege-afk-farm' and instance.get('version')==VERSION:
+                if not args.no_browser:webbrowser.open(f'http://127.0.0.1:{port}')
+                return
+        except (OSError,ValueError):pass
+    app=Panel();server=None
+    for port in range(args.port,args.port+10):
+        if port in occupied:continue
+        try:server=LocalPanelServer(('127.0.0.1',port),Handler);break
+        except OSError:continue
+    require(server,'Could not open a local panel port.');server.app=app
+    threading.Thread(target=app.monitor,daemon=True).start();url=f'http://127.0.0.1:{server.server_port}'
+    print(url,flush=True)
+    if not args.no_browser:webbrowser.open(url)
+    try:server.serve_forever()
+    except KeyboardInterrupt:pass
+    finally:app.closed.set();server.server_close()
+
+if __name__=='__main__':main()
