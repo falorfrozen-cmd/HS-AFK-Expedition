@@ -21,9 +21,12 @@ class PanelTests(unittest.TestCase):
             with self.subTest(key=key):self.assertTrue(panel.profile_problems(p,'B'))
     def test_same_name_different_save_slots_are_distinct(self):
         c=self.good()['character'];self.assertFalse(panel.same_character(c,dict(c,slot=0)))
-    def test_unsupported_activity_and_boss_packets_are_closed(self):
-        for changes in [dict(room='Unstable_Rift_03_03'),dict(packets=[dict(kind='kill',rank=5)])]:
+    def test_unsupported_activity_and_unranked_packets_are_closed_but_a_boss_kill_is_not(self):
+        for changes in [dict(room='Unstable_Rift_03_03'),dict(packets=[dict(kind='kill')])]:
             p=self.good();p.update(changes);self.assertTrue(panel.profile_problems(p))
+        # 0.7.0: an unverified boss is left out of the plan (afk.replayable), not the whole calibration.
+        p=self.good();p['packets']=[dict(kind='kill',rank=1),dict(kind='kill',rank=5)];self.assertEqual(panel.profile_problems(p,'B'),[])
+        self.assertFalse(afk.replayable(dict(kind='kill',rank=5,hash='x'),{}));self.assertTrue(afk.replayable(dict(kind='kill',rank=5,hash='x'),{'x':{}}))
     def test_failure_overrides_done_progress(self):
         afk.write_json(self.root/'sessions/x.progress.json',dict(state='done',calls_done=100,calls_total=100))
         afk.write_json(self.root/'sessions/x.failure.json',dict(state='error',calls_done=30,calls_total=100,error='write failed'))

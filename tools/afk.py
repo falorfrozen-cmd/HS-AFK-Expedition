@@ -608,6 +608,25 @@ def rebuild_preview(plan: dict) -> None:
         seconds_to_replay=round(estimate_delivery_seconds(calls, delivery_speed(plan)), 1))
 
 
+ORDINARY_RANKS = (1, 2, 3, 4)
+
+
+def verified_specials() -> dict:
+    """Special monster packets (bosses, event monsters) that passed `afk special verify`."""
+    value = read_json(DATA / "special-packets.json", {}) or {}
+    packets = value.get("packets") if isinstance(value, dict) else None
+    return packets if isinstance(packets, dict) else {}
+
+
+def replayable(packet: dict, verified: dict | None = None) -> bool:
+    """Ordinary monsters and breakables replay; a special monster only once verified.
+    A kill without a rank (research profiles before ranks were recorded) is not
+    special here; the panel refuses such calibrations outright."""
+    if packet.get("kind") != "kill" or packet.get("rank") in ORDINARY_RANKS or packet.get("rank") is None:
+        return True
+    return packet.get("hash") in (verified if verified is not None else verified_specials())
+
+
 def make_plan(hours: float, zones: list[tuple[str, float]], exp_id: str, per_frame: int, gold: str,
               extras: list[tuple[str, float]] | None = None, *, profile_overrides: dict | None = None) -> dict:
     """extras: (packet hash prefix, kills per hour) added on top of the zone
@@ -643,13 +662,16 @@ def make_plan(hours: float, zones: list[tuple[str, float]], exp_id: str, per_fra
     rates = learned_rates(first)
     plan_zones, packets, preview_exp, preview_items = [], [], 0.0, 0.0
     total_kills = total_breaks = 0
+    verified = verified_specials()
     for room, w in zones:
         p = profs[room]
         minutes = hours * 60.0 * w / wsum
-        kills = int(round(sum(q['count'] for q in p['packets'] if q['kind'] == 'kill') * minutes * 60 / p['basis_seconds']))
+        # A special monster (boss, event monster) replays only after `afk special
+        # verify`; until then its kills are left out, never swapped for others.
+        kill_pk = [q for q in p["packets"] if q["kind"] == "kill" and replayable(q, verified)]
+        kills = int(round(sum(q['count'] for q in kill_pk) * minutes * 60 / p['basis_seconds']))
         breaks = int(round(sum(q['count'] for q in p['packets'] if q['kind'] == 'break') * minutes * 60 / p['basis_seconds']))
         room = p['room']
-        kill_pk = [q for q in p["packets"] if q["kind"] == "kill"]
         break_pk = [q for q in p["packets"] if q["kind"] == "break"]
         for group, n in ((kill_pk, kills), (break_pk, breaks)):
             counts = largest_remainder(n, [q["weight"] for q in group]) if group else []
@@ -737,6 +759,16 @@ def claim_plan_for(plan: dict, credited_h: float, claim_id: str) -> dict:
         return siege.claim_plan(plan, credited_h, claim_id)
     factor = credited_h / float(plan["hours"]) if plan.get("hours") else 0.0
     return scale_plan(plan, factor, claim_id)
+
+
+def record_siege(claim_plan: dict) -> None:
+    """A settled Siege claim updates the hero's best wave at that level and region."""
+    claim = claim_plan.get("siege_claim") if isinstance(claim_plan, dict) else None
+    if not claim:
+        return
+    import siege
+    siege.record_claim(DATA, hero_key(claim_plan.get("character")) or "?", claim_plan["zones"][0]["room"], claim)
+    print(f"siege L{claim['level']}: {claim['waves_fought']} waves" + (" - a new record for this hero and region" if claim.get("record") else ""))
 
 
 def print_preview(plan: dict) -> None:
@@ -1120,9 +1152,17 @@ def cmd_claim(args) -> None:
               f"({pr_old.get('calls_done', 0)}/{pr_old.get('calls_total', 0)} calls); following it")
     else:
         scaled = claim_plan_for(plan, credited_h, claim_id)
+        if scaled.get('siege_claim'):
+            import siege
+            claim = scaled['siege_claim']
+            claim['previous_best'] = siege.best(DATA, hero_key(plan['character']) or '?', plan['zones'][0]['room'], claim['level'])
+            claim['record'] = claim['waves_fought'] > claim['previous_best']
+            credited_h = scaled['scale'] * float(plan['hours'])
         if plan.get('label_region'):
             # An early claim delivers less than planned: name it by what it credits.
             scaled['label'] = expedition_label(plan.get('label_hero'), plan['label_region'], credited_h)
+            if scaled.get('siege_claim'):
+                scaled['label'] = f"Siege L{scaled['siege_claim']['level']} · " + scaled['label']
         apply_delivery_speed(scaled, getattr(args, 'speed', None) or 'normal')
         # Items the game's loot filter hides: sold / broken down by the plugin
         # during delivery ("convert"), or kept in the spool ("keep").
@@ -1156,6 +1196,7 @@ def cmd_claim(args) -> None:
         st = load_state()   # another hero may have started meanwhile: settle on fresh state
         settle_in_state(st, claim_id, {"expedition_id": claim_id, "credited_hours": credited_h, "at": iso(now_utc()), "result": pr})
         save_state(st)
+        record_siege(scaled)
         print("claimed. The clock is free again.")
     else:
         print("the run did not finish; the clock stays armed so you can claim again (it resumes where it stopped)")
@@ -1233,6 +1274,72 @@ def cmd_packets(args) -> None:
     for r in sorted(rows, key=lambda r: (-r[5], r[1])):
         print(f"  {r[0]}  {r[1]:28s} rank {str(r[2]):4s} {str(r[3]):14s} exp {str(r[4]):8s} seen {r[5]:5d} {r[6]}")
     print(f"{len(rows)} packets")
+
+
+def cmd_special(args) -> None:
+    """Special monsters (bosses, event monsters) captured in calibrations.
+
+    `special list` shows them; `special verify PREFIX` replays one RUNS times
+    through the game with experience and gold off and its items kept out of the
+    Vault (a statistics run, like `verify`). A packet that replays without a
+    failed call is recorded in special-packets.json and may then replay in
+    expeditions and Siege boss waves. Stand in the packet's region with any
+    offline hero (or pass --anywhere to test elsewhere; the drops then see
+    that map).
+    """
+    pidx = packet_index()
+    verified = verified_specials()
+    specials = {h: m for h, m in pidx.items() if m.get("monster_key") and m.get("rank") not in ORDINARY_RANKS}
+    if args.action == "list":
+        seen = Counter()
+        for f in SESSIONS.glob("capture_*.ndjson"):
+            for r in read_ndjson(f):
+                if r.get("kind") == "kill" and r.get("packet") in specials:
+                    seen[r["packet"]] += 1
+        for h, m in sorted(specials.items(), key=lambda kv: (kv[1].get("room") or "", kv[1].get("monster_key"))):
+            state = "VERIFIED" if h in verified else ("incomplete" if not (m.get("deep") and m.get("complete")) else "not verified")
+            print(f"  {h[:12]}  {m.get('monster_key'):28s} rank {str(m.get('rank')):4s} {str(m.get('room')):14s} seen {seen[h]:4d}  {state}")
+        print(f"{len(specials)} special monster packet(s), {sum(1 for h in specials if h in verified)} verified")
+        return
+    matches = [h for h in specials if h.startswith(args.packet or "")]
+    if len(matches) != 1:
+        sys.exit(f"special verify {args.packet}: {'no' if not matches else 'several'} special packet(s) match; see `afk.py special list`")
+    h = matches[0]
+    meta = specials[h]
+    if not meta.get("deep") or not meta.get("complete"):
+        sys.exit("that packet is incomplete or old; capture the monster again")
+    runs = int(args.runs)
+    if not 1 <= runs <= 50:
+        sys.exit("--runs must be between 1 and 50")
+    bin_dir = game_bin(args)
+    ipc = Ipc(bin_dir)
+    who = ipc.send("afk who") or []
+    stamp = next((json.loads(l[5:]) for l in who if l.startswith("who: ")), None)
+    character_key(stamp)
+    ident = f"special_{h[:12]}_{now_utc().strftime('%Y%m%d_%H%M%S')}"
+    plan = {"expedition_id": ident, "created": iso(now_utc()), "hours": 0.0, "extras": [], "rate_source": "special-verify",
+            "zones": [{"room": meta.get("room"), "weight": 1, "minutes": 0, "kills": runs, "breaks": 0}],
+            "character": stamp, "forgepact": forgepact_current(), "game_build": meta.get("build"), "coverage": 1.0,
+            "estimate_rates": {"items_per_call": {}, "gold_per_call": None}, "farm_context": None, "stats_only": True,
+            "packets": [{"hash": h, "count": runs, "monster_key": meta.get("monster_key"), "room": meta.get("room"), "kind": "kill", "exp": 0.0}],
+            "exp": False, "gold": "none", "per_frame": 1, "frame_budget_ms": 10, "preview": {}}
+    rebuild_preview(plan)
+    path = PLANS / f"{ident}.json"
+    write_json(path, plan)
+    print(f"verifying {meta.get('monster_key')} ({h[:12]}, rank {meta.get('rank')}, {meta.get('room')}): {runs} statistics runs, no XP, no gold, nothing to the Vault")
+    with recovery.data_lock(DATA):
+        pr = run_plan(path, plan, bin_dir, ingest=False, anywhere=args.anywhere, forgepact_ignore=True)
+    if not run_succeeded(pr):
+        sys.exit("verification failed: the replay did not finish cleanly; the packet stays blocked")
+    items = sum(1 for r in read_ndjson(SPOOL / f"{ident}.ndjson") if r.get("kind") == "item")
+    value = read_json(DATA / "special-packets.json", {}) or {}
+    packets = value.get("packets") if isinstance(value, dict) and isinstance(value.get("packets"), dict) else {}
+    packets[h] = {"verified_at": iso(now_utc()), "runs": runs, "calls": pr.get("calls_done"), "items": items,
+                  "monster_key": meta.get("monster_key"), "rank": meta.get("rank"), "room": meta.get("room"), "build": meta.get("build"),
+                  "anywhere": bool(args.anywhere), "plan": ident}
+    write_json(DATA / "special-packets.json", {"schema": 1, "packets": packets})
+    print(f"verified: {runs} replays, {items} item(s) built by the game (kept out of the Vault). "
+          f"{meta.get('monster_key')} now replays in expeditions of {meta.get('room')} and in Siege boss waves there.")
 
 
 def cmd_events(args) -> None:
@@ -1394,6 +1501,10 @@ def main(argv=None) -> None:
     p.set_defaults(fn=cmd_plan)
     p = sub.add_parser("packets"); p.add_argument("--room"); p.add_argument("--find", help="substring of the monster key or object")
     p.set_defaults(fn=cmd_packets)
+    p = sub.add_parser("special", help="special monsters (bosses): list, or verify one before it may replay")
+    p.add_argument("action", choices=["list", "verify"]); p.add_argument("packet", nargs="?", help="packet hash prefix (verify)")
+    p.add_argument("--runs", type=int, default=3); p.add_argument("--anywhere", action="store_true", help="replay even outside the packet's region")
+    p.set_defaults(fn=cmd_special)
 
     p = sub.add_parser("preview"); p.add_argument("plan"); p.set_defaults(fn=cmd_preview)
     p = sub.add_parser("start"); p.add_argument("plan"); p.set_defaults(fn=cmd_start)

@@ -66,10 +66,12 @@ def profile_problems(p,build=None):
     if (p.get('quality') or {}).get('status')=='invalid': issues.append('The recording contains an invalid context or timer')
     if p.get('basis_seconds',0)<calibration.MIN_PROFILE_SECONDS or p.get('kills',0)<calibration.MIN_PROFILE_KILLS: issues.append('A sample of at least 1 minute and 30 kills is required')
     if not p.get('packets'): issues.append('No reward records')
-    # These fields are native monster rank labels. Only the established ordinary
-    # replay is exposed here; boss/event packages remain research evidence.
-    if any(q.get('rank') not in (1,2,3,4) for q in p.get('packets',[]) if q.get('kind')=='kill'):
-        issues.append('The sample contains an unverified special monster packet')
+    # Native monster rank labels: a special monster (boss, event monster) never
+    # replays until `afk special verify` passed it; its kills are left out of
+    # the plan instead of closing the whole calibration (0.7.0). A kill without
+    # any rank cannot be told apart from one and still closes it.
+    if any(q.get('rank') is None for q in p.get('packets',[]) if q.get('kind')=='kill'):
+        issues.append('A recorded monster has no rank; record a new calibration')
     return issues
 
 def capture_outcome(capture,stats,running,profiles):
@@ -171,14 +173,15 @@ class Panel:
         return p
 
     def refresh_profiles(self):
-        profiles=[]; seen=set(); build=(read(self.data/'build.json',{}) or {}).get('game_build')
+        profiles=[]; seen=set(); build=(read(self.data/'build.json',{}) or {}).get('game_build'); verified=afk.verified_specials()
         for f in sorted((self.data/'profiles').glob('*.json')):
             p=read(f,{})
             if not isinstance(p,dict): continue
             key=json.dumps([p.get('profile_id'),p.get('room'),p.get('character'),p.get('built_at')],sort_keys=True)
             if key in seen: continue
             seen.add(key); problems=profile_problems(p,build)
-            profiles.append(dict(p,id=f.stem,problems=problems,usable=not problems))
+            special=sum(q.get('count',0) for q in p.get('packets',[]) if not afk.replayable(q,verified))
+            profiles.append(dict(p,id=f.stem,problems=problems,usable=not problems,special_kills=special))
         self.profiles=profiles; self.chars=characters(self.data); self.last_profiles=time.monotonic()
 
     def monitor(self):
@@ -367,7 +370,7 @@ class Panel:
                     repeat=self.repeat_view(state,armed,afk.hero_key(focus_hero) if focus_hero else None),profile_live_matches=self.live_matches(live),regions=self.regions_view(),
                     background=self.background_view(armed,progress,review,live) if armed else self.background_view(None,{},None,live),pause_note=self.pause_note,
                     expeditions=[self.roster_view(a,live) for a in afk.armed_list(state)],focus=dict(focus or {}),
-                    collection=self.collection_summary())
+                    collection=self.collection_summary(),siege_records=self.siege_records(focus_hero))
 
     def delivery_view(self,armed,plan,progress):
         """Delivery speeds with this computer's estimate for the calls due now."""
@@ -687,15 +690,26 @@ class Panel:
             require(not afk.armed_for_hero(afk.load_state(self.data/'state.json'),p['character']),
                     "This hero's expedition is already active. Claim or cancel it first; other heroes can start their own.")
             hours=float(args.get('hours',1));require(math.isfinite(hours) and .25<=hours<=8,'Duration must be between 15 minutes and 8 hours.')
-            ident='farm_'+datetime.now().strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:6]
-            plan=afk.make_plan(hours,[(p['room'],1)],ident,40,'pickup',profile_overrides={p['room']:p})
-            plan['farm_context']=p['farm_context'];plan['panel_version']=VERSION
+            mode=args.get('mode','farm');require(mode in ('farm','siege'),'Choose an expedition or a Siege.')
+            ident=mode+'_'+datetime.now().strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:6]
+            modifiers=reward_modifiers.load(self.data/'reward-modifiers.json')
             hero=(p.get('character') or {}).get('name')
-            plan.update(label=expedition_label(p['room'],hours,hero),label_hero=hero,label_region=zone_names().get(p['room'],p['room']))
-            reward_modifiers.apply_to_plan(plan,p,reward_modifiers.load(self.data/'reward-modifiers.json'))
-            afk.rebuild_preview(plan)
+            if mode=='siege':
+                import siege
+                level=args.get('siege_level')
+                plan=siege.build_plan(p,level,hours,ident,modifiers,specials=self.verified_for(p))
+                label='Siege L'+str(level)+' · '+expedition_label(p['room'],hours,hero)
+            else:
+                plan=afk.make_plan(hours,[(p['room'],1)],ident,40,'pickup',profile_overrides={p['room']:p})
+                reward_modifiers.apply_to_plan(plan,p,modifiers)
+                afk.rebuild_preview(plan)
+                label=expedition_label(p['room'],hours,hero)
+            plan['farm_context']=p['farm_context'];plan['panel_version']=VERSION
+            plan.update(label=label,label_hero=hero,label_region=zone_names().get(p['room'],p['room']))
             path=self.data/'plans'/f'{ident}.json';afk.write_json(path,plan)
-            self.cli('start',path);return
+            self.cli('start',path)
+            if mode=='siege':self.log(f"Siege L{plan['siege']['level']} started. Waves come every {plan['siege']['wave_minutes']} minutes; the report is ready when the gate falls or the time is up.")
+            return
         if name=='claim':
             armed=self.target_armed(args,self.current_live())
             plan=read(Path(armed['plan']));require(plan,'Could not read the expedition plan.')
@@ -764,12 +778,54 @@ class Panel:
             width,height=struct.unpack('>II',raw[16:24]);require(0<width<=4096 and 0<height<=4096,'Portrait dimensions must be 4096 pixels or smaller.')
             path=self.data/'portraits'/(self.portrait_key(c)+'.png');path.parent.mkdir(parents=True,exist_ok=True)
             path.write_bytes(raw);self.log('Character screenshot saved locally. It does not change the game save.');return
+        if name=='verify_special':
+            ident=args.get('hash','');require(isinstance(ident,str) and bool(re.fullmatch(r'[a-f0-9]{12,64}',ident)),'Choose a special monster to verify.')
+            s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
+            self.cli('special','verify',ident,'--runs','3');self.refresh_profiles();return
         if name=='wishlist_add':
             collection.wishlist_add(self.data,self.collection.catalog,args.get('key'))
             self.log('Added to the wishlist: '+self.collection.catalog.by_key[args['key']]['name']+'. You get a Windows notification when an expedition brings it.');return
         if name=='wishlist_remove':
             collection.wishlist_remove(self.data,args.get('key'));self.log('Removed from the wishlist.');return
         raise ValueError('Unknown action.')
+
+    def verified_for(self,p):
+        """Verified special monster packets of this calibration's region and build."""
+        verified=afk.verified_specials()
+        return [q['hash'] for q in p.get('packets',[]) if q.get('kind')=='kill' and q.get('hash') in verified
+                and verified[q['hash']].get('room')==p.get('room') and verified[q['hash']].get('build')==p.get('game_build')]
+
+    def siege_forecast(self,query):
+        """/api/siege-forecast?profile=ID&level=L&hours=H: what a Siege there usually looks like."""
+        import siege
+        from urllib.parse import parse_qs
+        values=parse_qs(query or '');ident=(values.get('profile') or [''])[0]
+        p=next((p for p in self.profiles if p['id']==ident and p['usable']),None);require(p is not None,'Choose a usable calibration.')
+        try:level=int((values.get('level') or ['0'])[0]);hours=float((values.get('hours') or ['2'])[0])
+        except ValueError:raise ValueError('Invalid Siege level or duration.')
+        require(1<=level<=siege.MAX_LEVEL and math.isfinite(hours) and .25<=hours<=afk.MAX_HOURS,'Invalid Siege level or duration.')
+        result=siege.forecast(p,level,hours,specials=self.verified_for(p))
+        hero=afk.hero_key(p['character'])
+        result.update(suggested_level=siege.suggest_level(p,hours),best_waves=siege.best(self.data,hero,p['room'],level) if hero else 0,
+                      wave_minutes=siege.WAVE_MINUTES,max_level=siege.MAX_LEVEL)
+        return result
+
+    def specials_view(self):
+        """/api/specials: special monsters met in calibrations, and whether each may replay."""
+        verified=afk.verified_specials();rows={}
+        for p in self.profiles:
+            for q in p.get('packets',[]):
+                if q.get('kind')!='kill' or q.get('rank') in afk.ORDINARY_RANKS:continue
+                row=rows.setdefault(q['hash'],dict(hash=q['hash'],monster_key=q.get('monster_key'),rank=q.get('rank'),room=p.get('room'),
+                                                   region=zone_names().get(p.get('room'),p.get('room')),kills=0,profiles=[],
+                                                   verified=q['hash'] in verified,verification=verified.get(q['hash'])))
+                row['kills']+=q.get('count',0);row['profiles'].append(p['id'])
+        return dict(specials=sorted(rows.values(),key=lambda r:(r['room'] or '',r['monster_key'] or '')))
+
+    def siege_records(self,character):
+        import siege
+        hero=afk.hero_key(character) if character else None
+        return (siege.load_records(self.data)['heroes'].get(hero) or {}) if hero else {}
 
     def collection_summary(self):
         found,_=self.collection.log(self.expedition_results())
@@ -897,6 +953,8 @@ class Handler(BaseHTTPRequestHandler):
             if route=='/api/state':return self.send(200,self.app.snapshot(focus_query(urlsplit(self.path).query)))
             if route=='/api/instance':return self.send(200,dict(application='hero-siege-afk-farm',version=VERSION))
             if route=='/api/collection':return self.send(200,self.app.collection_view())
+            if route=='/api/siege-forecast':return self.send(200,self.app.siege_forecast(urlsplit(self.path).query))
+            if route=='/api/specials':return self.send(200,self.app.specials_view())
             if route=='/api/share':
                 from urllib.parse import parse_qs
                 return self.send(200,self.app.share_summary(parse_qs(urlsplit(self.path).query).get('id',[''])[0]))

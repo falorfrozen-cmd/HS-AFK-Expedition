@@ -297,4 +297,8 @@ def settle(data, ident):
     plan=read(data/'plans'/f'{ident}.json')
     settle_in_state(state,ident,dict(expedition_id=ident,credited_hours=float(plan.get('hours',0))*float(plan.get('scale',1)),at=iso(now_utc()),result=result))
     save_state(state,data/'state.json')
+    if plan.get('siege_claim'):
+        import siege
+        from afk import hero_key
+        siege.record_claim(data,hero_key(plan.get('character')) or '?',plan['zones'][0]['room'],plan['siege_claim'])
     return result
