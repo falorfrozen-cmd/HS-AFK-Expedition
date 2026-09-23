@@ -105,9 +105,9 @@ function backgroundClaim(problem){
 }
 function loadoutChanged(p){return !!p&&data?.profile_live_matches?.[p.id]===false;}
 function loadoutNotice(p){
-  if(loadoutChanged(p))return `<div class="notice warn-notice"><strong>Your loadout changed since this calibration.</strong> ${esc(p.character?.name)} is wearing different gear, talents or combat settings than when this pace was measured. Claiming will be refused until you switch back or recalibrate.</div>`;
+  if(loadoutChanged(p))return `<div class="notice warn-notice"><strong>Your loadout changed since this calibration.</strong> ${esc(p.character?.name)} is wearing different gear, talents or combat settings than when this pace was measured. Claims still work: the calibrated pace sets the rewards. Recalibrate to measure the new loadout.</div>`;
   if(data?.profile_live_matches?.[p.id]===true)return `<p class="settings-note">${svg('check')} Your current loadout matches this calibration.</p>`;
-  return `<p class="settings-note">Keep the same gear and talents until you claim; the loadout is checked then.</p>`;
+  return `<p class="settings-note">The calibrated pace sets the rewards; a changed loadout does not block the claim.</p>`;
 }
 function repeatCard(){
   const r=data?.repeat;if(!r||data.armed)return '';
@@ -368,7 +368,7 @@ document.addEventListener('click',async event=>{
   if(a==='cancel'){const dialog=document.querySelector('#confirm');dialog.showModal();dialog.addEventListener('close',()=>{if(dialog.returnValue==='yes')action('cancel');},{once:true});return;}
   if(a==='claim'||a==='claim_background'){await action(a,{speed:chosenSpeed()});return;}
   if(a==='repeat'){const r=data.repeat;if(!r)return;selected=r.slot;room=r.room;hours=r.hours;world=zone().world;localStorage.setItem('afk-slot',selected);localStorage.setItem('afk-room',room);signature='';render();centerMap();if(profile()&&!loadoutChanged(profile()))await action('start');return;}
-  if(a==='start'&&loadoutChanged(profile())&&!confirm('Your hero is wearing a different loadout than this calibration. Claiming will be refused until you switch back or recalibrate. Start anyway?'))return;
+  if(a==='start'&&loadoutChanged(profile())&&!confirm('Your hero is wearing a different loadout than this calibration. The expedition still uses the calibrated pace. Start anyway?'))return;
   if(a)await action(a);
 });
 document.addEventListener('change',event=>{

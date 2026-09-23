@@ -1,4 +1,4 @@
-# AFK FARM 0.6.3 beta
+# AFK FARM 0.6.4 beta
 
 Timed offline expeditions using your hero's measured farming pace and the game's
 native reward system. Windows only. The interface is entirely in English.
@@ -60,8 +60,9 @@ expedition time is complete and when delivery finishes. The panel page must be
 open; the tab title shows the delivery progress.
 
 **Farm again** in Explore starts the last settled expedition again with one
-click. The planner warns before starting when the loaded hero's gear, talents or
-combat settings differ from the calibration, because the claim would be refused.
+click. The planner asks before starting when the loaded hero's gear, talents or
+combat settings differ from the calibration: the claim is not blocked, but the
+rewards still follow the calibrated pace.
 
 ## Exploring the map
 
