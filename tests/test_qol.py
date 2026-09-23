@@ -7,6 +7,8 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+import os
+os.environ['AFK_NOTIFY_DISABLED'] = '1'   # tests never schedule real Windows tasks or toasts
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
 import afk,ingest_spool,loot_filter,panel,product_data,recovery
 

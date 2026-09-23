@@ -150,7 +150,7 @@ def sync_all(data, entries, enabled, now=None, run=subprocess.run):
     Scheduler refused a key. A refused request is not retried for the same key
     and time. The single 0.6.x task is removed once.
     """
-    if os.name != 'nt':
+    if os.name != 'nt' or (run is subprocess.run and os.environ.get('AFK_NOTIFY_DISABLED')):
         return {}
     data = Path(data)
     path = data / RECORD
@@ -200,7 +200,7 @@ def sync(data, armed, enabled, plan=None, now=None, run=subprocess.run):
 
 def toast(data, title, message, run=subprocess.Popen):
     """Show one notification now (no task). Returns False where Windows has no toasts."""
-    if os.name != 'nt':
+    if os.name != 'nt' or (run is subprocess.Popen and os.environ.get('AFK_NOTIFY_DISABLED')):
         return False
     data = Path(data)
     script = data / SCRIPT

@@ -6,6 +6,8 @@ Spool files are synthetic records shaped like the plugin's; the real catalog
 import json, sys, tempfile, threading, unittest, urllib.error, urllib.request
 from pathlib import Path
 from unittest.mock import patch
+import os
+os.environ['AFK_NOTIFY_DISABLED'] = '1'   # tests never schedule real Windows tasks or toasts
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import afk, collection, panel
 

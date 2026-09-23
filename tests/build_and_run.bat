@@ -33,4 +33,8 @@ cl /nologo /std:c++20 /EHsc /W4 /permissive- /I "%~dp0..\plugin\include" /I "%~d
 if errorlevel 1 exit /b 1
 obj\rewards_smoke.exe
 if errorlevel 1 exit /b 1
+cl /nologo /std:c++20 /EHsc /W4 /permissive- /I "%~dp0..\plugin\include" cpp\worker_smoke.cpp /Fe:obj\worker_smoke.exe /Fo:obj\
+if errorlevel 1 exit /b 1
+obj\worker_smoke.exe
+if errorlevel 1 exit /b 1
 exit /b 0

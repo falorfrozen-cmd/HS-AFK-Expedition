@@ -12,6 +12,7 @@ import loot_filter
 import notify
 import calibration, recovery, validate_farm
 import collection
+import workers
 from product_data import Presentation, SUPPORT, support_warnings
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -224,9 +225,6 @@ class Panel:
             return notify.entry('exp-'+armed['expedition_id'],ends,title,message)
         return notify.expedition_entry(armed,plan)
 
-    def worker_entries(self):
-        return []
-
     def notification_view(self,armed):
         """The setting's state for the focus expedition, plus every scheduled task."""
         n=self.notification or {}
@@ -370,7 +368,7 @@ class Panel:
                     repeat=self.repeat_view(state,armed,afk.hero_key(focus_hero) if focus_hero else None),profile_live_matches=self.live_matches(live),regions=self.regions_view(),
                     background=self.background_view(armed,progress,review,live) if armed else self.background_view(None,{},None,live),pause_note=self.pause_note,
                     expeditions=[self.roster_view(a,live) for a in afk.armed_list(state)],focus=dict(focus or {}),
-                    collection=self.collection_summary(),siege_records=self.siege_records(focus_hero))
+                    collection=self.collection_summary(),siege_records=self.siege_records(focus_hero),workers=self.workers_view())
 
     def delivery_view(self,armed,plan,progress):
         """Delivery speeds with this computer's estimate for the calls due now."""
@@ -548,7 +546,7 @@ class Panel:
         def run():
             try:
                 if action in ('plan','start','cancel','recover','ingest','portrait','configure','save_modifiers','save_loot_filter','save_preferences','settle_partial','accept_position',
-                              'wishlist_add','wishlist_remove'):
+                              'wishlist_add','wishlist_remove','worker_learn','worker_rename','worker_start','worker_cancel','worker_transfer','worker_settle_partial'):
                     self.action(action,args)
                 else:
                     with self.lock:self.action(action,args)
@@ -778,6 +776,7 @@ class Panel:
             width,height=struct.unpack('>II',raw[16:24]);require(0<width<=4096 and 0<height<=4096,'Portrait dimensions must be 4096 pixels or smaller.')
             path=self.data/'portraits'/(self.portrait_key(c)+'.png');path.parent.mkdir(parents=True,exist_ok=True)
             path.write_bytes(raw);self.log('Character screenshot saved locally. It does not change the game save.');return
+        if name.startswith('worker_'):return self.worker_action(name,args)
         if name=='verify_special':
             ident=args.get('hash','');require(isinstance(ident,str) and bool(re.fullmatch(r'[a-f0-9]{12,64}',ident)),'Choose a special monster to verify.')
             s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
@@ -826,6 +825,169 @@ class Panel:
         import siege
         hero=afk.hero_key(character) if character else None
         return (siege.load_records(self.data)['heroes'].get(hero) or {}) if hero else {}
+
+    # ------------------------------------------------------------ workers
+    def workers_view(self):
+        """The crew in /api/state: levels, points and trips (details: /api/workers)."""
+        state=workers.load(self.data)
+        crew=[]
+        for w in state['workers']:
+            v=workers.view(w)
+            crew.append(dict((k,v[k]) for k in ('id','name','type','level','xp_into_level','xp_for_next','points','max_trip_hours','trip')))
+        return dict(crew=crew,hire_price=workers.hire_price(state),max_workers=workers.MAX_WORKERS,
+                    pending_payments=[dict(request_id=k,**{x:v.get(x) for x in ('purpose','amount','state','error')})
+                                      for k,v in state.get('payments',{}).items() if v.get('state') in ('pending','refused')][-5:])
+
+    def workers_overview(self):
+        return workers.overview(workers.load(self.data))
+
+    def worker_entries(self):
+        entries=[]
+        for w in workers.load(self.data)['workers']:
+            trip=workers.trip_view(w)
+            if trip and not trip['ready']:
+                entries.append(notify.entry('worker-'+w['id'],afk.parse_iso(trip['ready_at']),'AFK FARM: haul ready',
+                               f"{w['name']} is back from the mine with {trip['ore_name']}. Open AFK FARM and collect it with any offline hero loaded."))
+        return entries
+
+    def worker_pay(self,purpose,amount,extra=None):
+        """Take ``amount`` gold from the loaded hero through the game's purchase path; returns the receipt."""
+        s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
+        state=workers.load(self.data);request=uuid.uuid4().hex
+        state['payments'][request]=dict(purpose=purpose,amount=amount,state='pending',at=datetime.now(timezone.utc).isoformat(),
+                                        character=s['character'],**(extra or {}))
+        workers.save(self.data,state)
+        self.log(f"Paying {amount:,} gold from {s['character']['name']} in the game...")
+        afk.Ipc(self.game_bin()).send(f'afk worker pay {request} {int(amount)}',timeout=60)
+        receipt=read(self.data/'models'/f'worker-pay-{request}.json',{}) or {}
+        state=workers.load(self.data);entry=state['payments'].get(request,{})
+        entry.update(state='paid' if receipt.get('ok') is True else 'refused',error=receipt.get('error') or (None if receipt else 'no receipt from the game'),
+                     receipt=receipt or None)
+        state['payments'][request]=entry;workers.save(self.data,state)
+        require(receipt.get('ok') is True,'The game did not take the gold: '+(receipt.get('error') or 'no receipt came back')+'. Nothing was bought.')
+        self.log(f"Paid {amount:,} gold ({receipt.get('gold_before'):,.0f} -> {receipt.get('gold_after'):,.0f}); the game saved.")
+        return request,receipt
+
+    def collect_worker(self,worker_id):
+        """Deliver one worker's haul through the game, then send it to the Vault."""
+        state=workers.load(self.data);w=workers.find(state,worker_id);trip=w.get('trip')
+        require(trip,f"{w['name']} is not on a trip.")
+        if trip.get('delivery'):
+            path=Path(trip['delivery']['plan']);plan=read(path,{}) or {}
+            require(plan.get('delivery_id')==trip['delivery']['delivery_id'],'The planned haul is missing; it was not made again.')
+        else:
+            view=workers.trip_view(w);plan=workers.delivery_plan(w,trip,view['credited_work_hours'])
+            require(plan['items'] or plan['prospect'],f"{w['name']} has not mined anything yet.")
+            path=self.data/'plans'/f"{plan['delivery_id']}.json";afk.write_json(path,plan)
+            trip['delivery']=dict(delivery_id=plan['delivery_id'],plan=str(path),planned_at=plan['planned_at'])
+            workers.save(self.data,state)
+        ident=plan['delivery_id'];result_path=self.data/'sessions'/f'{ident}.result.json'
+        if not result_path.exists():
+            s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
+            self.log(f"Delivering {w['name']}'s haul through the game...")
+            reply=afk.Ipc(self.game_bin()).send(f'afk worker deliver {path}',timeout=120) or []
+            for line in reply:self.log(line)
+        result=read(result_path,{}) or {}
+        if not result:
+            require(not (self.data/'spool'/f'{ident}.ndjson').exists(),
+                    'An earlier attempt stopped without a result. What it made stays in its records; close the haul as partial to keep it.')
+            raise ValueError('The game gave no result for the haul. Keep an offline hero loaded and collect again; nothing was made.')
+        require(result.get('state')=='done',f"The haul stopped part way ({result.get('error') or 'no reason given'}). What was made stays in its records; "
+                'nothing is made twice. Close the haul as partial to keep that part.')
+        state=workers.load(self.data)
+        applied=workers.apply_delivery(state,worker_id,plan,result);workers.save(self.data,state)
+        w=applied['worker']
+        self.log(f"{w['name']}: +{plan['xp']:,} XP" + (f", now level {w['level']}" if applied['levels'] else '') + f"; {plan['ore_total']:,} ore mined.")
+        self.transfer_worker_haul(ident,w['name'])
+        return applied
+
+    def transfer_worker_haul(self,ident,name=None):
+        """Send a delivered haul to the Vault (AFK Materials); retry later if the editor is closed."""
+        spool=self.data/'spool'/f'{ident}.ndjson'
+        if not spool.is_file():return False
+        label='AFK · Workers · '+(name or 'Miner')+' · '+datetime.now().strftime('%Y-%m-%d')
+        try:
+            with recovery.data_lock(self.data):self.cli('ingest',spool,'--label',label)
+            ok=True
+        except ValueError as error:
+            self.log(f'The haul waits for the Vault: {error}');ok=False
+        path=self.data/'sessions'/f'{ident}.result.json';result=read(path,{}) or {}
+        result['ingest']='done' if ok else 'pending';afk.write_json(path,result)
+        return ok
+
+    def settle_worker_partial(self,worker_id):
+        """Keep what a stopped delivery made, give up the rest; nothing is made again."""
+        state=workers.load(self.data);w=workers.find(state,worker_id);trip=w.get('trip')
+        require(trip and trip.get('delivery'),f"{w['name']} has no stopped haul to close.")
+        plan=read(Path(trip['delivery']['plan']),{}) or {};ident=plan.get('delivery_id') or trip['delivery']['delivery_id']
+        path=self.data/'sessions'/f'{ident}.result.json';result=read(path,{}) or {}
+        require(result.get('state')!='done','This haul was delivered; collect it instead.')
+        made={}
+        spool=self.data/'spool'/f'{ident}.ndjson'
+        for row in (afk.read_ndjson(spool) if spool.exists() else []):
+            item=row.get('item') or {}
+            if row.get('kind')!='item' or not isinstance(item,dict):continue
+            d=item.get('itemDefinitionStruct') or {}
+            key=f"{int(item.get('itemType',-1))}:{int(d.get('b',-1))}";made[key]=made.get(key,0)+int(d.get('o',1) or 1)
+        asked=sum(i['amount'] for i in plan.get('items',[]))+sum((plan.get('prospect') or {}).values())
+        share=min(1.0,sum(made.values())/asked) if asked else 0.0
+        kept=dict(plan,xp=int(plan.get('xp',0)*share),ore_total=int(plan.get('ore_total',0)*share),digs=int(plan.get('digs',0)*share),prospect={})
+        result=dict(result,delivery_id=ident,state='partial',partial=True,created=made,settled_by='player',
+                    settled_at=datetime.now(timezone.utc).isoformat())
+        afk.write_json(path,result)
+        workers.apply_delivery(state,worker_id,kept,result);workers.save(self.data,state)
+        self.log(f"{w['name']}'s haul closed as partial: {sum(made.values()):,} of {asked:,} units were made and kept.")
+        if made:self.transfer_worker_haul(ident,w['name'])
+
+    def collect_ready_workers(self):
+        """After a claim, with the game still open: deliver every finished trip."""
+        for w in workers.load(self.data)['workers']:
+            trip=workers.trip_view(w)
+            if trip and trip['ready']:
+                try:self.collect_worker(w['id'])
+                except (Exception,SystemExit) as error:self.log(f"{w['name']}'s haul was not collected: {error}")
+
+    def worker_action(self,name,args):
+        state=workers.load(self.data)
+        if name=='worker_hire':
+            price=workers.hire_price(state);require(price,f'Your crew is full ({workers.MAX_WORKERS} workers).')
+            wanted=str(args.get('name') or '').strip() or None
+            if wanted:require(bool(workers.NAME.fullmatch(wanted)),'Names use letters, digits, spaces, apostrophes and hyphens (up to 24).')
+            request,receipt=self.worker_pay('hire',price,dict(name=wanted))
+            state=workers.load(self.data)
+            w=workers.new_worker(state,wanted,payment=dict(request_id=request,amount=price,at=receipt.get('at'),character=receipt.get('character')))
+            workers.save(self.data,state);self.log(f"{w['name']} joined your crew. Send them on a trip from the Workers page.");return
+        if name=='worker_respec':
+            w=workers.find(state,args.get('worker'));require(workers.spent(w),f"{w['name']} has no skill points to reset.")
+            price=workers.respec_price(w)
+            self.worker_pay('respec',price,dict(worker=w['id']))
+            state=workers.load(self.data);workers.respec(workers.find(state,w['id']));workers.save(self.data,state)
+            self.log(f"{w['name']}'s skills were reset; every point can be spent again.");return
+        if name=='worker_learn':
+            w=workers.learn(state,args.get('worker'),args.get('skill'));workers.save(self.data,state)
+            self.log(f"{w['name']} learned {workers.NODES[args['skill']]['name']} (rank {workers.ranks(w,args['skill'])}).");return
+        if name=='worker_rename':
+            w=workers.rename(state,args.get('worker'),args.get('name'));workers.save(self.data,state);self.log(f"Renamed to {w['name']}.");return
+        if name=='worker_start':
+            trip=workers.start_trip(state,args.get('worker'),args.get('ore'),args.get('hours',1));workers.save(self.data,state)
+            w=workers.find(state,args.get('worker'))
+            self.log(f"{w['name']} went mining {workers.ORE_BY_ID[trip['ore']]['name']} for {trip['work_hours']:g} h of work (back in {trip['real_hours']:.2f} h).")
+            threading.Thread(target=self.sync_notification,daemon=True).start();return
+        if name=='worker_cancel':
+            workers.cancel_trip(state,args.get('worker'));workers.save(self.data,state);self.log('Trip cancelled; nothing was mined.')
+            threading.Thread(target=self.sync_notification,daemon=True).start();return
+        if name=='worker_collect':
+            targets=[args['worker']] if args.get('worker') else [w['id'] for w in state['workers'] if (workers.trip_view(w) or {}).get('ready')]
+            require(targets,'No haul is ready yet.')
+            for ident in targets:self.collect_worker(ident)
+            threading.Thread(target=self.sync_notification,daemon=True).start();return
+        if name=='worker_settle_partial':
+            self.settle_worker_partial(args.get('worker'));return
+        if name=='worker_transfer':
+            ident=str(args.get('delivery',''));require(bool(IDENTIFIER.fullmatch(ident)) and ident.startswith('worker_'),'Invalid haul.')
+            result=read(self.data/'sessions'/f'{ident}.result.json',{}) or {};require(result.get('state') in ('done','partial'),'Only a delivered haul can be transferred.')
+            require(self.transfer_worker_haul(ident),'The Vault transfer did not complete. Open Item Editor and try again.');return
+        raise ValueError('Unknown action.')
 
     def collection_summary(self):
         found,_=self.collection.log(self.expedition_results())
@@ -879,7 +1041,9 @@ class Panel:
             hero=next((c for c in characters(self.data) if valid_identity(ch) and same_character(c,ch)),None)
             afk.write_json(sidecar,dict(level_before=hero.get('level') if hero else None,speed=speed,at=datetime.now(timezone.utc).isoformat()))
         try:self.cli('claim','--expedition',armed['expedition_id'],'--speed',speed,'--filtered',load_preferences(self.data)['filtered_items'])
-        finally:self.announce_wishlist(ident)
+        finally:
+            self.announce_wishlist(ident)
+            self.collect_ready_workers()
 
     def claim_background(self,args):
         """Open the game minimized, load the hero in its region, deliver at Maximum speed, close the game.
@@ -955,6 +1119,7 @@ class Handler(BaseHTTPRequestHandler):
             if route=='/api/collection':return self.send(200,self.app.collection_view())
             if route=='/api/siege-forecast':return self.send(200,self.app.siege_forecast(urlsplit(self.path).query))
             if route=='/api/specials':return self.send(200,self.app.specials_view())
+            if route=='/api/workers':return self.send(200,self.app.workers_overview())
             if route=='/api/share':
                 from urllib.parse import parse_qs
                 return self.send(200,self.app.share_summary(parse_qs(urlsplit(self.path).query).get('id',[''])[0]))
