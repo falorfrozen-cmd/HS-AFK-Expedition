@@ -112,3 +112,60 @@ test('native errors and orphaned progress retain recovery warnings',()=>{
  assert.match(f.run('explore()'),/Reward delivery needs review/);assert.doesNotMatch(f.run('expeditionPanel()'),/Return early|Load Suh.*to claim/);
  assert.equal(f.run('deliveryCard()'),'');
 });
+
+const speeds=[{id:'normal',label:'Normal',calls_per_second:50,seconds:1200},{id:'fast',label:'Fast',calls_per_second:80,seconds:750},{id:'max',label:'Maximum',calls_per_second:100,seconds:600}];
+function armedHere(){
+ const f=fixture();f.data.live={character:hero,room:'Act_03_03',game_build:'B',farm_context:{hash:'a'}};f.data.armed={expedition_id:'farm',hours:2,started_at:new Date(Date.now()-3*3600e3).toISOString()};
+ f.data.plan={character:hero,zones:[{room:'Act_03_03'}],game_build:'B',farm_context:{hash:'a'}};f.data.progress={};f.data.delivery={calls:60000,speeds,active_speed:'normal'};
+ f.data.preferences={delivery_speed:'fast'};f.data.background={available:true};f.data.recovery={status:'not_started'};f.set(f.data);return f;
+}
+test('claim offers a delivery speed with this computer’s time estimate and a background claim',()=>{
+ const f=armedHere();const html=f.run('expeditionPanel()');
+ assert.match(html,/id="delivery-speed"/);assert.match(html,/value="fast" selected>Fast · about 13 min/);assert.match(html,/Maximum · about 10 min/);
+ assert.match(html,/data-action="claim" >|data-action="claim">/);assert.match(html,/Claim in background/);assert.match(html,/closes the game again/);
+ f.data.background={available:false,reason:'Another hero is loaded. Return to the main menu or close the game first.'};f.set(f.data);
+ assert.match(f.run('expeditionPanel()'),/data-action="claim_background" disabled/);assert.match(f.run('expeditionPanel()'),/Another hero is loaded/);
+});
+test('a saved pause continues instead of asking for review, keeping its original speed',()=>{
+ const f=armedHere();f.data.progress={expedition_id:'farm_claim',state:'aborted',resumable:true,calls_done:400,calls_total:1000,percent:40};f.data.delivery.active_speed='max';
+ f.data.recovery={status:'paused',resumable:true,recoverable:false,reasons:['Delivery was paused at a saved position.']};f.set(f.data);
+ const html=f.run('expeditionPanel()');
+ assert.match(html,/Delivery paused safely/);assert.match(html,/400 of 1,000 reward calls/);assert.match(html,/Continue delivery/);
+ assert.match(html,/Maximum \(kept from the paused delivery\)/);assert.doesNotMatch(html,/uncertain outcome|Review required/);
+ assert.equal(f.run('deliveryNeedsReview()'),false);
+});
+test('an active delivery shows time left and a pause button',()=>{
+ const f=delivering();f.data.delivery={speeds,active_speed:'normal'};f.data.progress.calls_total=55000;f.set(f.data);
+ const card=f.run('deliveryCard()');assert.match(card,/id="delivery-eta">about 18 min \(estimate\)/);assert.match(card,/data-action="pause_delivery" >|data-action="pause_delivery">/);
+ assert.match(card,/Closing the game window pauses and saves it/);
+ f.run('etaSamples.push({at:Date.now()-10000,done:0},{at:Date.now(),done:1000})');assert.equal(f.run('deliveryEtaText()'),'about 9 min');
+ f.data.progress.state='paused';f.set(f.data);assert.equal(f.run('deliveryEtaText()'),'Paused');
+});
+test('a claim that needs review can be closed as a partial delivery after a confirmation, then transferred',()=>{
+ const f=delivering();f.data.job=null;f.data.recovery={id:'farm_claim',status:'needs_review',recoverable:false,reasons:['Native delivery has no completed checkpoint.'],calls_done:80223,calls_total:102006};f.set(f.data);
+ const listeners={};f.context.document.addEventListener=(type,fn)=>{listeners[type]=fn;};
+ let inserted='';f.elements.set('.workspace',{querySelector:()=>({insertAdjacentHTML:(_,html)=>{inserted+=html;}})});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../web/extras.js'),'utf8'),f.context);
+ const panel=f.run('expeditionPanel()');
+ assert.match(panel,/uncertain outcome at 80,223 of 102,006 reward calls/);assert.match(panel,/data-settle-partial >|data-settle-partial>/);
+ assert.match(panel,/gives up the remaining 21,783 reward calls/);assert.match(panel,/recovery-report\?id=farm_claim/);assert.doesNotMatch(panel,/Review required|data-action="claim"/);
+ f.run('view="explore";extrasPanel()');
+ assert.match(inserted,/This claim needs review/);assert.match(inserted,/in the expedition panel above/);assert.doesNotMatch(inserted,/data-settle-partial/,'the action is not repeated below');
+ const calls=[];f.context.recorded=calls;f.run('action=(name,args)=>{recorded.push(name);return Promise.resolve();}');
+ let asked='';const button={disabled:false,dataset:{},hasAttribute:n=>n==='data-settle-partial'};
+ f.context.confirm=m=>{asked=m;return false;};listeners.click({target:{closest:()=>button}});
+ assert.match(asked,/remaining 21,783 are given up/);assert.deepEqual(calls,[]);
+ f.context.confirm=()=>true;listeners.click({target:{closest:()=>button}});assert.deepEqual(calls,['settle_partial']);
+ f.run('pending=true');assert.match(f.run('expeditionPanel()'),/data-settle-partial disabled/);f.run('pending=false');
+ f.data.recovery={status:'saved',recoverable:true,reasons:[]};f.set(f.data);assert.doesNotMatch(f.run('expeditionPanel()'),/data-settle-partial/);
+ f.data.job=null;f.data.editor='http://127.0.0.1:8791';f.data.rewards=[{id:'farm_claim',state:'partial',partial:true,save_confirmed:false,items:5,gold:0,stages:{ingest:'pending'}}];f.set(f.data);
+ const chest=f.run('loot()');assert.match(chest,/<span class="badge ">Partial<\/span>/);assert.match(chest,/data-ingest="farm_claim" >Transfer to Vault/);assert.doesNotMatch(chest,/Review save receipt/);
+});
+test('farm again restarts the last settled expedition and the planner warns about a changed loadout',()=>{
+ const f=fixture();const p={id:'suh',room:'Act_03_03',character:hero,usable:true,kills_per_min:20,basis_seconds:240,coverage:1,problems:[]};f.data.profiles=[p];
+ f.data.repeat={room:'Act_03_03',hours:2,slot:2,name:'Suh',profile:'suh'};f.set(f.data);f.run('selected=2;room="Act_03_03"');
+ let html=f.run('explore()');assert.match(html,/FARM AGAIN/);assert.match(html,/Desert · 2 h/);assert.match(html,/data-action="repeat"/);
+ f.data.profile_live_matches={suh:false};f.set(f.data);html=f.run('explore()');assert.match(html,/Your loadout changed since this calibration/);assert.equal(f.run('loadoutChanged(profile())'),true);
+ f.data.profile_live_matches={suh:true};f.set(f.data);assert.match(f.run('explore()'),/Your current loadout matches this calibration/);
+ f.data.repeat={room:'Act_03_03',hours:2,slot:2,name:'Suh',profile:null,reason:'Recalibrate first.'};f.set(f.data);assert.doesNotMatch(f.run('explore()'),/data-action="repeat"/);
+});

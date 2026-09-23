@@ -27,3 +27,6 @@ verification/**/before-live.zip
 
 # Local release verification includes complete equipped-item snapshots.
 verification/release-*/
+
+# Vault database copies kept as evidence hold the player's items and saves.
+verification/**/*.sqlite3

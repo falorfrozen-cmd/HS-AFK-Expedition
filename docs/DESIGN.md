@@ -1,4 +1,4 @@
-# AFK FARM 0.5.0 — measured-kill product
+# AFK FARM 0.6.0 — measured-kill product
 
 The earlier combat-reconstruction project is archived outside the active tree.
 The product uses empirical kills per region-second and native reward replay.
@@ -97,3 +97,46 @@ to pass. It does not establish rare-drop or event-reward parity.
 
 See [Independent rewards](INDEPENDENT_REWARDS.md) for modifier behavior, native MF
 rounding, one-time recalibration and optional ForgePact compatibility.
+
+## Delivery speed, pause and Vault transfer (0.6)
+
+Measured before the change (2026-09-23, Suh, Act_02_05, plugin 0.5): a 2 h claim
+of 102,006 calls delivered about 53 calls per second at the 10 ms frame budget,
+stopped at 78.6% when the game window was closed, and its 4,547 Vault records took
+16 minutes to ingest. The 0.5 preview claimed 42.5 s for the same claim.
+
+Replay: the first replay of a packet prepares each restored variable's name and
+converted value, the protected values and the call arguments; arrays and ds
+markers stay per-call values, so every ghost still gets fresh ones. Asset and
+object names are resolved once per session. `variable_instance_set` is called
+through the runner routine YYToolkit resolves by name. The spool is one buffered
+stream flushed after every replay frame and before every checkpoint; claims no
+longer copy each item into the last calibration capture. A running checkpoint is
+rewritten at most every 250 ms (pauses and endings at once). `progress.perf`
+reports milliseconds per replay stage, so the next live claim shows where time goes.
+
+Delivery speed maps to calls per frame and frame budget: Normal 40 / 10 ms, Fast
+200 / 30 ms, Maximum 1000 / 80 ms. Estimates use `delivery-rate.json` (smoothed
+from finished claims; defaults 50/80/100 calls per second).
+
+Pause: `afk expedition abort` saves (character and account) and writes an
+"aborted" checkpoint. Leaving the region while the expedition hero is still loaded
+saves, writes a partial spool summary and a "paused" checkpoint with the save
+receipt, and resumes by itself on return. A close request for the game window
+(WM_CLOSE or SC_CLOSE) during delivery is held for one frame, the delivery is
+stopped like Pause, and the same request is posted again; a repeated request passes
+at once. `CanResume` accepts "aborted" and saved "paused" checkpoints for the same
+plan. A crash, a close without the expedition hero, or any unsaved checkpoint
+still requires review. None of this suspends the game's own loop.
+
+Vault transfer: `loot-filter.json` keeps back gear of unticked rarities and, if
+chosen, keys and materials; records stay in the spool, so Transfer again adds them
+later. Records go best rarity first in 500-record batches with `layout: defer`,
+then one `finalize` request lays the expedition out once. The Item Editor stores
+each batch in one SQLite transaction, one backup per batch. Older editors ignore
+the new fields and lay out per batch.
+
+Claim in background uses the verified automatic setup (`game_session`): minimized
+launch, the game's own menu and travel routines, a Maximum-speed claim, and a
+normal window close only when the action started the game and delivery finished
+or paused safely.

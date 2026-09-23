@@ -153,16 +153,35 @@ static std::string KindName(const RValue& v)
 
 static bool IsNumberKind(const RValue& v) { return v.m_Kind == VALUE_REAL || v.m_Kind == VALUE_INT32 || v.m_Kind == VALUE_INT64 || v.m_Kind == VALUE_BOOL; }
 
+// Asset indices never change while the game runs, so each name is looked up
+// once per session. A replayed kill resolves about fifty sprite/sound names
+// and several object names; asking the runner every time was a large share of
+// its cost. Game thread only.
+static std::unordered_map<std::string, RValue> g_AssetIndexCache;
+static RValue AssetIndexCached(const std::string& name)
+{
+    auto it = g_AssetIndexCache.find(name);
+    if (it != g_AssetIndexCache.end()) return it->second;
+    RValue idx;
+    try { idx = g_Yytk->CallBuiltin("asset_get_index", { RValue(name) }); } catch (...) { return RValue(); }
+    g_AssetIndexCache.emplace(name, idx);
+    return idx;
+}
+
 // asset_get_index returns a typed asset reference on this runner (VALUE_REF),
 // not a plain number (MEASURED 2026-09-17: a number check rejected every
 // object). Validate through object_exists instead of looking at the kind.
 static bool ObjectIndex(const std::string& name, RValue& out)
 {
+    static std::unordered_map<std::string, std::pair<bool, RValue>> known;
+    auto it = known.find(name);
+    if (it != known.end()) { out = it->second.second; return it->second.first; }
     try {
-        out = g_Yytk->CallBuiltin("asset_get_index", { RValue(name) });
-        if (out.m_Kind == VALUE_UNDEFINED) return false;
-        if (IsNumberKind(out) && out.ToDouble() < 0) return false;
-        return g_Yytk->CallBuiltin("object_exists", { out }).ToBoolean();
+        out = AssetIndexCached(name);
+        bool exists = out.m_Kind != VALUE_UNDEFINED && !(IsNumberKind(out) && out.ToDouble() < 0)
+            && g_Yytk->CallBuiltin("object_exists", { out }).ToBoolean();
+        known.emplace(name, std::make_pair(exists, out));
+        return exists;
     } catch (...) { return false; }
 }
 
@@ -347,6 +366,7 @@ static std::string       g_CtxPacket;
 static std::atomic<uint64_t> g_ItemsLogged{ 0 };
 static std::atomic<bool> g_CaptureOn{ false };
 static std::atomic<bool> g_ReplayActive{ false };     // reserved for Phase 1
+static bool g_ExpBusy = false;            // an expedition is replaying across frames
 static std::atomic<uint64_t> g_DropItemCalls{ 0 };
 static std::atomic<uint64_t> g_KillsCaptured{ 0 };
 static std::atomic<uint64_t> g_PacketsWritten{ 0 };
@@ -725,11 +745,21 @@ static RValue& Hook_DropItem(CInstance* S, CInstance* O, RValue& R, int argc, RV
 static std::string g_PendingSpoolItem;      // spool record of the item just built, waiting for its floor object
 static uint64_t    g_SpoolFiltered = 0;     // items the player's loot filter hides
 static uint64_t    g_SpoolUnplaced = 0;     // items whose floor object never came back
+// One open, buffered stream per spool instead of opening and closing the file
+// for every item. SpoolFlush runs after each replay frame and before every
+// checkpoint, so a checkpoint never counts items that are not on disk.
+static std::ofstream g_SpoolStream;
+static void SpoolWriteLine(const std::string& line)
+{
+    if (!g_SpoolStream.is_open()) g_SpoolStream.open(g_SpoolPath, std::ios::app);
+    g_SpoolStream << line << "\n";
+}
+static void SpoolFlush() { if (g_SpoolStream.is_open()) g_SpoolStream.flush(); }
+static void SpoolClose() { if (g_SpoolStream.is_open()) { g_SpoolStream.flush(); g_SpoolStream.close(); } g_SpoolStream.clear(); }
 static void FlushPendingSpoolItem(const std::string& extraFields)
 {
     if (g_PendingSpoolItem.empty()) return;
-    std::ofstream f(g_SpoolPath, std::ios::app);
-    f << g_PendingSpoolItem << extraFields << "}\n";
+    SpoolWriteLine(g_PendingSpoolItem + extraFields + "}");
     g_PendingSpoolItem.clear();
 }
 static RValue& Hook_CreateItemNew(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
@@ -751,12 +781,17 @@ static RValue& Hook_CreateItemNew(CInstance* S, CInstance* O, RValue& R, int arg
                     if (t.m_Kind == VALUE_STRING) tname = t.ToString();
                     if (IsNumberKind(q)) rarity = Stringify(q);
                 }
-                RValue def = g_Yytk->CallBuiltin("variable_struct_get", { it, RValue("itemDefinitionStruct") });
-                std::string defjs = def.m_Kind == VALUE_OBJECT ? Stringify(def) : "null";
                 ++g_ItemsLogged;
-                SessionAppend("{\"kind\":\"item\",\"t\":\"" + NowIso() + "\",\"ctx\":\"" + g_CtxKind + "\",\"packet\":\"" + g_CtxPacket
-                    + "\",\"type\":" + (IsNumberKind(type) ? Stringify(type) : std::string("null")) + ",\"tname\":\"" + JsonEscape(tname)
-                    + "\",\"name\":\"" + JsonEscape(name) + "\",\"rarity\":" + rarity + ",\"def\":" + defjs + "}");
+                // A claim's items already go to its spool in full. Logging each
+                // one again into the last calibration recording doubled the
+                // per-item work and grew that file by tens of MB per claim.
+                if (!g_ExpBusy) {
+                    RValue def = g_Yytk->CallBuiltin("variable_struct_get", { it, RValue("itemDefinitionStruct") });
+                    std::string defjs = def.m_Kind == VALUE_OBJECT ? Stringify(def) : "null";
+                    SessionAppend("{\"kind\":\"item\",\"t\":\"" + NowIso() + "\",\"ctx\":\"" + g_CtxKind + "\",\"packet\":\"" + g_CtxPacket
+                        + "\",\"type\":" + (IsNumberKind(type) ? Stringify(type) : std::string("null")) + ",\"tname\":\"" + JsonEscape(tname)
+                        + "\",\"name\":\"" + JsonEscape(name) + "\",\"rarity\":" + rarity + ",\"def\":" + defjs + "}");
+                }
                 // Spool: the complete native item struct, exactly as the game
                 // built it (the shape a stash entry stores), one record per item.
                 if (g_SpoolActive && g_CtxKind == "replay") {
@@ -1171,7 +1206,6 @@ static bool InstallDropItemHook()
 // packet's arguments. Nothing is synthesised; the dice are the game's.
 static std::vector<RValue> g_ReplayDs;          // ds structures created for the current replay call
 static std::string g_ReplayNote;
-static bool g_ExpBusy = false;            // an expedition is replaying across frames
 
 static std::string ReadFileText(const std::string& path)
 {
@@ -1204,7 +1238,8 @@ static RValue FromJsonValue(const RValue& v, int depth = 0)
             const std::string kind = s.substr(5, lp == std::string::npos ? 0 : lp - 5);
             const std::string name = (lp != std::string::npos && rp != std::string::npos && rp > lp) ? s.substr(lp + 1, rp - lp - 1) : "";
             if (kind == "sprite" || kind == "sound" || kind == "object" || kind == "room" || kind == "font") {
-                try { RValue idx = g_Yytk->CallBuiltin("asset_get_index", { RValue(name) }); if (IsNumberKind(idx)) return idx; } catch (...) {}
+                RValue idx = AssetIndexCached(name);
+                if (IsNumberKind(idx)) return idx;
                 return RValue(-1.0);
             }
             if (kind == "instance") return RValue(-4.0);   // noone: the killer, targets... are long gone
@@ -1392,11 +1427,20 @@ static void CmdReplay(const std::string& prefix, int times, bool clean, const st
 }
 
 // A packet loaded once (parsed JSON kept as game structs) and replayed many times.
+// The first replay also prepares what every replay of it needs: each restored
+// variable's name and converted value, the protected values and the call
+// arguments, so a kill no longer walks the parsed JSON, re-parses "@ref ..."
+// strings and looks up asset names. Arrays and ds markers stay per-call values
+// (each ghost gets fresh ones, exactly as before); everything else is shared
+// the way plain structs already were.
+struct PreparedValue { RValue name; RValue value; bool perCall = false; };
 struct LoadedPacket {
     std::string path, hashPrefix, monsterKey, selfObject;
     RValue pk, args, snap, prot, monsterObj;
     int argc = 0; double packetExp = -1.0; bool haveMonsterObj = false;
     double overrideExp = -1.0;     // from the plan: mean kill experience of the kills behind this packet
+    bool prepared = false;
+    std::vector<PreparedValue> vars, prots, argv;
 };
 // anchor: a global variable name that keeps the parsed packet alive between
 // frames. The runner's garbage collector only sees GML references; a struct
@@ -1472,10 +1516,90 @@ static bool PrepareReplayEnv(ReplayEnv& env, std::string& err)
 
 struct CallOutcome { bool ok = false; int restored = 0; int handles = 0; bool changed = false; std::string note; };
 
+// Where replay time goes, per stage, for the progress file (`perf`). Game
+// thread only; reset when an expedition starts.
+struct ReplayPerf {
+    uint64_t calls = 0, frames = 0;
+    double create = 0, restore = 0, prot = 0, drop = 0, exp = 0, coins = 0, popups = 0, cleanup = 0, frameTotal = 0, checkpoint = 0;
+};
+static ReplayPerf g_Perf;
+static double PerfMs(std::chrono::steady_clock::time_point& t)
+{
+    const auto now = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - t).count();
+    t = now;
+    return ms;
+}
+
+// variable_instance_set is called several hundred times per replayed kill;
+// calling the runner's routine directly skips YYToolkit's by-name lookup and
+// argument vector for each of them. Falls back to CallBuiltin if unresolved.
+static TRoutine g_VariableInstanceSet = nullptr;
+static bool g_VariableInstanceSetTried = false;
+static void SetInstanceVar(const RValue& inst, const RValue& name, const RValue& value)
+{
+    if (!g_VariableInstanceSetTried) {
+        g_VariableInstanceSetTried = true;
+        PVOID fn = nullptr;
+        if (AurieSuccess(g_Yytk->GetNamedRoutinePointer("variable_instance_set", &fn)) && fn) g_VariableInstanceSet = reinterpret_cast<TRoutine>(fn);
+    }
+    if (g_VariableInstanceSet) {
+        RValue args[3] = { inst, name, value };
+        RValue result;
+        g_VariableInstanceSet(result, nullptr, nullptr, 3, args);
+        return;
+    }
+    g_Yytk->CallBuiltin("variable_instance_set", { inst, name, value });
+}
+
+static bool NeedsFreshValue(const RValue& v)
+{
+    if (v.m_Kind == VALUE_ARRAY) return true;
+    if (v.m_Kind != VALUE_OBJECT) return false;
+    return StructGet(v, "_ds").m_Kind == VALUE_STRING;
+}
+
+static void PreparePacket(LoadedPacket& lp)
+{
+    if (lp.prepared) return;
+    lp.vars.clear(); lp.prots.clear(); lp.argv.clear();
+    RValue names = g_Yytk->CallBuiltin("variable_struct_get_names", { lp.snap });
+    const int n = names.m_Kind == VALUE_ARRAY ? (int)g_Yytk->CallBuiltin("array_length", { names }).ToDouble() : 0;
+    for (int i = 0; i < n; ++i) {
+        RValue nm = g_Yytk->CallBuiltin("array_get", { names, RValue((double)i) });
+        if (nm.m_Kind != VALUE_STRING || IsGhostOwnVar(nm.ToString())) continue;
+        RValue raw = g_Yytk->CallBuiltin("variable_struct_get", { lp.snap, nm });
+        PreparedValue pv; pv.name = nm; pv.perCall = NeedsFreshValue(raw);
+        pv.value = pv.perCall ? raw : FromJsonValue(raw);
+        lp.vars.push_back(pv);
+    }
+    if (lp.prot.m_Kind == VALUE_OBJECT) {
+        RValue pn = g_Yytk->CallBuiltin("variable_struct_get_names", { lp.prot });
+        const int m = pn.m_Kind == VALUE_ARRAY ? (int)g_Yytk->CallBuiltin("array_length", { pn }).ToDouble() : 0;
+        for (int i = 0; i < m; ++i) {
+            RValue nm = g_Yytk->CallBuiltin("array_get", { pn, RValue((double)i) });
+            RValue val = g_Yytk->CallBuiltin("variable_struct_get", { lp.prot, nm });
+            if (!IsNumberKind(val)) continue;
+            PreparedValue pv; pv.name = nm; pv.value = val;
+            lp.prots.push_back(pv);
+        }
+    }
+    for (int i = 0; i < lp.argc; ++i) {
+        RValue raw = g_Yytk->CallBuiltin("array_get", { lp.args, RValue((double)i) });
+        PreparedValue pv; pv.perCall = NeedsFreshValue(raw);
+        pv.value = pv.perCall ? raw : FromJsonValue(raw);
+        lp.argv.push_back(pv);
+    }
+    lp.prepared = true;
+}
+
 // One replayed kill: ghost up, the game's drop routine, experience, coins, ghost down.
-static CallOutcome ReplayOneCall(const LoadedPacket& lp, const ReplayEnv& env)
+static CallOutcome ReplayOneCall(LoadedPacket& lp, const ReplayEnv& env)
 {
     CallOutcome oc;
+    auto stage = std::chrono::steady_clock::now();
+    g_ReplayStage = "prepare packet";
+    try { PreparePacket(lp); } catch (...) { oc.note = "preparing the packet threw"; return oc; }
     g_ReplayStage = "create ghost";
     RValue ghost;
     try { ghost = g_Yytk->CallBuiltin("instance_create_depth", { RValue(env.px + 96.0), RValue(env.py), RValue(0.0), env.ghostObj }); }
@@ -1483,46 +1607,35 @@ static CallOutcome ReplayOneCall(const LoadedPacket& lp, const ReplayEnv& env)
     g_ReplayStage = "resolve ghost";
     CInstance* gi = ResolveInstance(ghost);
     if (!gi) { oc.note = "ghost instance could not be resolved"; return oc; }
+    g_Perf.create += PerfMs(stage);
 
     // 1) restore the monster's variables
     g_ReplayStage = "restore variables";
     std::vector<RValue> protectedHandles;
     try {
-        RValue names = g_Yytk->CallBuiltin("variable_struct_get_names", { lp.snap });
-        int n = names.m_Kind == VALUE_ARRAY ? (int)g_Yytk->CallBuiltin("array_length", { names }).ToDouble() : 0;
-        for (int i = 0; i < n; ++i) {
-            RValue nm = g_Yytk->CallBuiltin("array_get", { names, RValue((double)i) });
-            if (nm.m_Kind != VALUE_STRING) continue;
-            const std::string name = nm.ToString();
-            if (IsGhostOwnVar(name)) continue;
-            RValue val = g_Yytk->CallBuiltin("variable_struct_get", { lp.snap, nm });
-            g_Yytk->CallBuiltin("variable_instance_set", { ghost, nm, FromJsonValue(val) });
+        for (const auto& v : lp.vars) {
+            SetInstanceVar(ghost, v.name, v.perCall ? FromJsonValue(v.value) : v.value);
             ++oc.restored;
         }
+        g_Perf.restore += PerfMs(stage);
         // 2) protected values. The drop routine reads these through the
         //    anti-cheat wrapper, so a plain number is read as handle 0
         //    (MEASURED 2026-09-17: 30 replays with plain values produced
         //    nothing). Allocate a real handle per value with the game's
         //    own "new variable" wrapper and free it after the call.
-        if (lp.prot.m_Kind == VALUE_OBJECT) {
-            RValue pn = g_Yytk->CallBuiltin("variable_struct_get_names", { lp.prot });
-            int m = pn.m_Kind == VALUE_ARRAY ? (int)g_Yytk->CallBuiltin("array_length", { pn }).ToDouble() : 0;
-            for (int i = 0; i < m; ++i) {
-                RValue nm = g_Yytk->CallBuiltin("array_get", { pn, RValue((double)i) });
-                RValue val = g_Yytk->CallBuiltin("variable_struct_get", { lp.prot, nm });
-                if (!IsNumberKind(val)) continue;
-                RValue h;
-                try { h = g_Yytk->CallGameScript("gml_Script_PC_InitNewVariableFastGMLWrapper", { val }); } catch (...) { h = RValue(); }
-                if (IsNumberKind(h) && h.ToDouble() > 0) {
-                    protectedHandles.push_back(h);
-                    g_Yytk->CallBuiltin("variable_instance_set", { ghost, nm, h });
-                } else {
-                    g_Yytk->CallBuiltin("variable_instance_set", { ghost, nm, val });
-                }
+        for (const auto& p : lp.prots) {
+            RValue h;
+            try { h = g_Yytk->CallGameScript("gml_Script_PC_InitNewVariableFastGMLWrapper", { p.value }); } catch (...) { h = RValue(); }
+            if (IsNumberKind(h) && h.ToDouble() > 0) {
+                protectedHandles.push_back(h);
+                SetInstanceVar(ghost, p.name, h);
+            } else {
+                SetInstanceVar(ghost, p.name, p.value);
             }
         }
-        g_Yytk->CallBuiltin("variable_instance_set", { ghost, RValue("xPos"), RValue(env.px + 96.0) });
-        g_Yytk->CallBuiltin("variable_instance_set", { ghost, RValue("yPos"), RValue(env.py) });
+        SetInstanceVar(ghost, RValue("xPos"), RValue(env.px + 96.0));
+        SetInstanceVar(ghost, RValue("yPos"), RValue(env.py));
+        g_Perf.prot += PerfMs(stage);
     } catch (...) { oc.note = "restoring variables threw"; }
     oc.handles = (int)protectedHandles.size();
 
@@ -1544,11 +1657,10 @@ static CallOutcome ReplayOneCall(const LoadedPacket& lp, const ReplayEnv& env)
     g_ReplayStage = "build arguments";
     std::vector<RValue> av; av.reserve(lp.argc);
     for (int i = 0; i < lp.argc; ++i) {
-        RValue a = g_Yytk->CallBuiltin("array_get", { lp.args, RValue((double)i) });
-        if (i == 2) a = RValue(env.px + 96.0);
-        else if (i == 3) a = RValue(env.py);
-        else a = FromJsonValue(a);
-        av.push_back(a);
+        if (i == 2) av.push_back(RValue(env.px + 96.0));
+        else if (i == 3) av.push_back(RValue(env.py));
+        else if (i < (int)lp.argv.size()) av.push_back(lp.argv[i].perCall ? FromJsonValue(lp.argv[i].value) : lp.argv[i].value);
+        else av.push_back(RValue());
     }
     std::vector<RValue*> ap; for (auto& a : av) ap.push_back(&a);
 
@@ -1561,6 +1673,7 @@ static CallOutcome ReplayOneCall(const LoadedPacket& lp, const ReplayEnv& env)
     try { g_OrigDropItem(gi, gi, result, lp.argc, ap.data()); oc.ok = true; }
     catch (...) { oc.ok = false; }
     g_ReplayActive = false; g_CtxKind = "none"; g_CtxPacket.clear();
+    g_Perf.drop += PerfMs(stage);
     if (g_SpoolActive) {
         if (g_GiveExp && oc.ok) {
             // What the game does at death (Enemy_Parent_obj Destroy event,
@@ -1594,7 +1707,9 @@ static CallOutcome ReplayOneCall(const LoadedPacket& lp, const ReplayEnv& env)
                 g_GiveExpNote = "no usable kill experience (packet expResolved=" + std::to_string((long long)lp.packetExp) + ")";
             }
         }
+        g_Perf.exp += PerfMs(stage);
         g_ReplayStage = "harvest coins"; g_PlayerX = env.px; g_PlayerY = env.py; HarvestCoins(coinBefore);
+        g_Perf.coins += PerfMs(stage);
         // The experience hand-over spawns a floating text (Combat_Text_obj) per
         // call; thousands of them alive drag the frame rate from ~250 to ~40
         // calls per second (MEASURED 2026-09-18). Remove the ones this call made.
@@ -1610,6 +1725,7 @@ static CallOutcome ReplayOneCall(const LoadedPacket& lp, const ReplayEnv& env)
                 }
             }
         } catch (...) {}
+        g_Perf.popups += PerfMs(stage);
     }
 
     g_ReplayStage = "cleanup";
@@ -1617,11 +1733,14 @@ static CallOutcome ReplayOneCall(const LoadedPacket& lp, const ReplayEnv& env)
     try { g_Yytk->CallBuiltin("instance_destroy", { ghost }); } catch (...) {}
     for (auto& h : protectedHandles) { try { g_Yytk->CallGameScript("gml_Script_PC_FreeVariableGMLWrapper", { h }); } catch (...) {} }
     FreeReplayDs();
+    g_Perf.cleanup += PerfMs(stage);
+    ++g_Perf.calls;
     return oc;
 }
 
 static void SpoolBegin(const std::string& spoolId)
 {
+    SpoolClose();
     g_SpoolActive = !spoolId.empty();
     if (!g_SpoolActive) return;
     std::error_code ec; fs::create_directories(DATA_ROOT + "\\spool", ec);
@@ -1643,15 +1762,21 @@ static std::string SpoolSummaryText()
         + " GoldLogAdd: " + std::to_string(g_GoldLogCalls) + " calls sum=" + std::to_string((long long)g_GoldLogSum) + " {" + g_GoldArgsNote + "}"
         + " -> " + g_SpoolPath;
 }
+static std::string SpoolSummaryLine(long long calls, const char* kind)
+{
+    std::ostringstream f;
+    f << "{\"expedition_id\":\"" << JsonEscape(g_SpoolId) << "\",\"seq\":" << (++g_SpoolSeq) << ",\"kind\":\"" << kind << "\",\"t\":\"" << NowIso()
+      << "\",\"gold\":" << (long long)g_SpoolGold << ",\"gold_piles\":" << g_SpoolGoldPiles << ",\"exp_credited\":" << (long long)g_GiveExpSum
+      << ",\"calls\":" << calls << ",\"items\":" << g_SpoolItems << ",\"items_filtered\":" << g_SpoolFiltered << ",\"items_unplaced\":" << g_SpoolUnplaced
+      << ",\"forgepact\":" << ForgePactSettingsJson() << "}";
+    return f.str();
+}
 static void SpoolEnd(long long calls, const char* kind = "summary")
 {
     if (!g_SpoolActive) return;
     FlushPendingSpoolItem("");
-    std::ofstream f(g_SpoolPath, std::ios::app);
-    f << "{\"expedition_id\":\"" << JsonEscape(g_SpoolId) << "\",\"seq\":" << (++g_SpoolSeq) << ",\"kind\":\"" << kind << "\",\"t\":\"" << NowIso()
-      << "\",\"gold\":" << (long long)g_SpoolGold << ",\"gold_piles\":" << g_SpoolGoldPiles << ",\"exp_credited\":" << (long long)g_GiveExpSum
-      << ",\"calls\":" << calls << ",\"items\":" << g_SpoolItems << ",\"items_filtered\":" << g_SpoolFiltered << ",\"items_unplaced\":" << g_SpoolUnplaced
-      << ",\"forgepact\":" << ForgePactSettingsJson() << "}\n";
+    SpoolWriteLine(SpoolSummaryLine(calls, kind));
+    SpoolClose();
     g_SpoolActive = false;
 }
 
@@ -1741,10 +1866,15 @@ struct Expedition {
     std::string saveNote;
     std::string planHash, identity, room;
     bool anywhere = false;
+    // A pause while the expedition character is still loaded (it walked out of
+    // the region) saves the game and leaves a resumable "paused" checkpoint.
+    bool pausedSaved = false;
+    std::chrono::steady_clock::time_point lastCheckpoint{};
 };
 static Expedition g_Exp;
 static uint64_t g_CheckpointWriteRetries = 0;
 static std::string PersistRewards();
+static void InstallCloseGuard();
 
 static std::string ExpeditionProgressJson(const std::string& state)
 {
@@ -1758,6 +1888,13 @@ static std::string ExpeditionProgressJson(const std::string& state)
       << ",\"effective_magic_find\":" << (g_Exp.effectiveMagicFind>=0?std::to_string(g_Exp.effectiveMagicFind):"null")
       << ",\"save_committed\":" << (g_Exp.saveNote.rfind("saved (",0)==0 ? "true" : "false");
     CurrentRewards().Fields([&](const char* key, auto& value) { o << ",\"" << key << "\":" << value; });
+    o << std::fixed << std::setprecision(1)
+      << ",\"perf\":{\"calls\":" << g_Perf.calls << ",\"frames\":" << g_Perf.frames
+      << ",\"frame_budget_ms\":" << g_Exp.frameBudgetMs << ",\"per_frame\":" << g_Exp.perFrame
+      << ",\"ms_replay_frames\":" << g_Perf.frameTotal << ",\"ms_create\":" << g_Perf.create << ",\"ms_restore\":" << g_Perf.restore
+      << ",\"ms_protected\":" << g_Perf.prot << ",\"ms_drop_and_items\":" << g_Perf.drop << ",\"ms_exp\":" << g_Perf.exp
+      << ",\"ms_coins\":" << g_Perf.coins << ",\"ms_popups\":" << g_Perf.popups << ",\"ms_cleanup\":" << g_Perf.cleanup
+      << ",\"ms_checkpoints\":" << g_Perf.checkpoint << "}" << std::defaultfloat << std::setprecision(17);
     o
       << ",\"started\":\"" << JsonEscape(g_Exp.startedAt) << "\",\"updated\":\"" << NowIso() << "\""
       << ",\"plan\":\"" << JsonEscape(g_Exp.planPath) << "\",\"spool\":\"" << JsonEscape(g_SpoolPath) << "\""
@@ -1766,7 +1903,10 @@ static std::string ExpeditionProgressJson(const std::string& state)
 }
 static void ExpeditionWriteProgress(const std::string& state)
 {
+    auto started = std::chrono::steady_clock::now();
     g_Exp.state = state;
+    g_Exp.lastCheckpoint = started;
+    SpoolFlush();
     std::error_code ec; fs::create_directories(DATA_ROOT + "\\sessions", ec);
     const std::string tmp = g_Exp.progressPath + ".tmp";
     bool written = false;
@@ -1792,6 +1932,7 @@ static void ExpeditionWriteProgress(const std::string& state)
         failure << ExpeditionProgressJson("error") << "\n";
         Out("expedition: " + g_Exp.error);
     }
+    g_Perf.checkpoint += PerfMs(started);
 }
 // MEASURED 2026-09-21 on Suh: Controller Room End persisted gold but left
 // the character file unchanged despite +822532 live XP. A real transition
@@ -1942,7 +2083,9 @@ static void CmdExpeditionStart(const std::string& planPath, bool anywhere = fals
         RestoreRewards(restored);
     }
     if (g_SessionFile.empty()) SessionOpen();
+    g_Perf = ReplayPerf();
     g_Exp.running = true; g_ExpBusy = true;
+    InstallCloseGuard();
     ExpeditionWriteProgress("running");
     Out("expedition " + g_Exp.id + ": " + (resumed ? "resumed at " : "started, ") + std::to_string(g_Exp.callsDone) + "/" + std::to_string(g_Exp.callsTotal)
         + " calls, " + std::to_string(g_Exp.packets.size()) + " packets, " + std::to_string(g_Exp.perFrame) + " calls/frame, exp=" + (g_Exp.exp ? "on" : "off") + " gold=" + (g_Exp.gold ? "pickup" : "off"));
@@ -1957,12 +2100,31 @@ static void ExpeditionTick()
         if (g_Exp.pauseReason != err) { g_Exp.pauseReason = err; ExpeditionWriteProgress("paused"); Out("expedition " + g_Exp.id + ": paused (" + err + ")"); }
         ++g_Exp.pausedFrames; return;
     }
-    if (CurrentIdentityKey() != g_Exp.identity || (!g_Exp.anywhere && CurrentRoomName() != g_Exp.room)) {
+    const bool sameCharacter = CurrentIdentityKey() == g_Exp.identity;
+    if (!sameCharacter || (!g_Exp.anywhere && CurrentRoomName() != g_Exp.room)) {
         const std::string reason = "return to the expedition character and room";
-        if (g_Exp.pauseReason != reason) { g_Exp.pauseReason = reason; ExpeditionWriteProgress("paused"); }
+        if (g_Exp.pauseReason != reason) {
+            g_Exp.pauseReason = reason;
+            if (sameCharacter && !g_Exp.pausedSaved) {
+                // The expedition's hero is still loaded (it left the region):
+                // save now, so this pause survives a game close or crash as a
+                // resumable checkpoint. The spool gets a partial summary first,
+                // so it ends consistently with the saved counters.
+                if (g_SpoolActive) { FlushPendingSpoolItem(""); SpoolWriteLine(SpoolSummaryLine(g_Exp.callsDone, "partial")); }
+                g_Exp.saveNote = g_Exp.callsDone > 0 ? PersistRewards() : std::string("nothing to save");
+                g_Exp.pausedSaved = true;
+                Out("expedition " + g_Exp.id + ": paused outside the region | " + g_Exp.saveNote);
+            }
+            ExpeditionWriteProgress("paused");
+        }
         return;
     }
-    if (!g_Exp.pauseReason.empty()) { Out("expedition " + g_Exp.id + ": resumed"); g_Exp.pauseReason.clear(); }
+    if (!g_Exp.pauseReason.empty()) {
+        Out("expedition " + g_Exp.id + ": resumed");
+        g_Exp.pauseReason.clear();
+        // Replaying again: the save made when pausing no longer covers the counters.
+        if (g_Exp.pausedSaved) { g_Exp.pausedSaved = false; g_Exp.saveNote.clear(); }
+    }
     const auto t0 = std::chrono::steady_clock::now();
     int callsThisFrame = 0;
     try {
@@ -1991,14 +2153,72 @@ static void ExpeditionTick()
         g_ReplayActive = false; FreeReplayDs();
         ExpeditionFinish("error"); return;
     }
+    ++g_Perf.frames;
+    g_Perf.frameTotal += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (g_Exp.idx >= g_Exp.packets.size() || (g_Exp.idx + 1 == g_Exp.packets.size() && g_Exp.doneInPacket >= g_Exp.packets.back().count)) { ExpeditionFinish("done"); return; }
-    ExpeditionWriteProgress("running");
+    // A running checkpoint is never resumable, so rewriting it every frame
+    // only cost frame time (and write-through flushes). Four times a second
+    // is more often than the panel polls; pauses and endings still write at once.
+    SpoolFlush();
+    if (g_Exp.state != "running" || std::chrono::steady_clock::now() - g_Exp.lastCheckpoint >= std::chrono::milliseconds(250))
+        ExpeditionWriteProgress("running");
 }
 static void CmdExpeditionAbort()
 {
     if (!g_Exp.running) { Out("expedition: nothing running"); return; }
     if (CurrentIdentityKey() != g_Exp.identity) { Out("expedition: load the expedition character before saving an abort"); return; }
     ExpeditionFinish("aborted");
+}
+
+// ------------------------------------------------ closing the game window
+// Closing the window during delivery used to leave a "running" checkpoint
+// that needs manual review (MEASURED 2026-09-23: a 2 h claim stopped at 78.6%
+// when the game was closed). While a delivery is active the first close
+// request is held for one frame: delivery stops exactly like Pause (game save
+// and a resumable "aborted" checkpoint), then the same request is posted
+// again and the game closes normally. A repeated request passes at once, so a
+// stuck frame can never keep the window open.
+static HWND g_GameWindow = nullptr;
+static WNDPROC g_OriginalWndProc = nullptr;
+static bool g_CloseRequested = false, g_CloseAllowed = false;
+static UINT g_CloseMessage = 0; static WPARAM g_CloseWParam = 0; static LPARAM g_CloseLParam = 0;
+static bool IsCloseMessage(UINT msg, WPARAM wp) { return msg == WM_CLOSE || (msg == WM_SYSCOMMAND && (wp & 0xFFF0) == SC_CLOSE); }
+static LRESULT CALLBACK AfkCloseGuardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (IsCloseMessage(msg, wp) && g_ExpBusy && !g_CloseAllowed && !g_CloseRequested) {
+        g_CloseRequested = true; g_CloseMessage = msg; g_CloseWParam = wp; g_CloseLParam = lp;
+        return 0;
+    }
+    return CallWindowProcW(g_OriginalWndProc, hwnd, msg, wp, lp);
+}
+static BOOL CALLBACK FindOwnTopWindow(HWND hwnd, LPARAM out)
+{
+    DWORD pid = 0; GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd) && !GetWindow(hwnd, GW_OWNER)) { *reinterpret_cast<HWND*>(out) = hwnd; return FALSE; }
+    return TRUE;
+}
+static void InstallCloseGuard()
+{
+    if (g_OriginalWndProc) return;
+    HWND hwnd = nullptr;
+    try { RValue h = g_Yytk->CallBuiltin("window_handle", {}); if (h.m_Kind == VALUE_PTR) hwnd = static_cast<HWND>(h.m_Pointer); } catch (...) {}
+    if (!hwnd || !IsWindow(hwnd)) { hwnd = nullptr; EnumWindows(FindOwnTopWindow, reinterpret_cast<LPARAM>(&hwnd)); }
+    if (!hwnd) { Out("close guard: game window not found; closing during delivery stays unprotected"); return; }
+    g_OriginalWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(AfkCloseGuardProc)));
+    if (g_OriginalWndProc) g_GameWindow = hwnd;
+    else Out("close guard: could not attach to the game window");
+}
+static void HandleCloseRequest()
+{
+    if (!g_CloseRequested) return;
+    if (g_Exp.running && CurrentIdentityKey() == g_Exp.identity) {
+        Out("expedition " + g_Exp.id + ": game window closing - saving and pausing delivery");
+        ExpeditionFinish("aborted");
+    } else if (g_Exp.running) {
+        Out("expedition " + g_Exp.id + ": game window closing without the expedition character loaded; checkpoint left " + g_Exp.state);
+    }
+    g_CloseAllowed = true; g_CloseRequested = false;
+    if (g_GameWindow) PostMessageW(g_GameWindow, g_CloseMessage, g_CloseWParam, g_CloseLParam);
 }
 static void CmdExpeditionStatus()
 {
@@ -2645,6 +2865,7 @@ static void FrameCallback(FWFrame& FrameContext)
     UNREFERENCED_PARAMETER(FrameContext);
     static uint32_t fc = 0;
     ++fc;
+    HandleCloseRequest();
     if (fc % 6 == 0) PollCommands();
     static auto nextFarmSample=std::chrono::steady_clock::now();
     static auto previousFarmSample=nextFarmSample;

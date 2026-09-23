@@ -44,6 +44,58 @@ STATE, CONFIG = DATA / "state.json", DATA / "config.json"
 MAX_HOURS = 8.0
 ACTIVE_WINDOW_S = 30
 MIN_COVERAGE = 0.95
+# Delivery speed: calls per frame and how much of each frame reward replay may
+# use. Higher settings lower the game's frame rate while delivering; Maximum
+# suits a claim nobody watches (Claim in background).
+DELIVERY_SPEEDS = {"normal": (40, 10.0), "fast": (200, 30.0), "max": (1000, 80.0)}
+# Calls per second assumed before this computer has been measured
+# (MEASURED 2026-09-23: about 53/s at Normal with plugin 0.5). Finished
+# claims replace them through delivery-rate.json.
+DEFAULT_CALL_RATES = {"normal": 50.0, "fast": 80.0, "max": 100.0}
+RATE_FILE = DATA / "delivery-rate.json"
+LOOT_FILTER_FILE = DATA / "loot-filter.json"
+DELIVERY_WAIT_HOURS = 12
+
+
+def delivery_speed(plan: dict) -> str:
+    """The named speed of a plan; older plans without one are Normal."""
+    name = plan.get("delivery_speed")
+    return name if name in DELIVERY_SPEEDS else "normal"
+
+
+def apply_delivery_speed(plan: dict, speed: str) -> None:
+    if speed not in DELIVERY_SPEEDS:
+        sys.exit(f"unknown delivery speed {speed!r}; choose {', '.join(DELIVERY_SPEEDS)}")
+    plan["per_frame"], plan["frame_budget_ms"] = DELIVERY_SPEEDS[speed]
+    plan["delivery_speed"] = speed
+
+
+def learned_call_rate(speed: str) -> float:
+    rates = read_json(RATE_FILE, {}) or {}
+    entry = rates.get(speed) if isinstance(rates, dict) else None
+    value = entry.get("calls_per_second") if isinstance(entry, dict) else None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
+        return float(value)
+    return DEFAULT_CALL_RATES.get(speed, DEFAULT_CALL_RATES["normal"])
+
+
+def estimate_delivery_seconds(calls: int, speed: str) -> float:
+    return max(0.0, float(calls)) / learned_call_rate(speed)
+
+
+def record_delivery_rate(speed: str, calls: int, seconds: float) -> None:
+    """Remember how fast this computer delivered (smoothed), for estimates."""
+    if speed not in DELIVERY_SPEEDS or calls < 500 or seconds < 20:
+        return
+    observed = calls / seconds
+    rates = read_json(RATE_FILE, {}) or {}
+    if not isinstance(rates, dict):
+        rates = {}
+    previous = (rates.get(speed) or {}).get("calls_per_second") if isinstance(rates.get(speed), dict) else None
+    blended = observed if not isinstance(previous, (int, float)) or isinstance(previous, bool) or previous <= 0 else 0.5 * previous + 0.5 * observed
+    rates[speed] = {"calls_per_second": round(blended, 2), "last_observed": round(observed, 2), "calls": int(calls),
+                    "seconds": round(seconds, 1), "at": iso(now_utc())}
+    write_json(RATE_FILE, rates)
 
 
 def character_key(stamp) -> tuple:
@@ -461,7 +513,7 @@ def rebuild_preview(plan: dict) -> None:
         exp=int(sum(p['count'] * float(p.get('exp') or 0) for p in pk)) if plan.get('exp', True) else 0,
         items_estimate=round(sum(p['count'] * items[p['hash']] for p in pk)) if pk and all(p['hash'] in items for p in pk) else None,
         gold_estimate=round(calls * gold) if gold is not None else None,
-        seconds_to_replay=round(calls / max(1, plan['per_frame']) / 60.0, 1))
+        seconds_to_replay=round(estimate_delivery_seconds(calls, delivery_speed(plan)), 1))
 
 
 def make_plan(hours: float, zones: list[tuple[str, float]], exp_id: str, per_frame: int, gold: str,
@@ -552,7 +604,7 @@ def make_plan(hours: float, zones: list[tuple[str, float]], exp_id: str, per_fra
         "preview": {"kills": total_kills, "breaks": total_breaks, "calls": calls, "exp": int(preview_exp),
                     "items_estimate": (int(round(preview_items)) if preview_items else None),
                     "gold_estimate": (int(round(calls * rates["gold_per_call"])) if rates["gold_per_call"] else None),
-                    "seconds_to_replay": round(calls / max(1, per_frame) / 60.0, 1)},
+                    "seconds_to_replay": round(estimate_delivery_seconds(calls, "normal"), 1)},
     }
     rebuild_preview(plan)
     return plan
@@ -787,6 +839,7 @@ def run_plan(plan_path: Path, plan: dict, bin_dir: Path, ingest: bool, anywhere:
     progress = SESSIONS / f"{plan['expedition_id']}.progress.json"
     failure = SESSIONS / f"{plan['expedition_id']}.failure.json"
     t0 = time.time()
+    start_calls = int((read_json(progress) or {}).get("calls_done") or 0)
     last_print = 0.0
     while not already_done:
         time.sleep(0.5)
@@ -798,10 +851,22 @@ def run_plan(plan_path: Path, plan: dict, bin_dir: Path, ingest: bool, anywhere:
             last_print = time.time()
         if state in ("done", "error", "aborted"):
             break
-        if time.time() - t0 > 3 * 3600:
-            print("giving up waiting after 3 hours")
+        if time.time() - t0 > DELIVERY_WAIT_HOURS * 3600:
+            print(f"giving up waiting after {DELIVERY_WAIT_HOURS} hours")
             break
     pr = read_json(failure) or read_json(progress) or {}
+    if pr.get("state") == "aborted" and not read_json(failure):
+        # Pause, a closed game window or `afk.py pause`: the plugin saved and left
+        # a resumable checkpoint. The claim is not settled, so no result file.
+        resumable = recovery.resumable(DATA, plan["expedition_id"])
+        print(f"expedition {plan['expedition_id']}: delivery paused at {pr.get('calls_done', 0)}/{pr.get('calls_total', 0)} calls"
+              + (" and saved. Claim again with the same hero in the same region to continue."
+                 if resumable else "; the save could not be confirmed, so the records need review."))
+        pr["paused"] = True
+        pr["resumable"] = resumable
+        return pr
+    if pr.get("state") == "done":
+        record_delivery_rate(delivery_speed(plan), int(pr.get("calls_done") or 0) - start_calls, time.time() - t0)
     # the plugin performs the game's own save when the expedition stops; ask
     # once more here so a reward is never left only in memory
     saved = ipc.send("afk save") or []
@@ -841,6 +906,8 @@ def ingest_spool(spool: Path, label: str | None, keep_filtered: bool = False) ->
         print(f"no spool at {spool}")
         return 1
     argv = ["ingest_spool.py", str(spool)] + (["--label", label] if label else []) + (["--keep-filtered"] if keep_filtered else [])
+    if LOOT_FILTER_FILE.exists():
+        argv += ["--filter", str(LOOT_FILTER_FILE)]
     try:
         rc = mod.main(argv)
     except SystemExit as e:
@@ -914,7 +981,7 @@ def cmd_claim(args) -> None:
             recovery.settle(DATA,claim_id)
             print('Saved claim recovered without replay. Transfer queued items to the Vault separately.')
             return
-        if review['status']!='not_started':
+        if review['status'] not in ('not_started', 'paused'):
             sys.exit('claim records require review; rewards were not repeated: '+' '.join(review['reasons']))
     pr_old = read_json(SESSIONS / f"{claim_id}.progress.json") or {}
     reuse = pr_old.get("state") in ("running", "paused", "aborted", "error", "done") and claim_path.exists()
@@ -925,8 +992,11 @@ def cmd_claim(args) -> None:
               f"({pr_old.get('calls_done', 0)}/{pr_old.get('calls_total', 0)} calls); following it")
     else:
         scaled = scale_plan(plan, factor, claim_id)
+        apply_delivery_speed(scaled, getattr(args, 'speed', None) or 'normal')
+        rebuild_preview(scaled)
         print(f"elapsed {elapsed_h:.2f} h, credited {credited_h:.2f} h of {armed['hours']:.2f} h")
     print_preview(scaled)
+    print(f"delivery speed: {delivery_speed(scaled)} - about {math.ceil(scaled['preview']['seconds_to_replay'] / 60)} min on this computer")
     if args.dry_run:
         print("(dry run: nothing replayed, the clock stays armed)")
         return
@@ -936,6 +1006,11 @@ def cmd_claim(args) -> None:
     if not reuse:
         write_json(claim_path, scaled)
     pr = run_plan(claim_path, scaled, game_bin(args), ingest=not args.no_ingest, anywhere=args.anywhere, forgepact_ignore=args.forgepact_ignore)
+    if pr and pr.get("paused"):
+        if not pr.get("resumable"):
+            sys.exit(1)
+        print("the clock stays armed; claim again to continue from the saved position")
+        return
     if run_succeeded(pr):
         credited_h = float(scaled.get("hours", 0)) * float(scaled.get("scale", 1.0)) if reuse else credited_h
         st["last_claim"] = {"expedition_id": claim_id, "credited_hours": credited_h, "at": iso(now_utc()), "result": pr}
@@ -945,6 +1020,18 @@ def cmd_claim(args) -> None:
     else:
         print("the run did not finish; the clock stays armed so you can claim again (it resumes where it stopped)")
         sys.exit(1)
+
+
+def cmd_pause(args) -> None:
+    """Stop reward delivery at a saved position that a later claim continues.
+
+    Not serialized with the reward lock: the claim being paused holds it. The
+    single IPC writer lock still orders this command with every other one.
+    """
+    reply = Ipc(game_bin(args)).send("afk expedition abort", timeout=20) or []
+    print("\n".join(reply) or "no reply from the game")
+    if not any(": aborted " in line for line in reply):
+        sys.exit("delivery was not paused; load the expedition hero in the game and try again")
 
 
 @serialized_rewards
@@ -1171,7 +1258,9 @@ def main(argv=None) -> None:
     p = sub.add_parser("preview"); p.add_argument("plan"); p.set_defaults(fn=cmd_preview)
     p = sub.add_parser("start"); p.add_argument("plan"); p.set_defaults(fn=cmd_start)
     p = sub.add_parser("cancel"); p.set_defaults(fn=cmd_cancel)
+    p = sub.add_parser("pause"); p.set_defaults(fn=cmd_pause)
     p = sub.add_parser("claim"); p.add_argument("--dry-run", action="store_true"); p.add_argument("--no-ingest", action="store_true")
+    p.add_argument("--speed", choices=sorted(DELIVERY_SPEEDS), default="normal", help="delivery speed for a new claim (a paused claim keeps its own)")
     p.add_argument("--anywhere", action="store_true", help="replay even when not standing in a calibrated zone")
     p.add_argument("--forgepact-ignore", action="store_true", help="replay even if rate-affecting ForgePact settings changed"); p.set_defaults(fn=cmd_claim)
     p = sub.add_parser("run"); p.add_argument("plan"); p.add_argument("--no-ingest", action="store_true")

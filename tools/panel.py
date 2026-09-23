@@ -8,6 +8,7 @@ from urllib.parse import urlsplit, unquote
 import afk
 import reward_modifiers
 import ingest_spool
+import loot_filter
 import calibration, recovery, validate_farm
 from product_data import Presentation, SUPPORT, support_warnings
 
@@ -15,7 +16,7 @@ ROOT=Path(__file__).resolve().parents[1]
 WEB=ROOT/'web'
 CLASSES={i+1:n for i,n in enumerate(('Viking','Pyromancer','Marksman','Pirate','Nomad','Redneck','Necromancer','Samurai','Paladin','Amazon','Demon Slayer','Demonspawn','Shaman','White Mage','Marauder','Plague Doctor','Shield Lancer','Illusionist','Jotunn','Exo','Butcher','Stormweaver','Bard','Prophet'))}
 XOR=bytes.fromhex('e3953db1016bb65854383f46a17429cc454551f2a7f7abb726f137a88191e67e')
-VERSION='0.5.1'
+VERSION='0.6.0'
 IDENTIFIER=re.compile(r'[A-Za-z0-9_-]{1,120}\Z')
 
 def require(ok,message):
@@ -112,7 +113,32 @@ def progress_view(data,expedition):
     p=dict(p,percent=max(0,min(100,100*done/total)) if total else 0)
     if failure: p['reconciliation_required']=True
     if p.get('state')=='error': p['reconciliation_required']=True
+    p['resumable']=not failure and recovery.resumable(data,expedition)
     return p
+
+
+def zone_names():
+    try:return {z['room']:z['name'] for z in json.loads((WEB/'zones.json').read_text(encoding='utf-8'))}
+    except (OSError,ValueError,KeyError,TypeError):return {}
+
+
+def expedition_label(room,hours):
+    """Readable name of an expedition's Vault category: region and duration."""
+    return f"{zone_names().get(room,room)} · {hours:g} h"
+
+
+def load_preferences(data):
+    prefs=read(data/'preferences.json',{}) or {}
+    speed=prefs.get('delivery_speed') if isinstance(prefs,dict) else None
+    return dict(schema=1,delivery_speed=speed if speed in afk.DELIVERY_SPEEDS else 'normal')
+
+
+def delivery_seconds(result):
+    """Wall time of a finished delivery, from its native checkpoint times."""
+    try:
+        return max(0,round((afk.parse_iso(result['updated'])-afk.parse_iso(result['started'])).total_seconds()))
+    except (KeyError,TypeError,ValueError):
+        return None
 
 class Panel:
     def __init__(self,data=afk.DATA):
@@ -124,6 +150,7 @@ class Panel:
         self.calibration=read(self.data/'panel-calibration.json',{}) or {}
         self.presentation=Presentation(ROOT)
         self.recovery_cache=None; self.recovery_checked_at=0
+        self.pause_lock=threading.Lock(); self.pause_note=None
         self.refresh_profiles()
 
     def game_bin(self):
@@ -212,6 +239,17 @@ class Panel:
                 self.recovery_cache=recovery.inspect(self.data,ident);self.recovery_checked_at=time.monotonic()
             review=self.recovery_cache
         validations=[read(f,{}) for f in sorted((self.data/'validations').glob('*.result.json'),key=lambda p:p.stat().st_mtime,reverse=True)][:20]
+        levels={afk.character_key(c):c.get('level') for c in self.chars if valid_identity(c)}
+        for reward in rewards:
+            sidecar=read(self.data/'sessions'/f"{reward['id']}.panel.json",{}) or {}
+            reward['level_before']=sidecar.get('level_before')
+            ch=reward.get('character')
+            reward['level_now']=levels.get(afk.character_key(ch)) if valid_identity(ch) else None
+            reward['delivery_seconds']=delivery_seconds(reward)
+        filter_error=None
+        try: vault_filter=loot_filter.load(self.data/'loot-filter.json')
+        except ValueError as error:
+            vault_filter=loot_filter.normalize();filter_error=str(error)
         modifier_error=None
         try: modifiers=reward_modifiers.load(self.data/'reward-modifiers.json')
         except ValueError as error:
@@ -225,7 +263,82 @@ class Panel:
                     modifier_fields=[dict(key=k,label=l,description=d) for k,l,d in reward_modifiers.FIELDS],
                     claim_context_matches=reward_modifiers.context_matches((plan or {}).get('farm_context'),(live or {}).get('farm_context'),bool((plan or {}).get('reward_modifiers'))),
                     support_warnings=support_warnings((live or {}).get('forgepact')),
-                    portraits={str(c['slot']):self.portrait_key(c) for c in self.chars if (self.data/'portraits'/(self.portrait_key(c)+'.png')).is_file()})
+                    portraits={str(c['slot']):self.portrait_key(c) for c in self.chars if (self.data/'portraits'/(self.portrait_key(c)+'.png')).is_file()},
+                    loot_filter=vault_filter,loot_filter_error=filter_error,loot_filter_rarities=list(loot_filter.GEAR_RARITIES),
+                    preferences=load_preferences(self.data),delivery=self.delivery_view(armed,plan,progress),
+                    repeat=self.repeat_view(state,armed),profile_live_matches=self.live_matches(live),
+                    background=self.background_view(armed,progress,review,live),pause_note=self.pause_note)
+
+    def delivery_view(self,armed,plan,progress):
+        """Delivery speeds with this computer's estimate for the calls due now."""
+        calls=None
+        if progress.get('calls_total'):
+            calls=max(0,progress['calls_total']-(progress.get('calls_done') or 0))
+        elif armed and plan:
+            try:
+                elapsed=(datetime.now(timezone.utc)-afk.parse_iso(armed['started_at'])).total_seconds()/3600
+                credited=max(0.0,min(elapsed,float(armed['hours']),afk.MAX_HOURS))
+                calls=round(plan['preview']['calls']*credited/float(plan['hours'])) if plan.get('hours') else None
+            except (KeyError,TypeError,ValueError,ZeroDivisionError):calls=None
+        speeds=[dict(id=k,label={'normal':'Normal','fast':'Fast','max':'Maximum'}[k],per_frame=v[0],frame_budget_ms=v[1],
+                     calls_per_second=afk.learned_call_rate(k),
+                     seconds=None if calls is None else round(afk.estimate_delivery_seconds(calls,k)))
+                for k,v in afk.DELIVERY_SPEEDS.items()]
+        return dict(calls=calls,speeds=speeds,active_speed=afk.delivery_speed(read(self.data/'plans'/f"{armed['expedition_id']}_claim.json",{}) or {}) if armed else None)
+
+    def repeat_view(self,state,armed):
+        """The last settled expedition, to start the same one again with one click."""
+        if armed:return None
+        last=(state.get('last_claim') or {}).get('expedition_id','')
+        plan=read(self.data/'plans'/f"{last.removesuffix('_claim')}.json",{}) or {}
+        room=(plan.get('zones') or [{}])[0].get('room');ch=plan.get('character')
+        if not room or not valid_identity(ch) or not plan.get('hours'):return None
+        profile=next((p for p in self.profiles if p['usable'] and p.get('room')==room and same_character(p.get('character'),ch)),None)
+        return dict(room=room,hours=float(plan['hours']),slot=ch['slot'],name=ch['name'],profile=profile['id'] if profile else None,
+                    reason=None if profile else 'The saved calibration for this hero and region is no longer usable. Recalibrate first.')
+
+    def live_matches(self,live):
+        """Per profile of the loaded hero: does the current loadout still match?"""
+        if not live or not valid_identity(live.get('character')) or not live.get('farm_context'):return {}
+        return {p['id']:reward_modifiers.context_matches(p.get('farm_context'),live['farm_context'],True)
+                for p in self.profiles if p['usable'] and same_character(p.get('character'),live['character'])}
+
+    def background_view(self,armed,progress,review,live):
+        """Whether Claim in background can run: verified automatic setup, game closed or at a menu."""
+        def no(reason):return dict(available=False,reason=reason)
+        if not armed:return no('No active expedition.')
+        if review and review.get('status')=='needs_review' or progress.get('reconciliation_required'):return no('The previous claim needs review.')
+        if progress.get('state') in ('running',) :return no('Delivery is already running.')
+        setup=self.installation()
+        if not setup.get('verified_build'):return no('Automatic setup is available for the verified game executable only.')
+        if not setup.get('plugin_current'):return no('Install the current AFK plugin in Settings first.')
+        if self.game_running and live and live.get('character') and live.get('room') not in ('Main_Menu_rm','Chose_rm'):
+            plan_char=(read(Path(armed['plan']),{}) or {}).get('character')
+            if not same_character(live.get('character'),plan_char):return no('Another hero is loaded. Return to the main menu or close the game first.')
+        return dict(available=True,reason=None)
+
+    def note(self,message):
+        with self.state_lock:
+            if self.job:self.job['output']=(self.job['output']+str(message)+'\n')[-40000:]
+            else:self.pause_note=str(message)[-2000:]
+
+    def pause(self):
+        """Pause a running delivery at a saved position. Runs beside the claim job."""
+        armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active expedition.')
+        pr=progress_view(self.data,armed['expedition_id']+'_claim')
+        require(pr.get('state') in ('running','paused'),'No reward delivery is running.')
+        require(self.pause_lock.acquire(blocking=False),'Pause was already requested.')
+        def run():
+            try:
+                env=os.environ.copy();env['PYTHONIOENCODING']='utf-8';env['PYTHONDONTWRITEBYTECODE']='1'
+                flags=getattr(subprocess,'CREATE_NO_WINDOW',0)
+                result=subprocess.run([sys.executable,'-B','-u',str(ROOT/'tools/afk.py'),'pause'],cwd=ROOT,capture_output=True,text=True,
+                                      encoding='utf-8',errors='replace',env=env,creationflags=flags,timeout=60)
+                self.note((result.stdout+result.stderr).strip() or 'Pause requested.')
+            except (OSError,subprocess.SubprocessError) as error:self.note('Pause failed: '+str(error))
+            finally:self.pause_lock.release()
+        threading.Thread(target=run,daemon=True).start()
+        return {'accepted':True}
 
     def installation(self):
         try:
@@ -257,17 +370,18 @@ class Panel:
         code=process.wait(); require(code==0,f'Action failed (exit code {code}). See the activity log for details.')
 
     def submit(self,action,args):
+        if action=='pause_delivery':return self.pause()
         require(self.job_lock.acquire(blocking=False),'Another action is in progress.')
         with self.state_lock:self.job=dict(id=uuid.uuid4().hex,action=action,state='running',output='',error=None,started_at=time.time())
         def run():
             try:
-                if action in ('plan','start','cancel','recover','ingest','portrait','configure','save_modifiers'):
+                if action in ('plan','start','cancel','recover','ingest','portrait','configure','save_modifiers','save_loot_filter','save_preferences','settle_partial'):
                     self.action(action,args)
                 else:
                     with self.lock:self.action(action,args)
-                with self.state_lock:self.job['state']='done'
+                with self.state_lock:self.job.update(state='done',finished_at=time.time())
             except (Exception,SystemExit) as e:
-                with self.state_lock:self.job.update(state='error',error=str(e))
+                with self.state_lock:self.job.update(state='error',error=str(e),finished_at=time.time())
             finally:
                 try:self.refresh_profiles()
                 finally:self.job_lock.release()
@@ -289,6 +403,14 @@ class Panel:
         require(reward_modifiers.context_matches(p.get('farm_context'),s.get('farm_context'),bool(p.get('reward_modifiers'))),'Gear, talents, level or combat settings changed. Recalibration is required.')
 
     def action(self,name,args):
+        if name=='save_loot_filter':
+            settings=loot_filter.normalize(args.get('settings'))
+            afk.write_json(self.data/'loot-filter.json',settings)
+            self.log('Vault transfer filter saved: '+loot_filter.describe(settings)+'. Items it keeps back stay in the expedition records.');return
+        if name=='save_preferences':
+            speed=args.get('delivery_speed');require(speed in afk.DELIVERY_SPEEDS,'Choose Normal, Fast or Maximum.')
+            afk.write_json(self.data/'preferences.json',dict(schema=1,delivery_speed=speed))
+            self.log('Delivery speed saved: '+speed+'. A paused delivery keeps its own speed.');return
         if name=='save_modifiers':
             settings=reward_modifiers.normalize(args.get('settings'))
             afk.write_json(self.data/'reward-modifiers.json',settings)
@@ -378,7 +500,7 @@ class Panel:
             hours=float(args.get('hours',1));require(math.isfinite(hours) and .25<=hours<=8,'Duration must be between 15 minutes and 8 hours.')
             ident='farm_'+datetime.now().strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:6]
             plan=afk.make_plan(hours,[(p['room'],1)],ident,40,'pickup',profile_overrides={p['room']:p})
-            plan['farm_context']=p['farm_context'];plan['panel_version']=VERSION
+            plan['farm_context']=p['farm_context'];plan['panel_version']=VERSION;plan['label']=expedition_label(p['room'],hours)
             reward_modifiers.apply_to_plan(plan,p,reward_modifiers.load(self.data/'reward-modifiers.json'))
             afk.rebuild_preview(plan)
             path=self.data/'plans'/f'{ident}.json';afk.write_json(path,plan)
@@ -392,14 +514,25 @@ class Panel:
                 self.log('Recovered the saved claim. No rewards were replayed. Transfer queued items from Loot.');return
             pr=progress_view(self.data,armed['expedition_id']+'_claim')
             require(not pr.get('reconciliation_required'),'The claim has an uncertain outcome. Rewards were not repeated. The records need review.')
-            if pr.get('state') in ('running','paused'):raise ValueError('The previous claim is incomplete. It was not retried automatically.')
+            if pr.get('state') in ('running','paused','aborted') and not pr.get('resumable'):raise ValueError('The previous claim is incomplete. It was not retried automatically.')
             s=self.fresh();self.context_matches(plan,s)
             require(s['room']==plan['zones'][0]['room'],'Return to the calibrated region to claim rewards: '+plan['zones'][0]['room'])
-            self.cli('claim');return
+            self.claim(armed,args.get('speed'));return
+        if name=='claim_background':
+            self.claim_background(args);return
         if name=='recover':
             armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active claim to reconcile.')
             with recovery.data_lock(self.data):recovery.settle(self.data,armed['expedition_id']+'_claim')
             self.log('Saved rewards reconciled without replay. Queued items can be transferred from Loot.');return
+        if name=='settle_partial':
+            # The player keeps what an interrupted claim delivered and gives up the
+            # rest. Nothing is generated again; the records stay for the report.
+            armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active expedition.')
+            live=self.current_live()
+            require(not (live and live.get('replay_running')),'Delivery is running in the game. Pause it first.')
+            with recovery.data_lock(self.data):result=recovery.settle_partial(self.data,armed['expedition_id']+'_claim')
+            self.log(f"Claim closed as a partial delivery ({result.get('calls_done',0):,} of {result.get('calls_total',0):,} reward calls). "
+                     'Delivered rewards stay; nothing was generated again. The expedition clock is free.');return
         if name=='cancel':
             armed=(read(self.data/'state.json',{}) or {}).get('armed')
             require(not armed or not progress_view(self.data,armed['expedition_id']+'_claim').get('state'),'An expedition cannot be cancelled here once delivery has started.')
@@ -407,8 +540,12 @@ class Panel:
         if name=='ingest':
             ident=args.get('id','');require(bool(IDENTIFIER.fullmatch(ident)),'Invalid reward ID.')
             spool=self.data/'spool'/f'{ident}.ndjson';require(spool.is_file(),'Reward file not found.')
-            review=recovery.inspect(self.data,ident);require(review['recoverable'],'Only complete, saved and consistent rewards can be transferred.')
-            with recovery.data_lock(self.data):self.cli('ingest',spool)
+            review=recovery.inspect(self.data,ident);settled=read(self.data/'sessions'/f'{ident}.result.json',{}) or {}
+            require(review['recoverable'] or (settled.get('partial') is True and settled.get('settled_by')=='player'),
+                    'Only complete, saved and consistent rewards, or a claim you closed as partial, can be transferred.')
+            plan=read(self.data/'plans'/f'{ident}.json',{}) or {}
+            label=plan.get('label') or expedition_label((plan.get('zones') or [{}])[0].get('room',''),float(plan.get('hours') or 0)*float(plan.get('scale') or 1))
+            with recovery.data_lock(self.data):self.cli('ingest',spool,'--label',label)
             path=self.data/'sessions'/f'{ident}.result.json';result=read(path)
             if result:
                 result.setdefault('stages',{})['ingest']='done'
@@ -423,6 +560,52 @@ class Panel:
             path=self.data/'portraits'/(self.portrait_key(c)+'.png');path.parent.mkdir(parents=True,exist_ok=True)
             path.write_bytes(raw);self.log('Character screenshot saved locally. It does not change the game save.');return
         raise ValueError('Unknown action.')
+
+    def claim(self,armed,speed=None):
+        """Start or continue delivery; remember the hero's level for the summary."""
+        speed=speed if speed in afk.DELIVERY_SPEEDS else load_preferences(self.data)['delivery_speed']
+        ident=armed['expedition_id']+'_claim';sidecar=self.data/'sessions'/f'{ident}.panel.json'
+        if not sidecar.exists():
+            plan=read(Path(armed['plan']),{}) or {};ch=plan.get('character')
+            hero=next((c for c in characters(self.data) if valid_identity(ch) and same_character(c,ch)),None)
+            afk.write_json(sidecar,dict(level_before=hero.get('level') if hero else None,speed=speed,at=datetime.now(timezone.utc).isoformat()))
+        self.cli('claim','--speed',speed)
+
+    def claim_background(self,args):
+        """Open the game minimized, load the hero in its region, deliver at Maximum speed, close the game.
+
+        Uses the verified automatic setup (game_session): no mouse or keyboard
+        input, the game's own menu and travel routines. The game is closed again
+        only when this action opened it and delivery finished or paused safely.
+        """
+        from game_session import Session,running
+        armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active expedition.')
+        plan=read(Path(armed['plan']));require(plan,'Could not read the expedition plan.')
+        ident=armed['expedition_id']+'_claim'
+        review=recovery.inspect(self.data,ident)
+        require(review['status'] in ('not_started','paused') or review['recoverable'],'The previous claim needs review before another delivery.')
+        view=self.background_view(armed,progress_view(self.data,ident),review,self.current_live())
+        require(view['available'],view['reason'] or 'Claim in background is unavailable.')
+        c=plan['character'];region=plan['zones'][0]['room']
+        session=Session(self.game_bin(),self.data)
+        launched=running(session.exe) is None
+        live=None
+        if not launched:
+            try:live=self.fresh()
+            except (ValueError,RuntimeError):live=None
+        if not (live and same_character(live.get('character'),c) and live.get('room')==region):
+            self.log(f"Preparing {c['name']} in the background{' (starting the game minimized)' if launched else ''}...")
+            self.log(json.dumps(session.prepare(c['slot'],c['name'],c['class'],240),ensure_ascii=False)[:2000])
+            self.log('Travelling to '+zone_names().get(region,region)+'...')
+            self.log(json.dumps(session.travel(region,c['slot'],c['name'],c['class'],240),ensure_ascii=False)[:2000])
+        s=self.fresh();self.context_matches(plan,s)
+        require(s['room']==region,'The hero did not arrive in the expedition region.')
+        self.claim(armed,'max')
+        pr=progress_view(self.data,ident)
+        if launched and (pr.get('state')=='done' or pr.get('resumable')):
+            self.log('Closing the game that this action opened...')
+            self.log(json.dumps(session.close()))
+            self.live=None;self.game_running=False
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):pass

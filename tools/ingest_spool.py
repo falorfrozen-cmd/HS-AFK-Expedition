@@ -1,12 +1,18 @@
 r"""Send an HS AFK Expedition spool file to the Item Editor's Infinite Vault.
 
-    py tools\ingest_spool.py <spool.ndjson> [--label "..."] [--batch 200]
+    py tools\ingest_spool.py <spool.ndjson> [--label "..."] [--batch 500] [--filter loot-filter.json]
 
 Reads the NDJSON spool (``%LOCALAPPDATA%\Hero_Siege\afk\spool\<id>.ndjson``),
 finds a running Hero Siege Item Editor on 127.0.0.1:8765-8774, posts the
 ``"kind": "item"`` records to ``POST /api/vault/ingest`` in batches and prints
 the totals.  Re-running on the same spool is safe: the editor keys every
 record by (expedition_id, seq) and reports repeats as duplicates.
+
+``--filter`` names a Vault transfer filter (``tools/loot_filter.py``): gear of
+unticked rarities, or keys and materials, stay in the spool. Records are sent
+best rarity first, and an editor that understands it lays the expedition's
+stashes out once at the end (``layout: defer`` then ``finalize``); an older
+editor ignores both fields and lays out each batch as before.
 
 Exit codes: 0 done, 1 bad input, 2 no editor running, 3 the editor refused a
 batch, 4 unreadable or skipped records. Standard library only.
@@ -20,6 +26,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+import loot_filter
 
 APPLICATION_ID = "hero-siege-item-editor"
 HEADERS = {"Content-Type": "application/json", "X-Hero-Siege-Item-Editor": "1"}
@@ -42,10 +50,18 @@ def discover_editor(timeout: float = 0.5) -> str | None:
     return None
 
 
-def read_spool(path: Path, keep_filtered: bool = False) -> tuple[dict[str, list[dict]], int, int]:
+def read_spool(path: Path, keep_filtered: bool = False, settings: dict | None = None,
+               left_out: dict | None = None) -> tuple[dict[str, list[dict]], int, int]:
     """Return item records grouped by expedition id, the unreadable line count
     and how many records the player's in-game loot filter hid (skipped unless
-    keep_filtered). A record without a verdict (older spools) is kept."""
+    keep_filtered). A record without a verdict (older spools) is kept.
+
+    ``settings`` applies a Vault transfer filter on top; ``left_out`` (when
+    given) receives the number of records it kept back, by reason. Records of
+    each expedition come back best rarity first, spool order within a rarity.
+    """
+    if settings is not None and keep_filtered:
+        settings = dict(settings, respect_game_filter=False)
     groups: dict[str, list[dict]] = {}
     unreadable = 0
     filtered = 0
@@ -61,13 +77,25 @@ def read_spool(path: Path, keep_filtered: bool = False) -> tuple[dict[str, list[
                 continue
             if not isinstance(record, dict) or record.get("kind") != "item":
                 continue
-            if record.get("filter_visible") is False and not keep_filtered:
-                filtered += 1
-                continue
+            if settings is None:
+                if record.get("filter_visible") is False and not keep_filtered:
+                    filtered += 1
+                    continue
+            else:
+                reason = loot_filter.decide(record, settings)
+                if reason == "game_filter":
+                    filtered += 1
+                    continue
+                if reason is not None:
+                    if left_out is not None:
+                        left_out[reason] = left_out.get(reason, 0) + 1
+                    continue
             expedition = record.get("expedition_id")
             if not isinstance(expedition, str) or not expedition.strip():
                 expedition = path.stem
             groups.setdefault(expedition, []).append(record)
+    for records in groups.values():
+        records.sort(key=loot_filter.transfer_order)  # stable: spool order inside a rarity
     return groups, unreadable, filtered
 
 
@@ -85,7 +113,8 @@ def get_json(base: str, path: str, timeout: float = 10.0) -> dict:
         return json.load(response)
 
 
-def ingest(base: str, expedition: str, records: list[dict], label: str | None, batch_size: int) -> dict:
+def ingest(base: str, expedition: str, records: list[dict], label: str | None, batch_size: int,
+           defer_layout: bool = True) -> dict:
     totals: dict = {"deposited": 0, "duplicate": 0, "ignored": 0, "skipped": [], "collections": {}}
     index = 0
     size = batch_size
@@ -94,6 +123,8 @@ def ingest(base: str, expedition: str, records: list[dict], label: str | None, b
         body: dict = {"expedition_id": expedition, "records": batch}
         if label:
             body["label"] = label
+        if defer_layout:
+            body["layout"] = "defer"
         try:
             result = post_json(base, "/api/vault/ingest", body)
         except urllib.error.HTTPError as exc:
@@ -118,6 +149,17 @@ def ingest(base: str, expedition: str, records: list[dict], label: str | None, b
     return totals
 
 
+def finalize(base: str, expedition: str, label: str | None) -> dict:
+    """Lay out every item of the expedition once, after the last batch."""
+    body: dict = {"expedition_id": expedition, "records": [], "finalize": True}
+    if label:
+        body["label"] = label
+    result = post_json(base, "/api/vault/ingest", body)
+    if not isinstance(result, dict) or result.get("err"):
+        raise RuntimeError(str((result or {}).get("err") or "unexpected reply from the editor"))
+    return result
+
+
 def main(argv: list[str]) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -127,9 +169,11 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("spool", type=Path, help="spool .ndjson file")
     parser.add_argument("--label", default=None, help="optional text added to the AFK Farm stash name")
-    parser.add_argument("--batch", type=int, default=200, help="records per request (1-500, default 200)")
+    parser.add_argument("--batch", type=int, default=MAX_BATCH, help=f"records per request (1-{MAX_BATCH}, default {MAX_BATCH})")
     parser.add_argument("--keep-filtered", action="store_true",
                         help="also deposit items your in-game loot filter hides (they are skipped by default)")
+    parser.add_argument("--filter", type=Path, default=None,
+                        help="Vault transfer filter file (rarities, keys and materials); items it keeps back stay in the spool")
     args = parser.parse_args(argv[1:])
     if not args.spool.is_file():
         print(f"not a file: {args.spool}", file=sys.stderr)
@@ -137,13 +181,26 @@ def main(argv: list[str]) -> int:
     if not 1 <= args.batch <= MAX_BATCH:
         print(f"--batch must be between 1 and {MAX_BATCH}", file=sys.stderr)
         return 1
-    groups, unreadable, filtered = read_spool(args.spool, keep_filtered=args.keep_filtered)
+    settings = None
+    if args.filter is not None:
+        try:
+            settings = loot_filter.load(args.filter)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print("Vault transfer filter: " + loot_filter.describe(settings))
+    left_out: dict = {}
+    groups, unreadable, filtered = read_spool(args.spool, keep_filtered=args.keep_filtered,
+                                              settings=settings, left_out=left_out)
     if unreadable:
         print(f"warning: {unreadable} unreadable line(s) skipped")
     if filtered:
         print(f"{filtered} item(s) hidden by your in-game loot filter were left out (--keep-filtered to take them)")
+    labels = {"rarity": "of rarities you did not choose", "stackables": "keys and materials"}
+    for reason, count in sorted(left_out.items()):
+        print(f"{count} item(s) {labels.get(reason, reason)} stay in the spool; widen the Vault transfer filter to add them later")
     if not groups:
-        print(f"no item records in {args.spool}; nothing to ingest")
+        print(f"no item records to transfer from {args.spool}")
         return 4 if unreadable else 0
     base = discover_editor()
     if base is None:
@@ -165,6 +222,12 @@ def main(argv: list[str]) -> int:
             print(f"  ingest failed: {exc}", file=sys.stderr)
             exit_code = 3
             continue
+        if totals["deposited"]:
+            try:
+                totals["collections"] = finalize(base, expedition, args.label).get("collections") or totals["collections"]
+            except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
+                # Items are stored; the Vault places unplaced items when opened.
+                print(f"  warning: final stash layout failed ({exc}); the Vault arranges the items when you open it")
         print(
             f"  deposited {totals['deposited']}, duplicate {totals['duplicate']}, "
             f"skipped {len(totals['skipped'])}; the Vault holds {status.get('deposited')} "

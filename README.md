@@ -1,16 +1,27 @@
 # AFK FARM · Hero Siege
 
 A Windows companion that plans timed expeditions using your offline hero’s measured
-farming pace. **0.5.1 — measured farming / beta release.** Kill rates come from your
+farming pace. **0.6.0 — measured farming / beta release.** Kill rates come from your
 calibration; the game generates loot when you claim your rewards.
 
 Start from a saved eligible profile with the game closed or another hero loaded.
 The selected hero, live hero and past recording are shown separately. Changing
 the selection does not change an active expedition.
 
-Keep the recorded hero in its region while claiming. Reward delivery can take
-several minutes; Explore and Loot show its live progress. Only after delivery
-finishes are the game save and Vault transfer marked complete.
+Keep the recorded hero in its region while claiming. Reward delivery replays every
+kill through the game, so it takes minutes to hours depending on the expedition;
+Explore shows the time left as measured on your computer, with Normal, Fast and
+Maximum speeds. **Pause and save delivery**, closing the game window or leaving the
+region with the expedition hero saves and pauses it; claim again to continue.
+**Claim in background** opens the game minimized, delivers and closes it again.
+Only after delivery finishes are the game save and Vault transfer marked complete.
+
+The Loot page has an expedition summary (rarities, best drops, XP, gold, level and
+delivery time) and a **Vault transfer filter** that chooses which rarities, keys
+and materials go to Infinite Vault; items left out stay in the records and
+**Transfer again** adds them later. Explore offers **Farm again**, warns when the
+loaded hero's loadout no longer matches a calibration, and can notify you when an
+expedition is ready and when delivery finishes.
 
 ## Getting started
 
@@ -118,6 +129,9 @@ spool without issuing a reward command. The game need not be running. Vault tran
 is a separate retryable step. A failure sidecar, changed plan, unsaved or partial
 checkpoint, incomplete spool or inconsistent totals blocks recovery and transfer.
 The recovery report explains the missing evidence; no automatic rollback edits saves.
+**Close as partial delivery** lets the player accept such a claim as it stands: the
+delivered records are kept and can be transferred, the rest is given up, nothing
+is replayed, and the expedition clock is freed.
 Older receipts that confirm only the controller's room-end save need review: that
 path did not reliably persist character XP. The corrected path explicitly saves
 both the character and account through native game routines.

@@ -2,9 +2,11 @@
 No pip, downloads or game/save files. Run after the plugin and launcher builds.
 """
 from pathlib import Path
-import hashlib,json,shutil,sys,zipfile
+import hashlib,json,re,shutil,sys,zipfile
 ROOT=Path(__file__).resolve().parents[1]
-OUT=ROOT/'dist/AFK-FARM-0.5.1'
+# The package is named after the panel version, so the two cannot drift apart.
+VERSION=re.search(r"^VERSION='([^']+)'",(ROOT/'tools/panel.py').read_text(encoding='utf-8'),re.M).group(1)
+OUT=ROOT/f'dist/AFK-FARM-{VERSION}'
 
 def copy(source,target):
     target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(source,target)

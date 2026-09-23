@@ -82,7 +82,11 @@ struct RewardTotals {
     }
 };
 
+// "aborted": a Pause/abort or a closed game window saved and stopped delivery.
+// "paused" counts only when it carries a save: the hero left the region and
+// the plugin saved before waiting. A running or unsaved checkpoint may hide
+// rewards the save does not contain, so it still needs reconciliation.
 inline bool CanResume(const std::string& state, bool samePlan, bool saved) {
-    return state == "aborted" && samePlan && saved;
+    return (state == "aborted" || state == "paused") && samePlan && saved;
 }
 }

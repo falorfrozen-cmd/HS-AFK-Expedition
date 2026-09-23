@@ -1,4 +1,4 @@
-# AFK FARM panel contract — 0.5.1
+# AFK FARM panel contract — 0.6.0
 
 The product interface is English only, including accessibility labels, server
 messages and launcher dialogs. Number formatting uses en-US. Player names, game
@@ -24,8 +24,13 @@ loot previews, recovery evidence, validation results and local portrait identifi
 JSON action and the `X-AFK-Token` from the page; Host and Origin are checked.
 
 Actions: configure, install, launch, close, capture_start, capture_stop, start,
-claim, cancel, ingest, restart_region, validate_start, recover, portrait, save_modifiers.
-`plan` is a compatibility alias for start, not a dry run.
+claim, claim_background, pause_delivery, cancel, ingest, restart_region,
+validate_start, recover, portrait, save_modifiers, save_loot_filter, save_preferences.
+`plan` is a compatibility alias for start, not a dry run. `claim` and
+`claim_background` accept `speed` (normal, fast, max); a paused claim keeps the
+speed written into its claim plan. `pause_delivery` is the only action that runs
+beside another job: it sends `afk.py pause` (the plugin's saved abort) through the
+single IPC writer lock and appends its output to the running claim's log.
 Long actions return HTTP 202 and run in one worker. The browser polls JSON at
 500 ms during recording or work, every 2 seconds while idle, and every 5 seconds
 while hidden and idle. Polls cannot overlap. The countdown updates locally each
@@ -54,6 +59,10 @@ All runtime data lives under `%LOCALAPPDATA%/Hero_Siege/afk`.
 | validations/*.reference.json | Forecast frozen before a separate recording |
 | validations/*.result.json | Independent comparison with declared sample and error targets |
 | portraits/<identity-hash>.png | User-selected screenshot, unchanged; never a rendered save |
+| loot-filter.json | Vault transfer filter: gear rarities, keys/materials, game filter (schema 1) |
+| preferences.json | Default delivery speed for new claims (schema 1) |
+| delivery-rate.json | Smoothed calls per second per speed, learned from finished claims |
+| sessions/<claim>.panel.json | Hero level and speed when the claim started, for the summary |
 
 `farm_context` is `{schema:1,hash:<SHA256>,inputs:{...}}`. New panel profiles use
 `profile_version:3`, `rate_basis:"farm-clock"` and identity version 2. A context
@@ -81,7 +90,19 @@ dismissible; their original log remains available.
 
 Progress percent is calls_done/calls_total, clamped to 0–100, with zero when total
 is unknown. A failure file overrides progress. A running/paused/unclean earlier
-claim is never silently retried by the panel. `rewards_saved` settles the clock;
+claim is never silently retried by the panel. `progress.resumable` (and
+`recovery.status == "paused"`) marks an "aborted" or "paused" checkpoint for the
+exact plan that carries the game's save receipt, no failed calls and no failure
+file: Claim continues it with `afk.py claim`, which follows the existing claim plan
+and never rescales it. Every other interrupted state still needs review.
+
+The snapshot adds `delivery` (remaining calls and per-speed estimates from
+`delivery-rate.json`), `preferences`, `loot_filter`, `repeat` (the last settled
+expedition and a usable profile for it), `profile_live_matches` (profile id →
+whether the loaded hero's pace inputs still match), `background` (whether Claim in
+background can run, with the reason) and, per reward, `level_before`,
+`level_now` and `delivery_seconds`. The browser estimates time left from the last
+minute of live progress; notifications are a browser preference in localStorage. `rewards_saved` settles the clock;
 `success` additionally reflects Vault status. Retry only ingest when Vault failed.
 The Loot view excludes old developer results without panel_version.
 
@@ -103,6 +124,14 @@ confirmed save callback, complete spool sequence and matching item/gold/XP total
 It settles local bookkeeping without replay. A partial or contradictory claim stays
 blocked. This is not an atomic transaction across game saves and the spool, or a
 guarantee against power loss. GET /api/recovery-report?id=... exports the evidence.
+Close as partial delivery (`settle_partial`, after a confirmation that states the
+kept and abandoned call counts) is offered only for a claim that needs review. It
+is refused while the live game reports a running replay or the checkpoint changed
+in the last 30 seconds. It writes a result with state `partial`, `partial: true`,
+`settled_by: player`, the original checkpoint state and the review reasons, credits
+the delivered fraction of the hours and frees the armed clock. The checkpoint,
+plan and spool stay untouched; no reward call is made. Such a result shows a
+Partial badge and may be transferred to the Vault.
 Reward operations share an OS lock. Snapshot recovery checks may be cached for two
 seconds; actions always recheck the files. Vault retries never replay native rewards.
 

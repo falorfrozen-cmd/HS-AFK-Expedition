@@ -49,8 +49,9 @@ int main() {
     check(resumed.exp == old.exp && resumed.gold == old.gold && resumed.expUpdateCalls == 71 && resumed.goldLogCalls == 21, "reward counters preserve fractional amounts");
     disk.erase("items_filtered");
     check(!resumed.Load(read), "incomplete legacy checkpoint refused");
-    check(!CanResume("running", true, true) && !CanResume("paused", true, true), "unclean interruption needs reconciliation");
+    check(!CanResume("running", true, true) && !CanResume("paused", true, false) && !CanResume("error", true, true), "unclean interruption needs reconciliation");
     check(CanResume("aborted", true, true) && !CanResume("aborted", false, true) && !CanResume("aborted", true, false), "resume requires same plan and saved rewards");
+    check(CanResume("paused", true, true) && !CanResume("paused", false, true), "a saved pause outside the region resumes");
     check(CheckFarmSample(false,true,true,1)==FarmSample::Count,"ordinary farm time is counted");
     check(CheckFarmSample(true,false,true,1)==FarmSample::Pause,"transient room loading pauses the same recording");
     check(CheckFarmSample(false,true,false,40)==FarmSample::Resume,"loading interval is excluded on return");

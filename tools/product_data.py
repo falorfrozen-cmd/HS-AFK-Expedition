@@ -4,6 +4,7 @@ import json
 from collections import Counter
 from pathlib import Path
 import afk
+import loot_filter
 from item_labels import rarity_name
 
 SUPPORT = [
@@ -15,7 +16,7 @@ SUPPORT = [
     dict(name='ForgePact kill-trigger rewards',status='Unsupported',detail='Signature and extra Angelic/Unholy rolls happen during a full enemy death and are not included here.'),
     dict(name='Event and guaranteed boss rewards',status='Unsupported',detail='Tower, Wormhole and battlefield completion rewards are not replayed. Special monster packets are blocked.'),
     dict(name='Tracker and kill statistics',status='Unsupported',detail='Reward calls do not represent a complete enemy death event.'),
-    dict(name='Interrupted delivery',status='Limited recovery',detail='Completed native saves with matching records can be reconciled. Uncertain partial saves remain held for review.'),
+    dict(name='Interrupted delivery',status='Limited recovery',detail='Pause, closing the game window and leaving the region with the expedition hero save and continue later. Completed native saves with matching records can be reconciled. A crash or other interruptions remain held for review.'),
 ]
 
 
@@ -66,7 +67,7 @@ class Presentation:
         key=('loot',ident)
         cached=self.cache.get(key)
         if cached and cached[0]==stamp:return cached[1]
-        rows=[];unreadable=0;rarities=Counter();filtered=0
+        rows=[];unreadable=0;rarities=Counter();visible=Counter();filtered=0;stackables=0;best={}
         for line in path.read_text(encoding='utf-8',errors='replace').splitlines():
             if not line.strip():continue
             try:r=json.loads(line)
@@ -80,8 +81,17 @@ class Presentation:
             rarity=info.get('27');label=rarity_name(rarity)
             hidden=r.get('filter_visible') is False
             filtered+=hidden;rarities[label]+=1
+            stackable=loot_filter.is_stackable(r);stackables+=stackable
+            if not hidden and not stackable:
+                # Summary: gear the game's filter shows, by rarity group, rarest first.
+                group=loot_filter.rarity_group(r);visible[group]+=1;drop=(group,display.get('name',name))
+                entry=best.setdefault(drop,dict(name=drop[1],rarity=label,group=group,icon=display.get('icon'),count=0))
+                entry['count']+=1
             rows.append(dict(seq=r.get('seq'),name=display.get('name',name),rarity=label,rarity_code=rarity,
                              icon=display.get('icon'),filtered=hidden,type=r.get('type')))
-        result=dict(items=rows[:500],total=len(rows),filtered=filtered,unreadable=unreadable,rarities=dict(rarities),truncated=len(rows)>500)
+        order={g:i for i,g in enumerate(loot_filter.GEAR_RARITIES)}
+        top=sorted(best.values(),key=lambda e:(order.get(e['group'],len(order)),-e['count'],e['name']))[:12]
+        result=dict(items=rows[:500],total=len(rows),filtered=filtered,unreadable=unreadable,rarities=dict(rarities),
+                    visible_rarities=dict(visible),stackables=stackables,best=top,truncated=len(rows)>500)
         self.cache[key]=(stamp,result)
         return result

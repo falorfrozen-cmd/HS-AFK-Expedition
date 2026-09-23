@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import time
 from pathlib import Path
 
 
@@ -37,13 +38,37 @@ def data_lock(data):
             else: fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
+SAVED='saved (character and account save performed)'
+
+
+def resumable(data, ident):
+    """A paused claim the plugin can continue from its saved position.
+
+    Pause, a closed game window or leaving the region with the expedition hero
+    saves the game and writes an "aborted" or "paused" checkpoint with that
+    save receipt. Only such a checkpoint, for the exact plan, without failed
+    calls or a failure record, continues; everything else still needs review.
+    """
+    if not isinstance(ident,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,120}', ident): return False
+    if (data/'sessions'/f'{ident}.failure.json').exists(): return False
+    p=read(data/'sessions'/f'{ident}.progress.json') or {}
+    plan_path=data/'plans'/f'{ident}.json'
+    if p.get('state') not in ('aborted','paused') or p.get('checkpoint_version')!=2 or p.get('expedition_id')!=ident: return False
+    if not plan_path.is_file() or p.get('plan_hash')!=hashlib.sha256(plan_path.read_bytes()).hexdigest(): return False
+    done,total=p.get('calls_done'),p.get('calls_total')
+    if type(done) is not int or type(total) is not int or not 0<=done<total: return False
+    if p.get('failed')!=0 or p.get('skipped')!=0: return False
+    saved=p.get('save_committed') is True and p.get('saved')==SAVED
+    return saved or (p.get('saved')=='nothing to save' and done==0)
+
+
 def inspect(data, ident):
     if not isinstance(ident,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,120}', ident): raise ValueError('Invalid claim ID.')
     p=data/'sessions'/f'{ident}.progress.json'
     plan_path=data/'plans'/f'{ident}.json'
     spool=data/'spool'/f'{ident}.ndjson'
     if not p.exists() and not spool.exists() and not (data/'sessions'/f'{ident}.failure.json').exists():
-        return dict(id=ident,status='not_started',recoverable=False,reasons=[])
+        return dict(id=ident,status='not_started',recoverable=False,resumable=False,reasons=[])
     reasons=[]
     progress=read(p) or {}
     plan=read(plan_path) or {}
@@ -84,8 +109,44 @@ def inspect(data, ident):
         if type(n) not in (int,float) or not math.isfinite(n) or n<0: reasons.append('The '+key+' counter is invalid.')
         elif summaries and summaries[-1].get('gold' if key=='gold' else 'exp_credited')!=int(n):
             reasons.append('The '+key+' summary does not match the checkpoint.')
-    return dict(id=ident,status='saved' if not reasons else 'needs_review',recoverable=not reasons,reasons=reasons,
+    if reasons and resumable(data,ident):
+        return dict(id=ident,status='paused',recoverable=False,resumable=True,
+                    reasons=['Delivery was paused at a saved position. Claim again with the same hero in the same region to continue.'],
+                    items=len(items),calls_done=progress.get('calls_done'),calls_total=progress.get('calls_total'))
+    return dict(id=ident,status='saved' if not reasons else 'needs_review',recoverable=not reasons,resumable=False,reasons=reasons,
                 items=len(items),calls_done=progress.get('calls_done'),calls_total=progress.get('calls_total'))
+
+
+def settle_partial(data, ident):
+    """The player keeps what an interrupted claim delivered and gives up the rest.
+
+    Only for a claim that needs review (not resumable, not a completed save). No
+    reward is generated or repeated: the partial result is recorded as such, the
+    armed clock is freed, and the checkpoint, spool and plan stay untouched for the
+    recovery report. Whether the game saved the delivered XP is not confirmed.
+    """
+    from afk import write_json, iso, now_utc
+    review=inspect(data,ident)
+    if review['status']!='needs_review':raise ValueError('Only a claim that needs review can be closed as partial.')
+    state=read(data/'state.json') or {}
+    armed=state.get('armed')
+    if not armed or armed.get('expedition_id')+'_claim'!=ident: raise ValueError('This is not the currently armed claim.')
+    p=read(data/'sessions'/f'{ident}.progress.json') or {}
+    if p.get('state') in ('running','paused') and (data/'sessions'/f'{ident}.progress.json').stat().st_mtime>time.time()-30:
+        raise ValueError('Delivery still looks active. Pause it or close the game, then try again.')
+    previous=read(data/'sessions'/f'{ident}.result.json') or {}
+    done,total=p.get('calls_done') or 0,p.get('calls_total') or 0
+    result=dict(p,state='partial',checkpoint_state=p.get('state'),rewards_saved=False,success=False,partial=True,settled_by='player',
+                settled_at=iso(now_utc()),review_reasons=review['reasons'],
+                stages=dict(replay='partial',save='unconfirmed',ingest='done' if previous.get('stages',{}).get('ingest')=='done' else 'pending'))
+    write_json(data/'sessions'/f'{ident}.result.json',result)
+    plan=read(data/'plans'/f'{ident}.json') or {}
+    fraction=done/total if total else 0
+    state['last_claim']=dict(expedition_id=ident,credited_hours=float(plan.get('hours',0))*float(plan.get('scale',1))*fraction,
+                             at=iso(now_utc()),result=result,partial=True)
+    state.pop('armed')
+    write_json(data/'state.json',state)
+    return result
 
 
 def settle(data, ident):
