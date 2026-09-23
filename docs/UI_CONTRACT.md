@@ -1,4 +1,4 @@
-# AFK FARM panel contract — 0.6.4
+# AFK FARM panel contract — 0.6.5
 
 The product interface is English only, including accessibility labels, server
 messages and launcher dialogs. Number formatting uses en-US. Player names, game
@@ -304,6 +304,10 @@ presets and world switches expose their selected state to assistive technology.
 Tables scroll within focusable, labelled regions on narrow screens; no data columns
 are removed. The initial fetch waits for DOMContentLoaded so all deferred UI modules
 are present before the first render. No API, reward rules or delivery logic changed.
+
+Settings opens **Connection diagnostics** by itself while any setup check needs action
+(its summary counts them); a section the player closed stays closed. The
+notification card names the one-time Windows scheduled task it uses.
 
 The isolated browser fixture accepts optional `presentation` fields in its temporary
 control.json for UI-only empty, populated and interrupted states. These overrides

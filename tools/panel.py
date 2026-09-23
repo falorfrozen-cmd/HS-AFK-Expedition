@@ -17,7 +17,7 @@ ROOT=Path(__file__).resolve().parents[1]
 WEB=ROOT/'web'
 CLASSES={i+1:n for i,n in enumerate(('Viking','Pyromancer','Marksman','Pirate','Nomad','Redneck','Necromancer','Samurai','Paladin','Amazon','Demon Slayer','Demonspawn','Shaman','White Mage','Marauder','Plague Doctor','Shield Lancer','Illusionist','Jotunn','Exo','Butcher','Stormweaver','Bard','Prophet'))}
 XOR=bytes.fromhex('e3953db1016bb65854383f46a17429cc454551f2a7f7abb726f137a88191e67e')
-VERSION='0.6.4'
+VERSION='0.6.5'
 IDENTIFIER=re.compile(r'[A-Za-z0-9_-]{1,120}\Z')
 
 def require(ok,message):

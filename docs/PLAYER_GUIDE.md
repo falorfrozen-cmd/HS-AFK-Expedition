@@ -1,4 +1,4 @@
-# AFK FARM 0.6.4 beta
+# AFK FARM 0.6.5 beta
 
 Timed offline expeditions using your hero's measured farming pace and the game's
 native reward system. Windows only. The interface is entirely in English.
@@ -78,8 +78,8 @@ keyboard activation. Map navigation does not require the game to be running.
 
 ## Items your loot filter hides
 
-Loot → **Items your loot filter hides** chooses what happens to them during your
-next claim:
+Loot → **Filtered item handling** chooses what happens to them during your next
+claim:
 
 - **Sell below Satanic; break Satanic and above down like the Prospector** (default).
   Each hidden item below Satanic is sold for the gold a merchant pays for it (its own
@@ -99,7 +99,7 @@ A paused delivery keeps the choice it started with.
 
 ## Region comparison and notifications
 
-Explore shows a **Region comparison** for the selected hero: each calibrated region's
+Explore → **Compare your regions** shows, for the selected hero, each calibrated region's
 kills per minute and XP per hour from the calibration (before reward settings), and
 the gold (at ×1) and Unholy, Angelic, Heroic and Satanic drops per hour of the
 expeditions you delivered there, at the Magic Find you used. Short expeditions give

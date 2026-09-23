@@ -271,3 +271,18 @@ test('startup waits for deferred UI modules before fetching and rendering state'
  await f.listeners.get('DOMContentLoaded')[0]();
  assert.deepEqual(requests,['/zones.json','/api/state']);assert.equal(f.run('rendered'),true);
 });
+
+test('settings name the reminder task and open diagnostics while a setup check needs action',()=>{
+ const f=fixture();let inserted='';f.elements.set('.workspace',{querySelector:()=>({insertAdjacentHTML:(_,html)=>{inserted+=html;}})});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../web/extras.js'),'utf8'),f.context);
+ f.data.notification={windows:true};f.data.preferences={ready_notification:true};f.data.support=[];
+ f.data.installation={checks:[{name:'Game folder',ok:true,detail:'Found'},{name:'AFK plugin',ok:false,detail:'Not installed'}]};f.set(f.data);
+ f.run('view="settings";extrasPanel()');
+ assert.match(inserted,/Windows scheduled task \(AFK FARM\\Expedition ready\)/);
+ assert.match(inserted,/data-disclosure="setup-details" open>/);assert.match(inserted,/1 check needs action/);
+ inserted='';f.data.installation.checks.push({name:'Aurie',ok:false,detail:'Missing'});f.set(f.data);f.run('extrasPanel()');assert.match(inserted,/2 checks need action/);
+ inserted='';f.data.installation.checks=f.data.installation.checks.map(c=>({...c,ok:true}));f.set(f.data);f.run('extrasPanel()');
+ assert.match(inserted,/data-disclosure="setup-details" >/);assert.match(inserted,/Game files & plugin checks/);
+ inserted='';f.run('disclosureState.set("setup-details",false)');f.data.installation.checks[0].ok=false;f.set(f.data);f.run('extrasPanel()');
+ assert.match(inserted,/data-disclosure="setup-details" >/,'a section the player closed stays closed');
+});

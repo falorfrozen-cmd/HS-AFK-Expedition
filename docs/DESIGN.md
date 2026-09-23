@@ -1,4 +1,4 @@
-# AFK FARM 0.6.4 — measured-kill product
+# AFK FARM 0.6.5 — measured-kill product
 
 The earlier combat-reconstruction project is archived outside the active tree.
 The product uses empirical kills per region-second and native reward replay.
