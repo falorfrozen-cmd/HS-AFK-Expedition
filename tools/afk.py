@@ -57,6 +57,11 @@ LOOT_FILTER_FILE = DATA / "loot-filter.json"
 DELIVERY_WAIT_HOURS = 12
 
 
+def max_hours(armed: dict | None = None) -> float:
+    """The longest an armed expedition's clock credits."""
+    return MAX_HOURS
+
+
 def delivery_speed(plan: dict) -> str:
     """The named speed of a plan; older plans without one are Normal."""
     name = plan.get("delivery_speed")
@@ -106,6 +111,93 @@ def character_key(stamp) -> tuple:
             or type(stamp.get('slot')) is not int or not 0 <= stamp['slot'] < 2**31):
         sys.exit('character identity is missing or legacy; load the character with the updated plugin and capture a new calibration')
     return stamp['slot'], stamp['name'], stamp['class']
+
+
+def hero_key(stamp) -> str | None:
+    """A version-2 identity as text (slot:class:name); None for legacy stamps."""
+    try:
+        slot, name, cls = character_key(stamp)
+    except SystemExit:
+        return None
+    return f"{slot}:{cls}:{name}"
+
+
+# ------------------------------------------------------------------ roster state
+# state.json schema 2 keeps every armed expedition under `expeditions`, keyed by
+# its id, one per hero (the hero roster, 0.7.0). Schema 1 kept a single one
+# under `armed`; such a file reads as a one-entry roster and is rewritten in the
+# new form by the next change. `last_claims` remembers each hero's last settled
+# claim for "Farm again"; `last_claim` stays the newest one overall.
+STATE_SCHEMA = 2
+
+
+def load_state(path: Path | None = None) -> dict:
+    st = read_json(path or STATE, {}) or {}
+    st = dict(st) if isinstance(st, dict) else {}
+    expeditions = st.get("expeditions") if isinstance(st.get("expeditions"), dict) else {}
+    expeditions = {k: dict(v) for k, v in expeditions.items() if isinstance(v, dict) and v.get("expedition_id") == k}
+    old = st.pop("armed", None)
+    if isinstance(old, dict) and isinstance(old.get("expedition_id"), str) and old["expedition_id"] not in expeditions:
+        expeditions[old["expedition_id"]] = dict(old)
+    st["expeditions"] = expeditions
+    st["last_claims"] = dict(st["last_claims"]) if isinstance(st.get("last_claims"), dict) else {}
+    return st
+
+
+def save_state(st: dict, path: Path | None = None) -> None:
+    out = {k: v for k, v in st.items() if k != "armed"}
+    out["schema"] = STATE_SCHEMA
+    write_json(path or STATE, out)
+
+
+def armed_hero(armed: dict) -> str | None:
+    """The hero an armed expedition belongs to (older records: from its plan)."""
+    if isinstance(armed.get("hero"), str) and armed["hero"]:
+        return armed["hero"]
+    plan = read_json(Path(armed["plan"])) if armed.get("plan") else None
+    return hero_key((plan or {}).get("character"))
+
+
+def armed_list(st: dict) -> list[dict]:
+    return sorted(st.get("expeditions", {}).values(), key=lambda a: (str(a.get("started_at") or ""), a["expedition_id"]))
+
+
+def armed_for_hero(st: dict, stamp) -> dict | None:
+    key = hero_key(stamp)
+    if key is None:
+        return None
+    return next((a for a in armed_list(st) if armed_hero(a) == key), None)
+
+
+def select_armed(st: dict, expedition_id: str | None = None, stamp=None) -> dict:
+    """The expedition an action is meant for: by id, else the hero's, else the only one."""
+    roster = armed_list(st)
+    if expedition_id:
+        found = st.get("expeditions", {}).get(expedition_id)
+        if not found:
+            sys.exit(f"no active expedition {expedition_id}")
+        return found
+    if stamp is not None:
+        found = armed_for_hero(st, stamp)
+        if not found:
+            sys.exit("this hero has no active expedition")
+        return found
+    if not roster:
+        sys.exit("nothing armed: afk.py start <plan> first")
+    if len(roster) > 1:
+        sys.exit("several expeditions are active; choose one with --expedition "
+                 + ", ".join(a["expedition_id"] for a in roster))
+    return roster[0]
+
+
+def settle_in_state(st: dict, claim_id: str, record: dict) -> None:
+    """Free the claim's hero and remember the claim (last_claim / last_claims)."""
+    ident = claim_id.removesuffix("_claim")
+    armed = st.get("expeditions", {}).pop(ident, None)
+    hero = armed_hero(armed) if armed else None
+    st["last_claim"] = record
+    if hero:
+        st.setdefault("last_claims", {})[hero] = record
 
 
 def profile_key(profile) -> str:
@@ -637,6 +729,16 @@ def scale_plan(plan: dict, factor: float, new_id: str) -> dict:
     return out
 
 
+def claim_plan_for(plan: dict, credited_h: float, claim_id: str) -> dict:
+    """What a claim delivers: a Siege the waves held by now, other expeditions
+    the plan scaled to the credited time."""
+    if plan.get("mode") == "siege":
+        import siege
+        return siege.claim_plan(plan, credited_h, claim_id)
+    factor = credited_h / float(plan["hours"]) if plan.get("hours") else 0.0
+    return scale_plan(plan, factor, claim_id)
+
+
 def print_preview(plan: dict) -> None:
     pv = plan["preview"]
     print(f"expedition {plan['expedition_id']}: {plan['hours']:.2f} h" + (f" (scaled x{plan['scale']:.3f})" if "scale" in plan else ""))
@@ -959,35 +1061,39 @@ def cmd_start(args) -> None:
     character_key(plan.get('character'))
     if len(plan.get('zones', [])) != 1:
         sys.exit('create a new single-zone plan before starting the clock')
-    st = read_json(STATE, {}) or {}
-    if st.get("armed"):
-        sys.exit(f"an expedition is already armed ({st['armed']['expedition_id']} since {st['armed']['started_at']}); claim or cancel it first")
-    st["armed"] = {"expedition_id": plan["expedition_id"], "plan": str(plan_path), "started_at": iso(now_utc()), "hours": plan["hours"]}
-    write_json(STATE, st)
+    st = load_state()
+    busy = armed_for_hero(st, plan['character'])
+    if busy:
+        sys.exit(f"this hero's expedition is already active ({busy['expedition_id']} since {busy.get('started_at')}); claim or cancel it first")
+    if plan["expedition_id"] in st["expeditions"]:
+        sys.exit(f"expedition {plan['expedition_id']} is already armed")
+    armed = {"expedition_id": plan["expedition_id"], "plan": str(plan_path), "started_at": iso(now_utc()), "hours": plan["hours"],
+             "hero": hero_key(plan["character"]), "mode": plan.get("mode", "farm")}
+    st["expeditions"][armed["expedition_id"]] = armed
+    save_state(st)
     print_preview(plan)
-    print(f"armed at {st['armed']['started_at']} for up to {plan['hours']:.2f} h. Quit the game if you like; come back and run `afk.py claim`.")
+    print(f"armed at {armed['started_at']} for up to {plan['hours']:.2f} h. Quit the game if you like; come back and run `afk.py claim`.")
 
 
 @serialized_rewards
 def cmd_cancel(args) -> None:
-    st = read_json(STATE, {}) or {}
-    if not st.get("armed"):
+    st = load_state()
+    if not st["expeditions"]:
         print("nothing armed")
         return
-    ident=st['armed']['expedition_id']+'_claim'
+    armed = select_armed(st, getattr(args, "expedition", None))
+    ident=armed['expedition_id']+'_claim'
     if any((folder/f'{ident}{suffix}').exists() for folder,suffix in ((SESSIONS,'.progress.json'),(SESSIONS,'.failure.json'),(SPOOL,'.ndjson'))):
         sys.exit('delivery has started; inspect recovery instead of cancelling the clock')
-    st["cancelled"] = st.pop("armed")
-    write_json(STATE, st)
-    print("cancelled")
+    st["cancelled"] = st["expeditions"].pop(armed["expedition_id"])
+    save_state(st)
+    print(f"cancelled {armed['expedition_id']}")
 
 
 @serialized_rewards
 def cmd_claim(args) -> None:
-    st = read_json(STATE, {}) or {}
-    armed = st.get("armed")
-    if not armed:
-        sys.exit("nothing armed: afk.py start <plan> first")
+    st = load_state()
+    armed = select_armed(st, getattr(args, "expedition", None))
     plan = read_json(Path(armed["plan"]))
     if not plan:
         sys.exit("the armed plan file is gone")
@@ -1013,7 +1119,7 @@ def cmd_claim(args) -> None:
         print(f"a claim for this expedition is already {pr_old['state']} "
               f"({pr_old.get('calls_done', 0)}/{pr_old.get('calls_total', 0)} calls); following it")
     else:
-        scaled = scale_plan(plan, factor, claim_id)
+        scaled = claim_plan_for(plan, credited_h, claim_id)
         if plan.get('label_region'):
             # An early claim delivers less than planned: name it by what it credits.
             scaled['label'] = expedition_label(plan.get('label_hero'), plan['label_region'], credited_h)
@@ -1047,9 +1153,9 @@ def cmd_claim(args) -> None:
               + (f" | {conversion['note']}" if conversion.get('note') else ''))
     if run_succeeded(pr):
         credited_h = float(scaled.get("hours", 0)) * float(scaled.get("scale", 1.0)) if reuse else credited_h
-        st["last_claim"] = {"expedition_id": claim_id, "credited_hours": credited_h, "at": iso(now_utc()), "result": pr}
-        st.pop("armed", None)
-        write_json(STATE, st)
+        st = load_state()   # another hero may have started meanwhile: settle on fresh state
+        settle_in_state(st, claim_id, {"expedition_id": claim_id, "credited_hours": credited_h, "at": iso(now_utc()), "result": pr})
+        save_state(st)
         print("claimed. The clock is free again.")
     else:
         print("the run did not finish; the clock stays armed so you can claim again (it resumes where it stopped)")
@@ -1081,16 +1187,16 @@ def cmd_run(args) -> None:
 
 
 def cmd_status(args) -> None:
-    st = read_json(STATE, {}) or {}
+    st = load_state()
     print(f"ForgePact now: {forgepact_text(forgepact_current())}")
-    armed = st.get("armed")
-    if armed:
+    roster = armed_list(st)
+    for armed in roster:
         started = parse_iso(armed["started_at"])
         elapsed_h = (now_utc() - started).total_seconds() / 3600.0
-        credited = min(elapsed_h, float(armed["hours"]), MAX_HOURS)
-        print(f"armed: {armed['expedition_id']} since {armed['started_at']} - elapsed {elapsed_h:.2f} h, credited so far {credited:.2f} h "
-              f"(cap {min(float(armed['hours']), MAX_HOURS):.2f} h)")
-    else:
+        credited = min(elapsed_h, float(armed["hours"]), max_hours(armed))
+        print(f"armed: {armed['expedition_id']} ({armed_hero(armed) or 'unknown hero'}, {armed.get('mode', 'farm')}) since {armed['started_at']} - "
+              f"elapsed {elapsed_h:.2f} h, credited so far {credited:.2f} h (cap {min(float(armed['hours']), max_hours(armed)):.2f} h)")
+    if not roster:
         print("no expedition armed")
     lc = st.get("last_claim")
     if lc:
@@ -1291,9 +1397,11 @@ def main(argv=None) -> None:
 
     p = sub.add_parser("preview"); p.add_argument("plan"); p.set_defaults(fn=cmd_preview)
     p = sub.add_parser("start"); p.add_argument("plan"); p.set_defaults(fn=cmd_start)
-    p = sub.add_parser("cancel"); p.set_defaults(fn=cmd_cancel)
+    p = sub.add_parser("cancel"); p.add_argument("--expedition", help="which armed expedition (needed when several heroes have one)")
+    p.set_defaults(fn=cmd_cancel)
     p = sub.add_parser("pause"); p.set_defaults(fn=cmd_pause)
     p = sub.add_parser("claim"); p.add_argument("--dry-run", action="store_true"); p.add_argument("--no-ingest", action="store_true")
+    p.add_argument("--expedition", help="which armed expedition (needed when several heroes have one)")
     p.add_argument("--speed", choices=sorted(DELIVERY_SPEEDS), default="normal", help="delivery speed for a new claim (a paused claim keeps its own)")
     p.add_argument("--filtered", choices=["convert", "keep"], default="keep",
                    help="items the game's loot filter hides, for a new claim: sell below Satanic and break Satanic and above down like the Prospector, or keep them")

@@ -1,7 +1,7 @@
 """AFK FARM local panel. Python 3.13 standard library; localhost only."""
 from __future__ import annotations
 import argparse, base64, hashlib, json, math, os, re, secrets, shutil, subprocess, sys, threading, time, uuid, webbrowser, zlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, unquote
@@ -197,14 +197,40 @@ class Panel:
             self.sync_notification()
 
     def sync_notification(self):
-        # Keeps the Windows "expedition ready" task in step with the armed
-        # expedition and the setting; a failure is shown, never raised.
+        # Keeps one Windows "ready" task per armed expedition (and worker trip)
+        # in step with the roster and the setting; a failure is shown, never raised.
         try:
-            armed=(read(self.data/'state.json',{}) or {}).get('armed')
-            plan=read(Path(armed['plan']),{}) if armed else None
-            self.notification=notify.sync(self.data,armed,load_preferences(self.data)['ready_notification'],plan)
+            entries=[]
+            for armed in afk.armed_list(afk.load_state(self.data/'state.json')):
+                plan=read(Path(armed['plan']),{}) if armed.get('plan') else {}
+                entries.append(self.ready_entry(armed,plan or {}))
+            entries+=self.worker_entries()
+            self.notification=notify.sync_all(self.data,[e for e in entries if e],load_preferences(self.data)['ready_notification'])
         except Exception as e:
             self.notification=dict(error=f'Notification task not updated: {e}')
+
+    def ready_entry(self,armed,plan):
+        """When an expedition's notification fires: its end, a Siege's report time."""
+        if plan.get('mode')=='siege':
+            import siege
+            try:ends=afk.parse_iso(armed['started_at'])+timedelta(hours=siege.report_hours(plan))
+            except (KeyError,TypeError,ValueError):return None
+            title,message=notify.texts(plan)
+            return notify.entry('exp-'+armed['expedition_id'],ends,title,message)
+        return notify.expedition_entry(armed,plan)
+
+    def worker_entries(self):
+        return []
+
+    def notification_view(self,armed):
+        """The setting's state for the focus expedition, plus every scheduled task."""
+        n=self.notification or {}
+        tasks=n.get('tasks') or {}
+        key='exp-'+armed['expedition_id'] if armed else None
+        scheduled=dict(expedition_id=armed['expedition_id'],at=tasks[key]) if key and key in tasks else None
+        errors=n.get('errors') or {}
+        return dict(windows=os.name=='nt',scheduled=scheduled,tasks=[dict(key=k,at=v) for k,v in sorted(tasks.items(),key=lambda kv:kv[1])],
+                    error=n.get('error') or (errors.get(key) if key else None) or next(iter(errors.values()),None))
 
     def current_live(self):
         return self.live if time.monotonic()-self.live_at<15 else None
@@ -233,9 +259,59 @@ class Panel:
         running=bool(not capture.get('stopped_at') and live and live.get('capture_on') and live.get('capture_file')==path)
         return dict(capture,**stats,running=running,outcome=capture_outcome(capture,stats,running,self.profiles))
 
-    def snapshot(self):
+    def hero_for_slot(self,slot):
+        return next((c for c in self.chars if c['slot']==slot),None) if type(slot) is int else None
+
+    def focus_armed(self,state,focus,live):
+        """The expedition the top-level fields describe: the one asked for, else
+        the selected hero's (none when that hero is free), else the live
+        hero's, else the most recently started one."""
+        focus=focus or {}
+        if focus.get('expedition') in state['expeditions']:return state['expeditions'][focus['expedition']]
+        if focus.get('slot') is not None:
+            hero=self.hero_for_slot(focus['slot'])
+            return afk.armed_for_hero(state,hero) if hero else None
+        if live and valid_identity(live.get('character')):
+            found=afk.armed_for_hero(state,live['character'])
+            if found:return found
+        roster=afk.armed_list(state)
+        return roster[-1] if roster else None
+
+    def review(self,ident,fresh=False):
+        """Display cache per claim: reward/recovery actions always inspect fresh files."""
+        cached=self.recovery_cache.get(ident) if isinstance(self.recovery_cache,dict) else None
+        if fresh or not cached or time.monotonic()-cached[0]>2:
+            if not isinstance(self.recovery_cache,dict):self.recovery_cache={}
+            cached=(time.monotonic(),recovery.inspect(self.data,ident));self.recovery_cache[ident]=cached
+        return cached[1]
+
+    def roster_view(self,armed,live):
+        """One row of the hero roster: who, where, how long, and how its claim stands."""
+        plan=read(Path(armed['plan']),{}) if armed.get('plan') else {}
+        plan=plan or {}
+        ident=armed['expedition_id']+'_claim';progress=progress_view(self.data,ident);review=self.review(ident)
+        room=(plan.get('zones') or [{}])[0].get('room')
+        try:
+            started=afk.parse_iso(armed['started_at']);elapsed=(datetime.now(timezone.utc)-started).total_seconds()/3600
+            ready_at=(started+timedelta(hours=float(armed['hours']))).isoformat()
+        except (KeyError,TypeError,ValueError):elapsed=None;ready_at=None
+        row=dict(expedition_id=armed['expedition_id'],hero=afk.armed_hero(armed),character=plan.get('character'),mode=plan.get('mode','farm'),
+                 label=plan.get('label'),room=room,region=zone_names().get(room,room),started_at=armed.get('started_at'),hours=armed.get('hours'),
+                 ready_at=ready_at,ready=elapsed is not None and elapsed>=float(armed.get('hours') or 0),
+                 progress=dict((k,progress.get(k)) for k in ('state','percent','calls_done','calls_total','resumable','reconciliation_required','pause')),
+                 recovery=dict(status=review.get('status'),recoverable=review.get('recoverable'),resumable=review.get('resumable')),
+                 live_hero=bool(live and same_character(live.get('character'),plan.get('character'))))
+        if plan.get('mode')=='siege' and elapsed is not None:
+            import siege
+            row['siege']=siege.live_view(plan,elapsed)
+            row['ready']=elapsed>=siege.report_hours(plan)
+        return row
+
+    def snapshot(self,focus=None):
         if time.monotonic()-self.last_profiles>3:self.refresh_profiles()
-        state=read(self.data/'state.json',{}) or {}; armed=state.get('armed'); plan=None; progress={}
+        state=afk.load_state(self.data/'state.json'); plan=None; progress={}
+        live=self.current_live()
+        armed=self.focus_armed(state,focus,live)
         if armed:
             plan=read(Path(armed['plan']))
             progress=progress_view(self.data,armed['expedition_id']+'_claim')
@@ -250,14 +326,8 @@ class Panel:
             if len(rewards)>=20:break
         cfg=read(self.data/'config.json',{}) or {}
         with self.state_lock: job=json.loads(json.dumps(self.job)) if self.job else None
-        live=self.current_live()
-        review=None
-        if armed:
-            ident=armed['expedition_id']+'_claim'
-            # Display cache only: reward/recovery actions always inspect fresh files.
-            if not self.recovery_cache or self.recovery_cache['id']!=ident or time.monotonic()-self.recovery_checked_at>2:
-                self.recovery_cache=recovery.inspect(self.data,ident);self.recovery_checked_at=time.monotonic()
-            review=self.recovery_cache
+        review=self.review(armed['expedition_id']+'_claim') if armed else None
+        focus_hero=(plan or {}).get('character') if armed else self.hero_for_slot((focus or {}).get('slot'))
         validations=[read(f,{}) for f in sorted((self.data/'validations').glob('*.result.json'),key=lambda p:p.stat().st_mtime,reverse=True)][:20]
         levels={afk.character_key(c):c.get('level') for c in self.chars if valid_identity(c)}
         for reward in rewards:
@@ -286,9 +356,10 @@ class Panel:
                     portraits={str(c['slot']):self.portrait_key(c) for c in self.chars if (self.data/'portraits'/(self.portrait_key(c)+'.png')).is_file()},
                     loot_filter=vault_filter,loot_filter_error=filter_error,loot_filter_rarities=list(loot_filter.GEAR_RARITIES),
                     preferences=load_preferences(self.data),delivery=self.delivery_view(armed,plan,progress),
-                    notification=dict(windows=os.name=='nt',scheduled=(self.notification or {}).get('scheduled'),error=(self.notification or {}).get('error')),
-                    repeat=self.repeat_view(state,armed),profile_live_matches=self.live_matches(live),regions=self.regions_view(),
-                    background=self.background_view(armed,progress,review,live),pause_note=self.pause_note)
+                    notification=self.notification_view(armed),
+                    repeat=self.repeat_view(state,armed,afk.hero_key(focus_hero) if focus_hero else None),profile_live_matches=self.live_matches(live),regions=self.regions_view(),
+                    background=self.background_view(armed,progress,review,live) if armed else self.background_view(None,{},None,live),pause_note=self.pause_note,
+                    expeditions=[self.roster_view(a,live) for a in afk.armed_list(state)],focus=dict(focus or {}))
 
     def delivery_view(self,armed,plan,progress):
         """Delivery speeds with this computer's estimate for the calls due now."""
@@ -307,15 +378,19 @@ class Panel:
                 for k,v in afk.DELIVERY_SPEEDS.items()]
         return dict(calls=calls,speeds=speeds,active_speed=afk.delivery_speed(read(self.data/'plans'/f"{armed['expedition_id']}_claim.json",{}) or {}) if armed else None)
 
-    def repeat_view(self,state,armed):
-        """The last settled expedition, to start the same one again with one click."""
+    def repeat_view(self,state,armed,hero=None):
+        """A hero's last settled expedition (else the newest one), to start it again with one click."""
         if armed:return None
-        last=(state.get('last_claim') or {}).get('expedition_id','')
+        claims=state.get('last_claims') or {}
+        record=claims.get(hero) if hero else state.get('last_claim')
+        last=(record or {}).get('expedition_id','')
         plan=read(self.data/'plans'/f"{last.removesuffix('_claim')}.json",{}) or {}
         room=(plan.get('zones') or [{}])[0].get('room');ch=plan.get('character')
         if not room or not valid_identity(ch) or not plan.get('hours'):return None
+        if 'expeditions' in state and afk.armed_for_hero(state,ch):return None
         profile=next((p for p in self.profiles if p['usable'] and p.get('room')==room and same_character(p.get('character'),ch)),None)
         return dict(room=room,hours=float(plan['hours']),slot=ch['slot'],name=ch['name'],profile=profile['id'] if profile else None,
+                    mode=plan.get('mode','farm'),siege_level=(plan.get('siege') or {}).get('level'),
                     reason=None if profile else 'The saved calibration for this hero and region is no longer usable. Recalibrate first.')
 
     def expedition_results(self):
@@ -390,9 +465,27 @@ class Panel:
             if self.job:self.job['output']=(self.job['output']+str(message)+'\n')[-40000:]
             else:self.pause_note=str(message)[-2000:]
 
-    def pause(self):
+    def target_armed(self,args,live=None):
+        """The armed expedition an action is for: ``expedition`` (id), else the
+        hero in ``slot`` if it has one, else the live hero's, else the only one."""
+        state=afk.load_state(self.data/'state.json')
+        ident=args.get('expedition')
+        if ident is not None:
+            require(isinstance(ident,str) and ident in state['expeditions'],'This expedition is not active.')
+            return state['expeditions'][ident]
+        hero=next((c for c in characters(self.data) if c['slot']==args.get('slot')),None) if type(args.get('slot')) is int else None
+        found=afk.armed_for_hero(state,hero) if hero else None
+        if found:return found
+        roster=afk.armed_list(state);require(roster,'No active expedition.')
+        if live and valid_identity(live.get('character')):
+            found=afk.armed_for_hero(state,live['character'])
+            if found:return found
+        require(len(roster)==1,'Several heroes have an active expedition. Choose which one.')
+        return roster[0]
+
+    def pause(self,args=None):
         """Pause a running delivery at a saved position. Runs beside the claim job."""
-        armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active expedition.')
+        armed=self.target_armed(args or {},self.current_live())
         pr=progress_view(self.data,armed['expedition_id']+'_claim')
         require(pr.get('state') in ('running','paused'),'No reward delivery is running.')
         require(self.pause_lock.acquire(blocking=False),'Pause was already requested.')
@@ -438,7 +531,7 @@ class Panel:
         code=process.wait(); require(code==0,f'Action failed (exit code {code}). See the activity log for details.')
 
     def submit(self,action,args):
-        if action=='pause_delivery':return self.pause()
+        if action=='pause_delivery':return self.pause(args)
         require(self.job_lock.acquire(blocking=False),'Another action is in progress.')
         with self.state_lock:self.job=dict(id=uuid.uuid4().hex,action=action,state='running',output='',error=None,started_at=time.time())
         def run():
@@ -582,7 +675,8 @@ class Panel:
             # Starting freezes a saved profile and arms a local clock. It must not
             # require the game, another hero's context, or a responsive IPC channel.
             p=self.profile(args)
-            require(not (read(self.data/'state.json',{}) or {}).get('armed'),'An expedition is already active.')
+            require(not afk.armed_for_hero(afk.load_state(self.data/'state.json'),p['character']),
+                    "This hero's expedition is already active. Claim or cancel it first; other heroes can start their own.")
             hours=float(args.get('hours',1));require(math.isfinite(hours) and .25<=hours<=8,'Duration must be between 15 minutes and 8 hours.')
             ident='farm_'+datetime.now().strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:6]
             plan=afk.make_plan(hours,[(p['room'],1)],ident,40,'pickup',profile_overrides={p['room']:p})
@@ -594,7 +688,7 @@ class Panel:
             path=self.data/'plans'/f'{ident}.json';afk.write_json(path,plan)
             self.cli('start',path);return
         if name=='claim':
-            armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active expedition.')
+            armed=self.target_armed(args,self.current_live())
             plan=read(Path(armed['plan']));require(plan,'Could not read the expedition plan.')
             review=recovery.inspect(self.data,armed['expedition_id']+'_claim')
             if review['recoverable']:
@@ -614,14 +708,13 @@ class Panel:
         if name=='claim_background':
             self.claim_background(args);return
         if name=='recover':
-            armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active claim to reconcile.')
+            armed=self.target_armed(args,self.current_live())
             with recovery.data_lock(self.data):recovery.settle(self.data,armed['expedition_id']+'_claim')
             self.log('Saved rewards reconciled without replay. Queued items can be transferred from Loot.');return
         if name=='settle_partial':
             # The player keeps what an interrupted claim delivered and gives up the
             # rest. Nothing is generated again; the records stay for the report.
-            armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active expedition.')
-            live=self.current_live()
+            live=self.current_live();armed=self.target_armed(args,live)
             require(not (live and live.get('replay_running')),'Delivery is running in the game. Pause it first.')
             with recovery.data_lock(self.data):result=recovery.settle_partial(self.data,armed['expedition_id']+'_claim')
             self.log(f"Claim closed as a partial delivery ({result.get('calls_done',0):,} of {result.get('calls_total',0):,} reward calls). "
@@ -629,17 +722,16 @@ class Panel:
         if name=='accept_position':
             # The player accepts the recorded position of a delivery a crash cut
             # short; the item records end exactly there. Nothing runs here.
-            armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active expedition.')
-            live=self.current_live()
+            live=self.current_live();armed=self.target_armed(args,live)
             require(not (live and live.get('replay_running')),'Delivery is running in the game. Pause it first.')
             with recovery.data_lock(self.data):p=recovery.accept_position(self.data,armed['expedition_id']+'_claim')
             self.recovery_cache=None
             self.log(f"Recorded position accepted ({p['calls_done']:,} of {p['calls_total']:,} reward calls). "
                      'Claim with the same hero in the same region to deliver the rest. Delivered calls are not repeated.');return
         if name=='cancel':
-            armed=(read(self.data/'state.json',{}) or {}).get('armed')
-            require(not armed or not progress_view(self.data,armed['expedition_id']+'_claim').get('state'),'An expedition cannot be cancelled here once delivery has started.')
-            self.cli('cancel');return
+            armed=self.target_armed(args)
+            require(not progress_view(self.data,armed['expedition_id']+'_claim').get('state'),'An expedition cannot be cancelled here once delivery has started.')
+            self.cli('cancel','--expedition',armed['expedition_id']);return
         if name=='ingest':
             ident=args.get('id','');require(bool(IDENTIFIER.fullmatch(ident)),'Invalid reward ID.')
             spool=self.data/'spool'/f'{ident}.ndjson';require(spool.is_file(),'Reward file not found.')
@@ -673,7 +765,7 @@ class Panel:
             plan=read(Path(armed['plan']),{}) or {};ch=plan.get('character')
             hero=next((c for c in characters(self.data) if valid_identity(ch) and same_character(c,ch)),None)
             afk.write_json(sidecar,dict(level_before=hero.get('level') if hero else None,speed=speed,at=datetime.now(timezone.utc).isoformat()))
-        self.cli('claim','--speed',speed,'--filtered',load_preferences(self.data)['filtered_items'])
+        self.cli('claim','--expedition',armed['expedition_id'],'--speed',speed,'--filtered',load_preferences(self.data)['filtered_items'])
 
     def claim_background(self,args):
         """Open the game minimized, load the hero in its region, deliver at Maximum speed, close the game.
@@ -683,7 +775,7 @@ class Panel:
         only when this action opened it and delivery finished or paused safely.
         """
         from game_session import Session,running
-        armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active expedition.')
+        armed=self.target_armed(args,self.current_live())
         plan=read(Path(armed['plan']));require(plan,'Could not read the expedition plan.')
         ident=armed['expedition_id']+'_claim'
         review=recovery.inspect(self.data,ident)
@@ -711,6 +803,17 @@ class Panel:
             self.log(json.dumps(session.close()))
             self.live=None;self.game_running=False
 
+def focus_query(query):
+    """/api/state?slot=N or ?expedition=ID: which expedition the top-level fields describe."""
+    from urllib.parse import parse_qs
+    values=parse_qs(query or '');focus={}
+    slot=(values.get('slot') or [''])[0]
+    if re.fullmatch(r'\d{1,4}',slot):focus['slot']=int(slot)
+    ident=(values.get('expedition') or [''])[0]
+    if IDENTIFIER.fullmatch(ident):focus['expedition']=ident
+    return focus
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):pass
     @property
@@ -733,7 +836,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.allowed():return self.send(403,{'error':'Host rejected'})
         try:
             route=urlsplit(self.path).path
-            if route=='/api/state':return self.send(200,self.app.snapshot())
+            if route=='/api/state':return self.send(200,self.app.snapshot(focus_query(urlsplit(self.path).query)))
             if route=='/api/instance':return self.send(200,dict(application='hero-siege-afk-farm',version=VERSION))
             if route=='/api/recovery-report':
                 from urllib.parse import parse_qs

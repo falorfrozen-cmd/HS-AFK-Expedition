@@ -41,7 +41,7 @@ class ReadyNotificationTests(unittest.TestCase):
         self.assertIn('<Command>conhost.exe</Command>', run.xml)
         self.assertIn('--headless powershell.exe', run.xml)
         self.assertIn('Suh&apos;s expedition in The Glacial Trail is ready' if '&apos;' in run.xml else "Suh's expedition in The Glacial Trail is ready", run.xml)
-        self.assertIn('&quot;AFK FARM\\Expedition ready&quot;', run.xml)
+        self.assertIn('&quot;AFK FARM\\Ready exp-farm_x&quot;', run.xml, 'each expedition has its own self-deleting task')
         self.assertFalse((self.d / 'notify-ready.xml').exists(), 'the request file is removed')
         script = (self.d / notify.SCRIPT).read_text(encoding='utf-8-sig')
         self.assertIn(notify.POWERSHELL_APP_ID, script); self.assertIn('/Delete /TN $Task /F', script)
@@ -72,6 +72,30 @@ class ReadyNotificationTests(unittest.TestCase):
         for bad in (dict(ARMED, started_at='yesterday'), dict(ARMED, started_at='2026-09-23T09:30:00'), dict(ARMED, hours=None)):
             with self.subTest(bad=bad):
                 self.assertIsNone(notify.sync(self.d, bad, True, PLAN, now=NOW, run=FakeScheduler())['scheduled'])
+
+    def test_every_hero_of_the_roster_gets_its_own_task(self):
+        run = FakeScheduler()
+        a = notify.expedition_entry(ARMED, PLAN)
+        b = notify.expedition_entry(dict(ARMED, expedition_id='farm_y', hours=3.0), dict(PLAN, label_hero='Sgham'))
+        record = notify.sync_all(self.d, [a, b], True, now=NOW, run=run)
+        self.assertEqual(run.calls, ['/Create', '/Create'])
+        self.assertEqual(set(record['tasks']), {'exp-farm_x', 'exp-farm_y'})
+        notify.sync_all(self.d, [b], True, now=NOW, run=run)
+        self.assertEqual(run.calls[-1], '/Delete', 'a claimed hero loses only its own task')
+        self.assertEqual(set(notify._read(self.d / notify.RECORD)['tasks']), {'exp-farm_y'})
+        notify.sync_all(self.d, [b], True, now=NOW, run=run)
+        self.assertEqual(len(run.calls), 3, 'an unchanged roster changes nothing')
+
+    def test_a_0_6_record_loses_its_single_task_once(self):
+        run = FakeScheduler()
+        (self.d / notify.RECORD).write_text(json.dumps(dict(schema=1, scheduled=dict(expedition_id='old', at='x'))), encoding='utf-8')
+        notify.sync_all(self.d, [], True, now=NOW, run=run)
+        notify.sync_all(self.d, [], True, now=NOW, run=run)
+        self.assertEqual(run.calls, ['/Delete'])
+
+    def test_a_siege_names_its_report(self):
+        title, message = notify.texts(dict(PLAN, mode='siege'))
+        self.assertIn('siege', title); self.assertIn('siege of The Glacial Trail is over', message)
 
     def test_texts_fall_back_and_never_break_the_command_line(self):
         self.assertEqual(notify.texts({})[1], "Your hero's expedition in its region is ready. Open AFK FARM and claim with Your hero in its region.")

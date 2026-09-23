@@ -125,7 +125,7 @@ class PanelTests(unittest.TestCase):
                 afk.cmd_start(SimpleNamespace(plan=args[1]))
             with patch.object(app,'cli',side_effect=cli),patch.object(app,'fresh',side_effect=AssertionError('Offline start contacted the game')),patch.object(afk,'Ipc',side_effect=AssertionError('Offline start sent IPC')):
                 app.action('start',dict(slot=1,profile='example',hours=.25))
-            state=afk.read_json(self.root/'state.json');plan=afk.read_json(Path(state['armed']['plan']))
+            state=afk.load_state(self.root/'state.json');plan=afk.read_json(Path(afk.armed_list(state)[0]['plan']))
             self.assertEqual(plan['character'],p['character']);self.assertEqual(plan['farm_context'],p['farm_context'])
             self.assertEqual(plan['preview']['kills'],188)
             before=(self.root/'state.json').read_bytes()

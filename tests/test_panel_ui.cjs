@@ -269,7 +269,7 @@ test('startup waits for deferred UI modules before fetching and rendering state'
  const requests=[];f.context.fetch=async url=>{requests.push(url);return {ok:true,json:async()=>url==='/zones.json'?[{room:'Act_03_03',name:'Desert',act:3,world:'old'}]:f.data};};
  f.run('let rendered=false;extrasPanel=()=>{};bindMap=()=>{};updateLive=()=>{};centerMap=()=>{};render=()=>{rendered=true;};');
  await f.listeners.get('DOMContentLoaded')[0]();
- assert.deepEqual(requests,['/zones.json','/api/state']);assert.equal(f.run('rendered'),true);
+ assert.deepEqual(requests,['/zones.json','/api/state?slot=2'],'the state names the selected hero so its own expedition is shown');assert.equal(f.run('rendered'),true);
 });
 
 test('settings name the reminder task and open diagnostics while a setup check needs action',()=>{
