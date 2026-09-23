@@ -45,9 +45,12 @@ class PanelTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         with self.assertRaises(OSError):
             panel.LocalPanelServer(('127.0.0.1',server.server_port),panel.Handler)
-    def test_context_mismatch_refuses_claim_before_reward_command(self):
+    def test_changed_loadout_refuses_validation_but_never_a_claim(self):
         app=panel.Panel(self.root);p=self.good();s=dict(character=p['character'],game_build='B',farm_context=dict(hash='b'*64))
         with self.assertRaises(ValueError):app.context_matches(p,s)
+        app.context_matches(p,s,loadout=False)
+        with self.assertRaises(ValueError):app.context_matches(p,dict(s,game_build='other'),loadout=False)
+        with self.assertRaises(ValueError):app.context_matches(p,dict(s,character=dict(p['character'],slot=9)),loadout=False)
     def test_profile_aliases_are_not_duplicated(self):
         p=self.good();afk.write_json(self.root/'profiles/Act_01_01.json',p);afk.write_json(self.root/'profiles/Act_01_01--alias.json',p)
         self.assertEqual(len(panel.Panel(self.root).profiles),1)
@@ -133,16 +136,20 @@ class PanelTests(unittest.TestCase):
         self.start_offline(None)
     def test_start_does_not_depend_on_other_live_character(self):
         self.start_offline(dict(character=dict(self.good()['character'],slot=5,name='Other'),room='Town_01_rm',replay_running=False))
-    def test_claim_keeps_character_loadout_and_region_guards(self):
+    def test_claim_keeps_character_build_and_region_guards_but_not_the_loadout(self):
         p=self.good();p['zones']=[dict(room=p['room'])]
         afk.write_json(self.root/'plans/example.json',p)
         afk.write_json(self.root/'state.json',dict(armed=dict(expedition_id='example',plan=str(self.root/'plans/example.json'))))
         base=dict(character=p['character'],game_build='B',farm_context=p['farm_context'],room=p['room'])
-        for changes in (dict(character=dict(p['character'],slot=5)),dict(farm_context=dict(hash='b'*64)),dict(room='Town_01_rm'),dict(game_build='old')):
+        for changes in (dict(character=dict(p['character'],slot=5)),dict(room='Town_01_rm'),dict(game_build='old')):
             app=panel.Panel(self.root)
             with self.subTest(changes=changes),patch.object(app,'fresh',return_value=dict(base,**changes)),patch.object(app,'cli') as cli,patch.object(panel.recovery,'inspect',return_value=dict(recoverable=False,status='not_started')):
                 with self.assertRaises(ValueError):app.action('claim',{})
                 cli.assert_not_called()
+        app=panel.Panel(self.root)
+        with patch.object(app,'fresh',return_value=dict(base,farm_context=dict(hash='b'*64))),patch.object(app,'cli') as cli,             patch.object(panel.recovery,'inspect',return_value=dict(recoverable=False,status='not_started')):
+            app.action('claim',{})
+        self.assertEqual(cli.call_args.args[0],'claim','a changed loadout, level or setting never blocks a claim')
     def test_capture_cache_invalidates_on_file_change_and_freshness(self):
         app=panel.Panel(self.root);p=self.root/'sessions/capture.ndjson';p.parent.mkdir()
         p.write_text(json.dumps(dict(kind='farm_clock',room='Act_01_01',seconds=5))+'\n',encoding='utf-8')

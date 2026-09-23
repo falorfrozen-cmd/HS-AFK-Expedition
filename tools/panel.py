@@ -17,7 +17,7 @@ ROOT=Path(__file__).resolve().parents[1]
 WEB=ROOT/'web'
 CLASSES={i+1:n for i,n in enumerate(('Viking','Pyromancer','Marksman','Pirate','Nomad','Redneck','Necromancer','Samurai','Paladin','Amazon','Demon Slayer','Demonspawn','Shaman','White Mage','Marauder','Plague Doctor','Shield Lancer','Illusionist','Jotunn','Exo','Butcher','Stormweaver','Bard','Prophet'))}
 XOR=bytes.fromhex('e3953db1016bb65854383f46a17429cc454551f2a7f7abb726f137a88191e67e')
-VERSION='0.6.2'
+VERSION='0.6.3'
 IDENTIFIER=re.compile(r'[A-Za-z0-9_-]{1,120}\Z')
 
 def require(ok,message):
@@ -465,10 +465,15 @@ class Panel:
         require(p is not None,'Calibration profile not found.');require(p['usable'],' · '.join(p['problems']))
         require(same_character(p['character'],self.selected(args)),'This profile belongs to another character.');return p
 
-    def context_matches(self,p,s):
+    def context_matches(self,p,s,loadout=True):
+        # Claims pass loadout=False: gear, talents, levels or combat settings that
+        # changed after the calibration never block delivery (the player's choice,
+        # 2026-09-23); the calibrated pace still sets the rewards. Hero, game
+        # version and region stay required: they decide who receives the rewards,
+        # whether the recorded monsters are valid, and the drops' map.
         require(same_character(p['character'],s['character']),f"Load {p['character']['name']} (slot {p['character']['slot']+1}) to use this profile in the game. Currently loaded: {s['character']['name']}.")
         require(p['game_build']==s['game_build'],'The game version changed. Recalibration is required.')
-        require(reward_modifiers.context_matches(p.get('farm_context'),s.get('farm_context'),bool(p.get('reward_modifiers'))),'Gear, talents, level or combat settings changed. Recalibration is required.')
+        if loadout:require(reward_modifiers.context_matches(p.get('farm_context'),s.get('farm_context'),bool(p.get('reward_modifiers'))),'Gear, talents, level or combat settings changed. Recalibration is required.')
 
     def action(self,name,args):
         if name=='save_loot_filter':
@@ -598,8 +603,13 @@ class Panel:
             pr=progress_view(self.data,armed['expedition_id']+'_claim')
             require(not pr.get('reconciliation_required'),'The claim has an uncertain outcome. Rewards were not repeated. The records need review.')
             if pr.get('state') in ('running','paused','aborted') and not pr.get('resumable'):raise ValueError('The previous claim is incomplete. It was not retried automatically.')
-            s=self.fresh();self.context_matches(plan,s)
+            s=self.fresh();self.context_matches(plan,s,loadout=False)
             require(s['room']==plan['zones'][0]['room'],'Return to the calibrated region to claim rewards: '+plan['zones'][0]['room'])
+            if pr.get('resumable'):
+                # A started delivery is bound to the loadout it began with (its plan is fixed).
+                claim=read(self.data/'plans'/f"{armed['expedition_id']}_claim.json",{}) or {}
+                require(not claim.get('farm_context') or reward_modifiers.context_matches(claim['farm_context'],s.get('farm_context'),bool(claim.get('reward_modifiers'))),
+                        'This paused delivery began with another loadout, level or settings. Restore them to continue it, or close it as a partial delivery.')
             self.claim(armed,args.get('speed'));return
         if name=='claim_background':
             self.claim_background(args);return
@@ -692,7 +702,7 @@ class Panel:
             self.log(json.dumps(session.prepare(c['slot'],c['name'],c['class'],240),ensure_ascii=False)[:2000])
             self.log('Travelling to '+zone_names().get(region,region)+'...')
             self.log(json.dumps(session.travel(region,c['slot'],c['name'],c['class'],240),ensure_ascii=False)[:2000])
-        s=self.fresh();self.context_matches(plan,s)
+        s=self.fresh();self.context_matches(plan,s,loadout=False)
         require(s['room']==region,'The hero did not arrive in the expedition region.')
         self.claim(armed,'max')
         pr=progress_view(self.data,ident)

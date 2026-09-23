@@ -1,4 +1,4 @@
-# AFK FARM 0.6.2 beta
+# AFK FARM 0.6.3 beta
 
 Timed offline expeditions using your hero's measured farming pace and the game's
 native reward system. Windows only. The interface is entirely in English.
@@ -29,7 +29,9 @@ Extract the entire ZIP, then open **AFK FARM.exe**. Keep the `app`, `runtime` an
    Choose your calibrated region and duration in **Explore**, then **Start expedition**.
    Start directly from the saved profile: the game can be closed or running another
    hero. Time continues while the game and panel are closed. Claiming early uses elapsed time.
-7. Load the same hero and return to that region with the same loadout. Click
+7. Load the same hero and return to that region. Gear, talents, levels or combat
+   settings you changed after calibrating do not block the claim; the calibrated
+   pace still sets the rewards. Click
    **Claim rewards**. XP and gold save through the game; native item records go to
    Item Editor's Infinite Vault. If Item Editor is closed, retry **Transfer to Vault**
    from Loot when it is available. Never replay rewards to repair an item transfer.
@@ -131,7 +133,8 @@ calibration page labels the live hero/location and the last recording individual
 To record, load the selected hero in a regular Act region. To start an expedition
 from an existing profile, no live hero is required. You can change the selected hero
 or record another hero while an expedition runs; the active plan stays unchanged.
-Return to the recorded hero, loadout and region when claiming rewards.
+Return to the recorded hero and region when claiming rewards. A delivery you
+paused continues only with the loadout it started with.
 
 Walking and idle time in the region count. Town and loading time do not count for
 that region. Finish before taking a break. One minute, 30 kills and 95% capture

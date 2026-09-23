@@ -782,7 +782,19 @@ def run_plan(plan_path: Path, plan: dict, bin_dir: Path, ingest: bool, anywhere:
         if state.get('request_id')!=token or state.get('online') is not False:
             sys.exit('stale or online character context; claim refused')
         if not reward_modifiers.context_matches(plan['farm_context'], state.get('farm_context'), bool(plan.get('reward_modifiers'))):
-            sys.exit('equipment/talents/level/difficulty/settings changed; recalibrate before claim')
+            if not state.get('farm_context'):
+                sys.exit('fresh character context unavailable')
+            if (SESSIONS / f"{plan['expedition_id']}.progress.json").exists():
+                sys.exit('this delivery began with another loadout, level or settings; restore them to continue it, or close it as partial')
+            # The player's choice (2026-09-23): gear, talents, levels or combat
+            # settings that changed after the calibration never block a claim.
+            # The calibrated pace still sets the rewards; the claim plan records
+            # the context it is delivered with (the plugin checks that one).
+            plan.setdefault('calibration_farm_context', plan['farm_context'])
+            plan['farm_context'] = state['farm_context']
+            write_json(plan_path, plan)
+            print('note: gear, talents, level or combat settings changed since the calibration; '
+                  'the calibrated pace still sets the rewards')
 
     if not ipc.alive():
         sys.exit("the game (with the AFK plugin) is not running, or it is not answering on afk_ipc")

@@ -1,4 +1,4 @@
-# AFK FARM panel contract — 0.6.2
+# AFK FARM panel contract — 0.6.3
 
 The product interface is English only, including accessibility labels, server
 messages and launcher dialogs. Number formatting uses en-US. Player names, game
@@ -178,6 +178,16 @@ divided by each claim's gold setting, `rarities_per_hour` for Unholy, Angelic, H
 and Satanic items at the Magic Find recorded (`magic_find`), `expeditions` and
 `hours`. Vault labels are `<hero> · <region> · <time>`; a claim relabels its plan
 with the credited time.
+
+## Claim requirements
+
+A claim needs the recorded hero (identity version 2), the same game build and the
+recorded region. Gear, talents, levels and combat settings that changed after the
+calibration do not block it (0.6.3): the panel shows a note instead, and
+`afk.py claim` writes the live `farm_context` into the new claim plan (keeping the
+calibration's as `calibration_farm_context`) before the plugin starts. A delivery
+with a checkpoint is refused when its context changed. Recording and validation
+still require an unchanged context.
 
 ## Filtered items
 

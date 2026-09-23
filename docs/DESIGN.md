@@ -1,4 +1,4 @@
-# AFK FARM 0.6.2 — measured-kill product
+# AFK FARM 0.6.3 — measured-kill product
 
 The earlier combat-reconstruction project is archived outside the active tree.
 The product uses empirical kills per region-second and native reward replay.
@@ -14,8 +14,14 @@ then imports spool items into the Item Editor Vault.
 
 Starting the clock freezes an eligible saved profile and needs no live game or
 character match. A different hero can be played or calibrated meanwhile. Claim
-still verifies the recorded character, build, loadout and region before native
-reward delivery. Selection in the UI never changes the frozen expedition owner.
+still verifies the recorded character, build and region before native reward
+delivery. Since 0.6.3 a loadout, level or combat setting that changed after the
+calibration no longer blocks a claim (the player's decision: a single-player
+offline game, where the check only guarded the calibrated pace against a weaker
+hero). The calibrated pace still sets the rewards; a new claim plan records the
+context it is delivered with (`farm_context`, the calibration's kept as
+`calibration_farm_context`) so the plugin's own check passes. A delivery that
+already started stays bound to the context it began with. Selection in the UI never changes the frozen expedition owner.
 
 `farm_context` schema 1 binds selected character, resolved level/loadout/difficulty,
 active equipped GUIDs and definitions, selected talents/subtalents, attribute and

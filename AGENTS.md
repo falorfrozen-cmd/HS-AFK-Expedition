@@ -17,7 +17,10 @@ This working tree contains the product and its tests.
 - No decompiled game source in this tree. Archive private raw research outside the hub.
 - Keep per-kill capture cheap. Do not reintroduce multi-megabyte research trace buffers.
 - Player identity is version 2: save slot, name and class. Names alone are not unique.
-- Farm context is build-bound; unknown values refuse use. Raw protected handles are
+- Farm context is build-bound; unknown values refuse use for recording and validation.
+  Claims do not require an unchanged loadout (the user's decision, 2026-09-23): the
+  calibrated pace sets the rewards and the claim plan records the delivered context.
+  Hero identity, game build and region still gate every claim. Raw protected handles are
   not stat values. Equipment loadout is resolved first, then converted from one-based
   saved number to zero-based equipment set index. Inactive set items may be absent.
 - A native direct-call hook is required. TableOnly is not working interception.
