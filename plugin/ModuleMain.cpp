@@ -25,6 +25,7 @@
 #include <AfkExpedition/Version.hpp>
 #include <AfkExpedition/Packet.hpp>
 #include <AfkExpedition/RuntimeState.hpp>
+#include <AfkExpedition/Conversion.hpp>
 #include <iomanip>
 #include <limits>
 #include <stdexcept>
@@ -333,6 +334,11 @@ static PFUNC_YYGMLScript g_OrigExperienceUpdate = nullptr;
 static std::string       g_ExpUpdateHookKind = "not installed";
 static PFUNC_YYGMLScript g_OrigGoldLogAdd = nullptr;
 static std::string       g_GoldLogHookKind = "not installed";
+// Anti-cheat reports the game raised (ReportClient). Filtered-item sales check
+// the count around every gold credit and stop selling at the first report.
+static PFUNC_YYGMLScript g_OrigReportClient = nullptr;
+static std::string       g_ReportClientHookKind = "not installed";
+static std::atomic<uint64_t> g_ReportClientCalls{ 0 };
 // Observed through the game's own routines during a replay window: how much
 // experience the game credited (ExperienceUpdate arg0) and gold it logged
 // (GoldLogAdd arg1).
@@ -748,6 +754,22 @@ static uint64_t    g_SpoolUnplaced = 0;     // items whose floor object never ca
 // One open, buffered stream per spool instead of opening and closing the file
 // for every item. SpoolFlush runs after each replay frame and before every
 // checkpoint, so a checkpoint never counts items that are not on disk.
+// Filtered items during delivery (AfkExpedition/Conversion.hpp): what the plan
+// chose, which paths passed their start checks, and what was sold or broken down.
+struct ConversionState {
+    bool enabled = false, sell = false, prospect = false;
+    std::string note;
+    std::vector<AfkExpedition::ProspectRecipe> recipes;
+    uint64_t soldItems = 0, prospectedItems = 0, keptItems = 0, outputStacks = 0, creditFailures = 0;
+    double sellGold = 0, sellPending = 0;
+    std::vector<std::string> soldLines;          // this frame's sales, written back if the credit fails
+    std::map<std::string, long long> pending;    // fragments gathered but not created yet, by "type:id"
+    std::map<std::string, long long> created;    // fragments delivered as stacks, by "type:id"
+};
+static ConversionState g_Conv;
+static AfkExpedition::ItemFacts g_PendingFacts;   // facts of the item in g_PendingSpoolItem
+static bool g_CreatingOutput = false;             // one of our fragment stacks is being built
+static std::string ConversionJson();
 static std::ofstream g_SpoolStream;
 static void SpoolWriteLine(const std::string& line)
 {
@@ -756,11 +778,41 @@ static void SpoolWriteLine(const std::string& line)
 }
 static void SpoolFlush() { if (g_SpoolStream.is_open()) g_SpoolStream.flush(); }
 static void SpoolClose() { if (g_SpoolStream.is_open()) { g_SpoolStream.flush(); g_SpoolStream.close(); } g_SpoolStream.clear(); }
+// A record gets its sequence number when it is written, so an item that a sale
+// or a break-down replaces never leaves a gap in the spool.
+static std::string SpoolRecord(const std::string& body)
+{
+    return "{\"expedition_id\":\"" + JsonEscape(g_SpoolId) + "\",\"seq\":" + std::to_string(++g_SpoolSeq) + "," + body + "}";
+}
 static void FlushPendingSpoolItem(const std::string& extraFields)
 {
     if (g_PendingSpoolItem.empty()) return;
-    SpoolWriteLine(g_PendingSpoolItem + extraFields + "}");
+    SpoolWriteLine(SpoolRecord(g_PendingSpoolItem + extraFields));
     g_PendingSpoolItem.clear();
+    g_PendingFacts = AfkExpedition::ItemFacts{};
+    ++g_SpoolItems;
+}
+// The fields a sale or a break-down needs, read from the finished item struct.
+static AfkExpedition::ItemFacts ReadItemFacts(const RValue& item, const RValue& type, const RValue& info)
+{
+    AfkExpedition::ItemFacts f;
+    try {
+        if (!IsNumberKind(type) || info.m_Kind != VALUE_OBJECT) return f;
+        RValue def = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("itemDefinitionStruct") });
+        if (def.m_Kind != VALUE_OBJECT) return f;
+        auto number = [](const RValue& st, const char* key, double fallback) {
+            RValue v = g_Yytk->CallBuiltin("variable_struct_get", { st, RValue(key) });
+            return IsNumberKind(v) && v.m_Kind != VALUE_BOOL ? v.ToDouble() : fallback;
+        };
+        const double rarity = number(info, "27", -1), tier = number(info, "32", -1);
+        if (rarity < 0 || tier < 0) return f;
+        f.type = static_cast<int>(type.ToDouble()); f.rarity = static_cast<int>(rarity); f.tier = static_cast<int>(tier);
+        f.value = number(info, "9", 0); f.stack = number(def, "o", 1); f.baseId = static_cast<int>(number(def, "b", -1));
+        RValue corrupted = g_Yytk->CallBuiltin("variable_struct_get", { def, RValue("r") });
+        f.corrupted = IsNumberKind(corrupted) && corrupted.ToBoolean();
+        f.valid = true;
+    } catch (...) { f = AfkExpedition::ItemFacts{}; }
+    return f;
 }
 static RValue& Hook_CreateItemNew(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
@@ -800,14 +852,13 @@ static RValue& Hook_CreateItemNew(CInstance* S, CInstance* O, RValue& R, int arg
                     // (lootFilterVisible / lootFilterHighlight, MEASURED
                     // 2026-09-18 on a live floor item), and that verdict goes
                     // into the record so the Vault ingest can drop the junk.
+                    FlushPendingSpoolItem("");           // an earlier item still pending: no floor object came back for it
                     std::ostringstream o;
-                    o << "{\"expedition_id\":\"" << JsonEscape(g_SpoolId) << "\",\"seq\":" << (++g_SpoolSeq)
-                      << ",\"kind\":\"item\",\"t\":\"" << NowIso() << "\",\"packet\":\"" << g_CtxPacket
+                    o << "\"kind\":\"item\",\"t\":\"" << NowIso() << "\",\"packet\":\"" << g_CtxPacket
                       << "\",\"type\":" << (IsNumberKind(type) ? Stringify(type) : std::string("null"))
                       << ",\"name\":\"" << JsonEscape(name) << "\",\"item\":" << Stringify(it);
-                    FlushPendingSpoolItem("");           // an earlier item still pending: no floor object came back for it
                     g_PendingSpoolItem = o.str();
-                    ++g_SpoolItems;
+                    if (g_Conv.enabled && !g_CreatingOutput) g_PendingFacts = ReadItemFacts(it, type, info);
                 }
             }
         } catch (...) {}
@@ -822,6 +873,42 @@ static RValue& Hook_CreateItemNew(CInstance* S, CInstance* O, RValue& R, int arg
 // hook during the call, and the floor object the call returns is removed
 // right away. Outside replays the call is untouched.
 static int g_EventDepth = 0;   // >0 while a reward routine (LootExplosion, WormholeGiveReward ...) is running
+// The game's own irandom(n): 0..n inclusive.
+static int GameRandom(int n)
+{
+    if (n <= 0) return 0;
+    try { return static_cast<int>(g_Yytk->CallBuiltin("irandom", { RValue(static_cast<double>(n)) }).ToDouble()); }
+    catch (...) { return 0; }
+}
+// A hidden item the plan converts. Below Satanic: its sale joins this frame's
+// gold credit and its record waits until the credit succeeds. Satanic and
+// above: broken down unit by unit with the game's recipe and random numbers,
+// the fragments gathered for full stacks. Returns false to keep the record.
+static bool ConvertPendingItem(const std::string& extra)
+{
+    if (!g_Conv.enabled || g_PendingSpoolItem.empty() || !g_PendingFacts.valid) return false;
+    using AfkExpedition::Conversion;
+    const Conversion c = AfkExpedition::DecideConversion(g_PendingFacts, g_Conv.recipes, g_Conv.sell, g_Conv.prospect);
+    if (c == Conversion::Sell) {
+        g_Conv.sellPending += AfkExpedition::SellGold(g_PendingFacts);
+        g_Conv.soldLines.push_back(g_PendingSpoolItem + extra);
+    } else if (c == Conversion::Prospect) {
+        const AfkExpedition::ProspectRecipe* recipe = AfkExpedition::FindProspectRecipe(g_PendingFacts, g_Conv.recipes);
+        const long long units = std::max<long long>(1, static_cast<long long>(g_PendingFacts.stack));
+        for (long long u = 0; u < units; ++u) {
+            int type = -1, id = -1; long long amount = 0;
+            if (AfkExpedition::ProspectYield(*recipe, GameRandom(99), [](int n) { return GameRandom(n - 1); }, type, id, amount))
+                g_Conv.pending[AfkExpedition::OutputKey(type, id)] += amount;
+        }
+        ++g_Conv.prospectedItems;
+    } else {
+        if (g_PendingFacts.rarity >= AfkExpedition::kSatanicRarity) ++g_Conv.keptItems;
+        return false;
+    }
+    g_PendingSpoolItem.clear();
+    g_PendingFacts = AfkExpedition::ItemFacts{};
+    return true;
+}
 static RValue& Hook_LootGroundCreate(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
     if (g_ReplayActive.load() && g_SpoolActive && g_LootGroundArgsNote.empty()) {
@@ -855,15 +942,21 @@ static RValue& Hook_LootGroundCreate(CInstance* S, CInstance* O, RValue& R, int 
         try {
             if ((r->m_Kind == VALUE_REF || IsNumberKind(*r)) && g_Yytk->CallBuiltin("instance_exists", { *r }).ToBoolean()) {
                 std::string extra;
+                bool hidden = false;
                 try {
                     RValue vis = GetVar(*r, "lootFilterVisible"), hi = GetVar(*r, "lootFilterHighlight"), skip = GetVar(*r, "skipLootFilter");
                     const bool visible = (vis.m_Kind == VALUE_BOOL || IsNumberKind(vis)) ? vis.ToBoolean() : true;
                     const bool skipped = (skip.m_Kind == VALUE_BOOL || IsNumberKind(skip)) && skip.ToBoolean();
-                    extra = std::string(",\"placed\":true,\"filter_visible\":") + ((visible || skipped) ? "true" : "false")
+                    hidden = !(visible || skipped) && !g_CreatingOutput;
+                    extra = std::string(",\"placed\":true,\"filter_visible\":") + (hidden ? "false" : "true")
                           + ",\"filter_highlight\":" + (((hi.m_Kind == VALUE_BOOL || IsNumberKind(hi)) && hi.ToBoolean()) ? "true" : "false");
-                    if (!(visible || skipped)) ++g_SpoolFiltered;
                 } catch (...) { extra = ",\"placed\":true"; }
-                FlushPendingSpoolItem(extra);
+                // Fragments the player chose are never filtered away again.
+                if (g_CreatingOutput) extra += ",\"source\":\"prospect\"";
+                if (!(hidden && ConvertPendingItem(extra))) {
+                    if (hidden) ++g_SpoolFiltered;
+                    FlushPendingSpoolItem(extra);
+                }
                 g_Yytk->CallBuiltin("instance_destroy", { *r });
                 ++g_LootGroundSkipped;
             } else if (!g_PendingSpoolItem.empty()) {
@@ -904,6 +997,13 @@ static RValue& Hook_ExperienceUpdate(CInstance* S, CInstance* O, RValue& R, int 
     RValue* r = &R;
     if (g_OrigExperienceUpdate) r = &g_OrigExperienceUpdate(S, O, R, argc, A);
     RememberCall("ExperienceUpdate", S, argc, A, r);
+    return *r;
+}
+static RValue& Hook_ReportClient(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
+{
+    ++g_ReportClientCalls;
+    RValue* r = &R;
+    if (g_OrigReportClient) r = &g_OrigReportClient(S, O, R, argc, A);
     return *r;
 }
 static RValue& Hook_GoldLogAdd(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
@@ -1768,7 +1868,7 @@ static std::string SpoolSummaryLine(long long calls, const char* kind)
     f << "{\"expedition_id\":\"" << JsonEscape(g_SpoolId) << "\",\"seq\":" << (++g_SpoolSeq) << ",\"kind\":\"" << kind << "\",\"t\":\"" << NowIso()
       << "\",\"gold\":" << (long long)g_SpoolGold << ",\"gold_piles\":" << g_SpoolGoldPiles << ",\"exp_credited\":" << (long long)g_GiveExpSum
       << ",\"calls\":" << calls << ",\"items\":" << g_SpoolItems << ",\"items_filtered\":" << g_SpoolFiltered << ",\"items_unplaced\":" << g_SpoolUnplaced
-      << ",\"forgepact\":" << ForgePactSettingsJson() << "}";
+      << ",\"forgepact\":" << ForgePactSettingsJson() << ",\"conversion\":" << ConversionJson() << "}";
     return f.str();
 }
 static void SpoolEnd(long long calls, const char* kind = "summary")
@@ -1878,6 +1978,241 @@ static uint64_t g_CheckpointWriteRetries = 0;
 static std::string PersistRewards();
 static void InstallCloseGuard();
 
+// The Prospector's recipe table as the game holds it (global.prospectItem /
+// global.prospectResult, filled by DefineProspectCombos). Only recipes that
+// take Satanic and above ("unique") matter here; a single-id amount is stored
+// protected and read through the game's own PilipaliDecrypt, as the game does.
+static bool LoadProspectRecipes(std::vector<AfkExpedition::ProspectRecipe>& out, std::string& why, std::vector<std::string>* report = nullptr)
+{
+    out.clear();
+    try {
+        RValue items = g_Yytk->CallBuiltin("variable_global_get", { RValue("prospectItem") });
+        RValue results = g_Yytk->CallBuiltin("variable_global_get", { RValue("prospectResult") });
+        if (items.m_Kind != VALUE_ARRAY || results.m_Kind != VALUE_ARRAY) { why = "the Prospector recipe table was not found"; return false; }
+        const int n = static_cast<int>(g_Yytk->CallBuiltin("array_length", { items }).ToDouble());
+        const int m = static_cast<int>(g_Yytk->CallBuiltin("array_length", { results }).ToDouble());
+        auto numbers = [](const RValue& v, std::vector<int>& list, std::string& kinds) {
+            if (IsNumberKind(v) && v.m_Kind != VALUE_BOOL) { list.push_back(static_cast<int>(v.ToDouble())); return; }
+            if (v.m_Kind != VALUE_ARRAY) { kinds += KindName(v) + " "; return; }
+            const int k = static_cast<int>(g_Yytk->CallBuiltin("array_length", { v }).ToDouble());
+            for (int j = 0; j < k; ++j) {
+                RValue e = g_Yytk->CallBuiltin("array_get", { v, RValue(static_cast<double>(j)) });
+                if (IsNumberKind(e) && e.m_Kind != VALUE_BOOL) list.push_back(static_cast<int>(e.ToDouble()));
+                else kinds += KindName(e) + " ";
+            }
+        };
+        for (int i = 0; i < n && i < m; ++i) {
+            RValue in = g_Yytk->CallBuiltin("array_get", { items, RValue(static_cast<double>(i)) });
+            RValue res = g_Yytk->CallBuiltin("array_get", { results, RValue(static_cast<double>(i)) });
+            if (in.m_Kind != VALUE_OBJECT) continue;
+            AfkExpedition::ProspectRecipe r;
+            RValue unique = StructGet(in, "isUnique");
+            r.unique = (unique.m_Kind == VALUE_BOOL || IsNumberKind(unique)) && unique.ToBoolean();
+            std::string skippedKinds;
+            numbers(StructGet(in, "itemType"), r.types, skippedKinds);
+            RValue tier = StructGet(in, "tierRequirement"); r.tier = IsNumberKind(tier) ? static_cast<int>(tier.ToDouble()) : AfkExpedition::kAnyTier;
+            RValue base = StructGet(in, "itemId"); r.baseId = IsNumberKind(base) ? static_cast<int>(base.ToDouble()) : -1;
+            std::vector<RValue> outs;
+            if (res.m_Kind == VALUE_OBJECT) outs.push_back(res);
+            else if (res.m_Kind == VALUE_ARRAY) {
+                const int k = static_cast<int>(g_Yytk->CallBuiltin("array_length", { res }).ToDouble());
+                for (int j = 0; j < k; ++j) outs.push_back(g_Yytk->CallBuiltin("array_get", { res, RValue(static_cast<double>(j)) }));
+            }
+            std::string line = "recipe " + std::to_string(i) + (r.unique ? " unique" : " other") + " types[";
+            for (int t : r.types) line += std::to_string(t) + " ";
+            line += "] tier=" + std::to_string(r.tier) + " base=" + std::to_string(r.baseId) + (skippedKinds.empty() ? "" : " unread-types(" + skippedKinds + ")") + " ->";
+            for (const RValue& o : outs) {
+                if (o.m_Kind != VALUE_OBJECT) continue;
+                AfkExpedition::ProspectOutput out;
+                RValue type = StructGet(o, "itemType"); out.type = IsNumberKind(type) ? static_cast<int>(type.ToDouble()) : -1;
+                std::string unread; numbers(StructGet(o, "itemId"), out.ids, unread);
+                RValue chance = StructGet(o, "resultChance"); out.chance = IsNumberKind(chance) ? chance.ToDouble() : 100.0;
+                RValue raw = StructGet(o, "amount");
+                std::string amountNote = "none";
+                if (out.ids.size() == 1 && IsNumberKind(raw)) {
+                    RValue plain; double value = -1;
+                    try { plain = g_Yytk->CallGameScript(HeroSiege::Scripts::gml_Script_PilipaliDecrypt.data(), { raw, RValue(), RValue() }); } catch (...) {}
+                    if (IsNumberKind(plain)) value = plain.ToDouble();
+                    amountNote = Stringify(raw).substr(0, 24) + "=>" + (IsNumberKind(plain) ? Stringify(plain) : std::string("?"));
+                    if (!(value >= 1 && value <= AfkExpedition::kNativeStackMax && std::floor(value) == value)) { out.ids.clear(); amountNote += "(refused)"; }
+                    else out.amount = static_cast<long long>(value);
+                }
+                line += " {type " + std::to_string(out.type) + " ids";
+                for (int id : out.ids) line += " " + std::to_string(id);
+                line += " amount " + amountNote + " chance " + Stringify(RValue(out.chance)) + "}";
+                if (out.type >= 0 && !out.ids.empty()) r.outputs.push_back(out);
+            }
+            if (report) report->push_back(line);
+            if (r.unique && !r.types.empty() && !r.outputs.empty()) out.push_back(r);
+        }
+    } catch (...) { why = "reading the Prospector recipe table threw"; out.clear(); return false; }
+    if (out.empty()) { why = "no Prospector recipe for Satanic and above items was readable"; return false; }
+    return true;
+}
+static void WriteBackSales(const std::string& why)
+{
+    if (g_SpoolActive) for (const auto& line : g_Conv.soldLines) { SpoolWriteLine(SpoolRecord(line)); ++g_SpoolItems; ++g_SpoolFiltered; }
+    g_Conv.soldLines.clear(); g_Conv.sellPending = 0;
+    if (!why.empty()) {
+        g_Conv.sell = false; ++g_Conv.creditFailures; g_Conv.note = "selling stopped: " + why;
+        Out("expedition " + g_Exp.id + ": " + g_Conv.note + "; those items stay in the records");
+    }
+}
+// Selling is only safe while no report could leave the game: offline (onl
+// false) and the API exchange absent or disconnected (STATIC 2026-09-23:
+// ReportClient sends whenever apiExchangeConnected is true, whatever onl says).
+// Menu_Controller_obj must exist, because the gold credit reads the save slot.
+static bool SalesSafe(std::string& why)
+{
+    try {
+        RValue online = g_Yytk->CallBuiltin("variable_global_get", { RValue("onl") });
+        if ((online.m_Kind == VALUE_BOOL || IsNumberKind(online)) && online.ToBoolean()) { why = "the game is online"; return false; }
+        RValue api;
+        if (ObjectIndex("Api_Exchange_Client_obj", api) && g_Yytk->CallBuiltin("instance_exists", { api }).ToBoolean()) {
+            RValue link = GetVar(g_Yytk->CallBuiltin("instance_find", { api, RValue(0.0) }), "apiExchangeConnected");
+            if ((link.m_Kind == VALUE_BOOL || IsNumberKind(link)) && link.ToBoolean()) { why = "the game is connected to the Hero Siege servers"; return false; }
+        }
+        RValue menu;
+        if (!ObjectIndex("Menu_Controller_obj", menu) || !g_Yytk->CallBuiltin("instance_exists", { menu }).ToBoolean()) { why = "the save controller is missing"; return false; }
+    } catch (...) { why = "the offline checks threw"; return false; }
+    return true;
+}
+static RValue GoldAmount(CInstance* player)
+{
+    RValue gold;
+    try { g_Yytk->CallGameScriptEx(gold, HeroSiege::Scripts::gml_Script_GetGoldAmount.data(), player, player, {}); } catch (...) { gold = RValue(); }
+    return gold;
+}
+// This frame's sales credited as one amount, the way a merchant sale credits
+// gold: PickUpGoldCheck with a GetCounterHash taken right before it, the local
+// player as self (STATIC: undefined on success, false on a stale hash). The
+// gold amount must rise by exactly the sale (it is clamped at the game's gold
+// cap). Anything else, or any anti-cheat report meanwhile: the items go to the
+// records as filtered items and selling stops for the rest of the delivery.
+static bool CreditSales(CInstance* player)
+{
+    if (g_Conv.soldLines.empty()) { g_Conv.sellPending = 0; return true; }
+    std::string why;
+    const uint64_t reportsBefore = g_ReportClientCalls.load();
+    if (!SalesSafe(why)) { WriteBackSales(why); return false; }
+    try {
+        const RValue before = GoldAmount(player);
+        RValue hash;
+        AurieStatus st = g_Yytk->CallGameScriptEx(hash, HeroSiege::Scripts::gml_Script_GetCounterHash.data(), player, player, {});
+        if (!AurieSuccess(st) || hash.m_Kind != VALUE_STRING) why = "GetCounterHash returned no hash";
+        else {
+            RValue result;
+            st = g_Yytk->CallGameScriptEx(result, HeroSiege::Scripts::gml_Script_PickUpGoldCheck.data(), player, player,
+                { hash, RValue(g_Conv.sellPending), RValue(1.0), RValue(), RValue(), RValue() });
+            const RValue after = GoldAmount(player);
+            if (!AurieSuccess(st) || (result.m_Kind == VALUE_BOOL && !result.ToBoolean())) why = "PickUpGoldCheck refused the sale";
+            else if (!IsNumberKind(before) || !IsNumberKind(after)) why = "the gold amount could not be read to confirm the sale";
+            else if (std::fabs(after.ToDouble() - before.ToDouble() - g_Conv.sellPending) > 0.5) why = "the gold did not rise by the sale (gold cap reached?)";
+        }
+    } catch (...) { why = "the gold credit threw"; }
+    if (g_ReportClientCalls.load() != reportsBefore) why = "the game raised an anti-cheat report";
+    if (!why.empty()) { WriteBackSales(why); return false; }
+    g_Conv.sellGold += g_Conv.sellPending; g_Conv.soldItems += g_Conv.soldLines.size();
+    g_Conv.soldLines.clear(); g_Conv.sellPending = 0;
+    return true;
+}
+// Gathered fragments leave as native stacks through the same LootGroundCreate
+// call a mining node uses (type, {o, b, j, c}); the spool hook records each
+// stack and removes its floor object. Full 999 stacks during delivery, the
+// rest when it is done. A stack that does not come back stops the break-down.
+static bool CreateOutputStacks(const ReplayEnv& env, bool includePartial)
+{
+    bool ok = true;
+    for (auto it = g_Conv.pending.begin(); it != g_Conv.pending.end() && g_Conv.prospect;) {
+        int type = -1, id = -1;
+        if (!AfkExpedition::ParseOutputKey(it->first, type, id)) { it = g_Conv.pending.erase(it); continue; }
+        for (long long n : AfkExpedition::StackSizes(it->second, includePartial)) {
+            const uint64_t before = g_SpoolItems;
+            bool called = false;
+            try {
+                RValue def = g_Yytk->CallBuiltin("json_parse", { RValue("{\"o\":" + std::to_string(n) + ",\"b\":" + std::to_string(id) + ",\"j\":0,\"c\":0}") });
+                g_CreatingOutput = true; g_ReplayActive = true; g_CtxKind = "replay"; g_CtxPacket = "prospect";
+                RValue result;
+                called = AurieSuccess(g_Yytk->CallGameScriptEx(result, HeroSiege::Scripts::gml_Script_LootGroundCreate.data(), env.pi, env.pi,
+                    { RValue(env.px + 96.0), RValue(env.py), RValue(static_cast<double>(type)), def, RValue(), RValue() }));
+            } catch (...) { called = false; }
+            if (!g_PendingSpoolItem.empty()) FlushPendingSpoolItem(",\"placed\":false,\"source\":\"prospect\"");
+            g_CreatingOutput = false; g_ReplayActive = false; g_CtxKind = "none"; g_CtxPacket.clear();
+            if (!called || g_SpoolItems != before + 1) {
+                g_Conv.prospect = false; ok = false;
+                g_Conv.note = "break-down stopped: a fragment stack could not be created; the remaining fragments stay pending";
+                Out("expedition " + g_Exp.id + ": " + g_Conv.note);
+                break;
+            }
+            it->second -= n; g_Conv.created[it->first] += n; ++g_Conv.outputStacks;
+        }
+        if (it->second <= 0) it = g_Conv.pending.erase(it); else ++it;
+    }
+    return ok;
+}
+static std::string ConversionJson()
+{
+    std::ostringstream o;
+    o << std::setprecision(17) << "{\"enabled\":" << (g_Conv.enabled ? "true" : "false") << ",\"sell\":" << (g_Conv.sell ? "true" : "false")
+      << ",\"prospect\":" << (g_Conv.prospect ? "true" : "false") << ",\"sold_items\":" << g_Conv.soldItems << ",\"sell_gold\":" << g_Conv.sellGold
+      << ",\"prospected_items\":" << g_Conv.prospectedItems << ",\"kept_items\":" << g_Conv.keptItems << ",\"output_stacks\":" << g_Conv.outputStacks
+      << ",\"credit_failures\":" << g_Conv.creditFailures << ",\"recipes\":" << g_Conv.recipes.size() << ",\"note\":\"" << JsonEscape(g_Conv.note) << "\"";
+    for (const auto* map : { &g_Conv.pending, &g_Conv.created }) {
+        o << ",\"" << (map == &g_Conv.pending ? "pending" : "created") << "\":{";
+        bool first = true;
+        for (const auto& [key, amount] : *map) { o << (first ? "" : ",") << "\"" << key << "\":" << amount; first = false; }
+        o << "}";
+    }
+    o << "}";
+    return o.str();
+}
+// A continued delivery keeps the earlier part's totals, its not yet created
+// fragments, and any path that part had to stop.
+static void RestoreConversion(const RValue& saved)
+{
+    if (saved.m_Kind != VALUE_OBJECT) return;
+    auto number = [&](const char* key) { RValue v = StructGet(saved, key); return IsNumberKind(v) && v.m_Kind != VALUE_BOOL && std::isfinite(v.ToDouble()) && v.ToDouble() >= 0 ? v.ToDouble() : 0.0; };
+    g_Conv.soldItems = static_cast<uint64_t>(number("sold_items")); g_Conv.sellGold = number("sell_gold");
+    g_Conv.prospectedItems = static_cast<uint64_t>(number("prospected_items")); g_Conv.keptItems = static_cast<uint64_t>(number("kept_items"));
+    g_Conv.outputStacks = static_cast<uint64_t>(number("output_stacks")); g_Conv.creditFailures = static_cast<uint64_t>(number("credit_failures"));
+    for (auto* map : { &g_Conv.pending, &g_Conv.created }) {
+        RValue m = StructGet(saved, map == &g_Conv.pending ? "pending" : "created");
+        if (m.m_Kind != VALUE_OBJECT) continue;
+        RValue names = g_Yytk->CallBuiltin("variable_struct_get_names", { m });
+        const int k = names.m_Kind == VALUE_ARRAY ? static_cast<int>(g_Yytk->CallBuiltin("array_length", { names }).ToDouble()) : 0;
+        for (int i = 0; i < k; ++i) {
+            RValue name = g_Yytk->CallBuiltin("array_get", { names, RValue(static_cast<double>(i)) });
+            int type = -1, id = -1;
+            if (name.m_Kind != VALUE_STRING || !AfkExpedition::ParseOutputKey(name.ToString(), type, id)) continue;
+            RValue v = StructGet(m, name.ToString().c_str());
+            if (IsNumberKind(v) && v.ToDouble() > 0) (*map)[name.ToString()] = static_cast<long long>(v.ToDouble());
+        }
+    }
+    for (const char* path : { "sell", "prospect" }) {
+        RValue v = StructGet(saved, path);
+        if (v.m_Kind == VALUE_BOOL && !v.ToBoolean()) (std::string(path) == "sell" ? g_Conv.sell : g_Conv.prospect) = false;
+    }
+    RValue note = StructGet(saved, "note");
+    if (note.m_Kind == VALUE_STRING && !note.ToString().empty()) g_Conv.note = note.ToString();
+}
+static bool InstallReportWatch()
+{
+    return InstallScriptDetour("ReportClient", "afk_reportclient", &Hook_ReportClient, &g_OrigReportClient, g_ReportClientHookKind);
+}
+// The plan asked to convert filtered items: selling needs the game offline and
+// the anti-cheat report watched; breaking down needs the recipe table.
+static void SetUpConversion()
+{
+    g_Conv = ConversionState{};
+    g_Conv.enabled = true;
+    std::string unsafe;
+    if (!SalesSafe(unsafe)) g_Conv.note = "selling off: " + unsafe;
+    else if (!InstallReportWatch()) g_Conv.note = "selling off: anti-cheat reports cannot be watched";
+    else g_Conv.sell = true;
+    std::string why;
+    g_Conv.prospect = LoadProspectRecipes(g_Conv.recipes, why);
+    if (!g_Conv.prospect) g_Conv.note += (g_Conv.note.empty() ? "" : "; ") + std::string("break-down off: ") + why;
+}
 static std::string ExpeditionProgressJson(const std::string& state)
 {
     std::ostringstream o;
@@ -1886,7 +2221,8 @@ static std::string ExpeditionProgressJson(const std::string& state)
       << ",\"packet_index\":" << g_Exp.idx << ",\"done_in_packet\":" << g_Exp.doneInPacket
       << ",\"calls_done\":" << g_Exp.callsDone << ",\"calls_total\":" << g_Exp.callsTotal << ",\"failed\":" << g_Exp.failed << ",\"skipped\":" << g_Exp.skipped
       << ",\"checkpoint_version\":2,\"plan_hash\":\"" << g_Exp.planHash << "\""
-      << ",\"checkpoint_write_retries\":" << g_CheckpointWriteRetries;
+      << ",\"checkpoint_write_retries\":" << g_CheckpointWriteRetries
+      << ",\"conversion\":" << ConversionJson();
     // The spool is flushed before every checkpoint: its size here is where the
     // records of this position end. After a crash the panel sets aside what was
     // written later, so a player-accepted continue never repeats a record.
@@ -1968,6 +2304,16 @@ static std::string PersistRewards()
 static void ExpeditionFinish(const std::string& state)
 {
     g_Exp.running = false; g_ExpBusy = false;
+    if (g_Conv.enabled && g_SpoolActive) {
+        ReplayEnv env; std::string err;
+        if (PrepareReplayEnv(env, err)) {
+            CreditSales(env.pi);
+            if (state == "done" && g_Conv.prospect) CreateOutputStacks(env, true);
+        } else if (!g_Conv.soldLines.empty()) WriteBackSales("");
+        Out("expedition " + g_Exp.id + ": filtered items sold " + std::to_string(g_Conv.soldItems) + " for " + std::to_string(static_cast<long long>(g_Conv.sellGold))
+            + " gold, broken down " + std::to_string(g_Conv.prospectedItems) + " into " + std::to_string(g_Conv.outputStacks) + " stacks"
+            + (g_Conv.pending.empty() ? "" : " (fragments still pending)") + (g_Conv.note.empty() ? "" : " | " + g_Conv.note));
+    }
     if (g_SpoolActive) { Out(SpoolSummaryText()); SpoolEnd(g_Exp.callsDone, state == "done" ? "summary" : "partial"); }
     std::string saved = g_Exp.callsDone > 0 ? PersistRewards() : std::string("nothing to save");
     g_Exp.saveNote = saved;
@@ -2045,6 +2391,7 @@ static void CmdExpeditionStart(const std::string& planPath, bool anywhere = fals
     // resume: a progress file for this id that is not done carries what was already replayed
     bool resumed = false;
     AfkExpedition::RewardTotals restored;
+    RValue restoredConversion;
     {
         const std::string pt = ReadFileText(e.progressPath);
         if (pt.empty() && fs::exists(e.progressPath)) { Out("expedition: empty/unreadable checkpoint; refusing to restart"); return; }
@@ -2066,6 +2413,7 @@ static void CmdExpeditionStart(const std::string& planPath, bool anywhere = fals
                 if (!restored.Load([&](const char* key) { RValue v = StructGet(pr, key); return IsNumberKind(v) && v.m_Kind != VALUE_BOOL ? v.ToDouble() : std::numeric_limits<double>::quiet_NaN(); })) {
                     Out("expedition: checkpoint reward counters missing/invalid"); return;
                 }
+                restoredConversion = StructGet(pr, "conversion");
                 RValue pi = StructGet(pr, "packet_index"), dp = StructGet(pr, "done_in_packet"), cd = StructGet(pr, "calls_done"), fl = StructGet(pr, "failed"), sa = StructGet(pr, "started");
                 if (IsNumberKind(pi)) e.idx = (size_t)pi.ToDouble();
                 if (IsNumberKind(dp)) e.doneInPacket = (long long)dp.ToDouble();
@@ -2087,12 +2435,19 @@ static void CmdExpeditionStart(const std::string& planPath, bool anywhere = fals
         try {IndependentRewards::Batch scope(e.rewards);e.effectiveMagicFind=IndependentRewards::NativeMagicFind();}
         catch(...){Out("expedition: unable to verify effective Magic Find; no rewards generated");return;}
     }
+    RValue filtered = StructGet(plan, "filtered_items");
+    const bool convert = filtered.m_Kind == VALUE_STRING && filtered.ToString() == "convert";
     g_Exp = std::move(e);
     g_GiveExp = g_Exp.exp; g_GoldPickup = g_Exp.gold;
     SpoolBegin(g_Exp.id);
+    if (convert) SetUpConversion(); else g_Conv = ConversionState{};
     if (resumed) {
         RestoreRewards(restored);
+        if (convert) RestoreConversion(restoredConversion);
     }
+    if (convert) Out("expedition " + g_Exp.id + ": filtered items -> " + (g_Conv.enabled ? std::string("sell ") + (g_Conv.sell ? "on" : "off")
+        + ", break-down " + (g_Conv.prospect ? "on (" + std::to_string(g_Conv.recipes.size()) + " recipes)" : "off") : std::string("kept"))
+        + (g_Conv.note.empty() ? "" : " | " + g_Conv.note));
     if (g_SessionFile.empty()) SessionOpen();
     g_Perf = ReplayPerf();
     g_Exp.running = true; g_ExpBusy = true;
@@ -2121,6 +2476,7 @@ static void ExpeditionTick()
                 // save now, so this pause survives a game close or crash as a
                 // resumable checkpoint. The spool gets a partial summary first,
                 // so it ends consistently with the saved counters.
+                if (g_Conv.enabled) CreditSales(env.pi);
                 if (g_SpoolActive) { FlushPendingSpoolItem(""); SpoolWriteLine(SpoolSummaryLine(g_Exp.callsDone, "partial")); }
                 g_Exp.saveNote = g_Exp.callsDone > 0 ? PersistRewards() : std::string("nothing to save");
                 g_Exp.pausedSaved = true;
@@ -2166,6 +2522,10 @@ static void ExpeditionTick()
     }
     ++g_Perf.frames;
     g_Perf.frameTotal += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (g_Conv.enabled) {
+        CreditSales(env.pi);
+        if (g_Conv.prospect && !g_Conv.pending.empty()) CreateOutputStacks(env, false);
+    }
     if (g_Exp.idx >= g_Exp.packets.size() || (g_Exp.idx + 1 == g_Exp.packets.size() && g_Exp.doneInPacket >= g_Exp.packets.back().count)) { ExpeditionFinish("done"); return; }
     // A running checkpoint is never resumable, so rewriting it every frame
     // only cost frame time (and write-through flushes). Four times a second
@@ -2344,6 +2704,53 @@ static void RunCommand(const std::string& raw)
     }
 
     if (w0 == "status") { CmdStatus(); return; }
+    if (w0 == "convert" && w1 == "probe") {
+        // Research: filtered-item conversion against the live game, outside any delivery.
+        //   afk convert probe          offline flag, report watcher, recipe table
+        //   afk convert probe credit   also credits 1 gold through the sale path
+        //   afk convert probe make     also drops 1 Satanic Crystal Fragment at the player
+        if (g_Exp.running) { Out("convert probe: finish the delivery first"); return; }
+        try {
+            RValue online = g_Yytk->CallBuiltin("variable_global_get", { RValue("onl") });
+            Out("convert probe: onl=" + Stringify(online) + " (" + KindName(online) + ")");
+            const bool watch = InstallReportWatch();
+            Out("convert probe: ReportClient watch " + std::string(watch ? "on" : "OFF") + " [" + g_ReportClientHookKind + "] reports so far=" + std::to_string(g_ReportClientCalls.load()));
+            std::string unsafe;
+            const bool safe = SalesSafe(unsafe);
+            Out("convert probe: selling " + std::string(safe ? "safe (offline, no server link, save controller present)" : "NOT safe: " + unsafe));
+            std::vector<AfkExpedition::ProspectRecipe> recipes; std::vector<std::string> lines; std::string why;
+            const bool loaded = LoadProspectRecipes(recipes, why, &lines);
+            for (const auto& line : lines) Out("convert probe: " + line);
+            Out("convert probe: " + std::to_string(recipes.size()) + " recipes for Satanic and above" + (loaded ? "" : " | " + why));
+            ReplayEnv env; std::string err;
+            if (!PrepareReplayEnv(env, err)) { Out("convert probe: " + err); return; }
+            if (w2 == "credit") {
+                if (!watch || !safe) { Out("convert probe: no credit unless selling is safe and reports are watched"); return; }
+                // The production path with one gold and a stand-in record.
+                const RValue before = GoldAmount(env.pi);
+                g_Conv = ConversionState{}; g_Conv.enabled = true; g_Conv.sell = true;
+                g_Conv.soldLines.push_back("\"kind\":\"probe\""); g_Conv.sellPending = 1;
+                const uint64_t reports = g_ReportClientCalls.load();
+                const bool spool = g_SpoolActive; g_SpoolActive = false;   // a refused probe writes no spool record
+                const bool ok = CreditSales(env.pi);
+                g_SpoolActive = spool;
+                const std::string note = g_Conv.note;
+                g_Conv = ConversionState{};
+                Out("convert probe: gold " + Stringify(before) + " -> " + Stringify(GoldAmount(env.pi)) + ", reports during the credit="
+                    + std::to_string(g_ReportClientCalls.load() - reports) + (ok ? " | credit accepted" : " | credit NOT accepted: " + note));
+            }
+            if (w2 == "make") {
+                RValue def = g_Yytk->CallBuiltin("json_parse", { RValue("{\"o\":1,\"b\":60,\"j\":0,\"c\":0}") });
+                RValue result;
+                const AurieStatus st = g_Yytk->CallGameScriptEx(result, HeroSiege::Scripts::gml_Script_LootGroundCreate.data(), env.pi, env.pi,
+                    { RValue(env.px + 48.0), RValue(env.py), RValue(14.0), def, RValue(), RValue() });
+                std::string item = "?";
+                try { if (g_Yytk->CallBuiltin("instance_exists", { result }).ToBoolean()) item = Stringify(GetVar(result, "item")).substr(0, 600); } catch (...) {}
+                Out("convert probe: LootGroundCreate(type 14, Satanic Crystal Fragment x1) st=" + std::to_string(static_cast<int>(st)) + " -> " + KindName(result) + " item=" + item);
+            }
+        } catch (...) { Out("convert probe: EXCEPTION"); }
+        return;
+    }
     if (w0 == "session" && w1 == "state") { std::string mode;ss>>mode;TestSession::State(w2,mode=="isolated"); return; }
     if (w0 == "model") { Out("Combat research is archived; this is the measured AFK product."); return; }
     if (w0 == "hook") { InstallDropItemHook(); return; }

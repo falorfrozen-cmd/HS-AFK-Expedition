@@ -1,7 +1,7 @@
 # AFK FARM · Hero Siege
 
 A Windows companion that plans timed expeditions using your offline hero’s measured
-farming pace. **0.6.1 — measured farming / beta release.** Kill rates come from your
+farming pace. **0.6.2 — measured farming / beta release.** Kill rates come from your
 calibration; the game generates loot when you claim your rewards.
 
 Start from a saved eligible profile with the game closed or another hero loaded.
@@ -29,6 +29,12 @@ yielded), a **Windows notification** when an expedition is ready that also works
 while AFK FARM and the game are closed, **Continue from recorded position** for a
 delivery a crash cut short, and Vault category names with the hero and the time
 actually claimed (`AFK · <date> · <hero> · <region> · <time>`).
+
+0.6.2: **items your loot filter hides** can be converted in the game while
+delivering: below Satanic they are sold for their own merchant value (gold to the
+hero), Satanic and above are broken down with the game's Prospector recipes
+(fragments to the Vault in stacks of up to 999). Selling runs only offline with no
+connection to the Hero Siege servers. Choose it on the Loot page.
 
 ## Getting started
 

@@ -2,8 +2,10 @@
 estimates, background claim, repeat, loadout warning and the expedition summary.
 Only temporary data folders are used; no game or Item Editor is contacted.
 """
-import hashlib,json,os,sys,tempfile,time,unittest
+import contextlib,hashlib,json,os,sys,tempfile,time,unittest
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
 import afk,ingest_spool,loot_filter,panel,product_data,recovery
@@ -111,7 +113,7 @@ class PauseAndResumeTests(unittest.TestCase):
         app=panel.Panel(self.d)
         with patch.object(app,'fresh',return_value=live),patch.object(app,'cli') as cli:
             app.action('claim',dict(speed='fast'))
-            self.assertEqual(cli.call_args.args,('claim','--speed','fast'))
+            self.assertEqual(cli.call_args.args,('claim','--speed','fast','--filtered','convert'))
             self.write(state='paused',save_committed=False,saved='');cli.reset_mock()
             with self.assertRaises(ValueError):app.action('claim',{})
             cli.assert_not_called()
@@ -294,6 +296,46 @@ class RegionComparisonTests(unittest.TestCase):
     def test_calibration_only_regions_have_no_expedition_numbers(self):
         row=next(e for e in self.app.regions_view() if e['character']==HERO)['rows'][1]
         self.assertEqual((row['gold_per_hour'],row['rarities_per_hour'],row['expeditions']),(None,{},0))
+
+
+class FilteredItemsTests(unittest.TestCase):
+    """Items the game's loot filter hides: the player's choice, saved in the
+    panel, reaches a new claim plan; a continued claim keeps its own."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.d=Path(self.tmp.name)
+    def test_choice_defaults_to_convert_and_is_saved_on_its_own(self):
+        self.assertEqual(panel.load_preferences(self.d)['filtered_items'],'convert')
+        app=panel.Panel(self.d);app.job=dict(output='')
+        app.action('save_preferences',dict(filtered_items='keep'))
+        self.assertEqual((panel.load_preferences(self.d)['filtered_items'],panel.load_preferences(self.d)['delivery_speed']),('keep','normal'))
+        with self.assertRaises(ValueError):app.action('save_preferences',dict(filtered_items='sell'))
+        afk.write_json(self.d/'preferences.json',dict(filtered_items='junk'))
+        self.assertEqual(panel.load_preferences(self.d)['filtered_items'],'convert')
+    def test_a_new_claim_plan_records_the_choice_and_a_continued_one_keeps_its_own(self):
+        plan=dict(expedition_id='e',hours=1.0,zones=[dict(room='Act_01_01',minutes=60.0)],
+                  packets=[dict(hash='h'*64,count=100,kind='kill',room='Act_01_01',weight=1)],per_frame=40)
+        seen=[]
+        def run(path,claim,*args,**kwargs):
+            seen.append(json.loads(Path(path).read_text(encoding='utf-8')));return dict(paused=True,resumable=True)
+        with contextlib.ExitStack() as stack:
+            for name,value in dict(DATA=self.d,STATE=self.d/'state.json',PLANS=self.d/'plans',SESSIONS=self.d/'sessions',SPOOL=self.d/'spool').items():
+                stack.enter_context(patch.object(afk,name,value))
+            stack.enter_context(patch.object(afk,'run_plan',side_effect=run))
+            stack.enter_context(patch.object(afk,'game_bin',return_value=self.d))
+            afk.write_json(self.d/'plans/e.json',plan)
+            afk.write_json(self.d/'state.json',dict(armed=dict(expedition_id='e',plan=str(self.d/'plans/e.json'),
+                                                               started_at=afk.iso(afk.now_utc()-timedelta(hours=2)),hours=1.0)))
+            args=dict(speed='fast',dry_run=False,no_ingest=True,anywhere=False,forgepact_ignore=False)
+            afk.cmd_claim(SimpleNamespace(filtered='convert',**args))
+            afk.write_json(self.d/'sessions/e_claim.progress.json',dict(state='aborted',calls_done=40,calls_total=100))
+            afk.cmd_claim(SimpleNamespace(filtered='keep',**args))
+        self.assertEqual([p['filtered_items'] for p in seen],['convert','convert'])
+    def test_panel_claim_passes_the_saved_choice(self):
+        app=panel.Panel(self.d)
+        afk.write_json(self.d/'preferences.json',dict(filtered_items='keep'))
+        with patch.object(app,'cli') as cli:
+            app.claim(dict(expedition_id='e',plan=str(self.d/'missing.json')),'normal')
+        self.assertEqual(cli.call_args.args,('claim','--speed','normal','--filtered','keep'))
 
 
 class DeliverySpeedTests(unittest.TestCase):

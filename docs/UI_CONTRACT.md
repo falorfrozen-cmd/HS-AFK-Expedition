@@ -1,4 +1,4 @@
-# AFK FARM panel contract — 0.6.1
+# AFK FARM panel contract — 0.6.2
 
 The product interface is English only, including accessibility labels, server
 messages and launcher dialogs. Number formatting uses en-US. Player names, game
@@ -178,6 +178,31 @@ divided by each claim's gold setting, `rarities_per_hour` for Unholy, Angelic, H
 and Satanic items at the Magic Find recorded (`magic_find`), `expeditions` and
 `hours`. Vault labels are `<hero> · <region> · <time>`; a claim relabels its plan
 with the credited time.
+
+## Filtered items
+
+`preferences.json` `filtered_items` is `convert` (default) or `keep`; the claim
+passes it as `afk.py claim --filtered`, which stores it in a new claim plan as
+`filtered_items` (a continued claim keeps its own). The plugin (0.6.2) reads it at
+expedition start. `convert`: for an item whose floor object the loot filter hides,
+below Satanic (itemInfoStruct "27" < 6) the sale value ceil(info "9" × max(1, def
+"o")) is added to the frame's sale and the record is held; after the frame, one
+`PickUpGoldCheck(GetCounterHash(), total, 1, …)` with the local player as self
+credits it, and `GetGoldAmount` must rise by exactly that total. Selling requires
+`onl` false, `Api_Exchange_Client_obj` absent or `apiExchangeConnected` false,
+`Menu_Controller_obj` present and a pass-through `ReportClient` watch; a refusal, a
+missing rise or any report writes the held records back as filtered items and stops
+selling. Satanic and above equipment matching a unique recipe of
+`global.prospectItem`/`global.prospectResult` (amounts through `PilipaliDecrypt`)
+is broken down unit by unit with the game's `irandom`; fragments gather per
+`type:id` and are created as full 999 stacks with `LootGroundCreate(x, y, type,
+{o, b, j: 0, c: 0})`, the remainder when the delivery is done, each recorded with
+`source: prospect` and `filter_visible: true`. Unmatched Satanic and above items
+are kept. The checkpoint and the spool summary carry `conversion` (`sold_items`,
+`sell_gold`, `prospected_items`, `kept_items`, `output_stacks`, `credit_failures`,
+`recipes`, `note`, `pending`, `created`); a continued delivery restores it.
+`afk convert probe [credit|make]` checks the recipe table, the safety state, a
+1 gold credit or one fragment on the floor outside a delivery.
 
 ## User-facing limits
 

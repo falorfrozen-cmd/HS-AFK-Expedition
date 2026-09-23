@@ -87,7 +87,7 @@ class PreferenceTests(unittest.TestCase):
             app = panel.Panel(d); app.job = dict(output='')
             with patch.object(app, 'sync_notification'):
                 app.action('save_preferences', dict(ready_notification=False))
-                self.assertEqual(panel.load_preferences(d), dict(schema=1, delivery_speed='normal', ready_notification=False))
+                self.assertEqual(panel.load_preferences(d), dict(schema=1, delivery_speed='normal', ready_notification=False, filtered_items='convert'))
                 app.action('save_preferences', dict(delivery_speed='fast'))
                 self.assertEqual(panel.load_preferences(d)['ready_notification'], False, 'saving the speed keeps the setting')
                 for bad in (dict(ready_notification='yes'), dict(), dict(delivery_speed='warp')):

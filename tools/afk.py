@@ -1006,6 +1006,9 @@ def cmd_claim(args) -> None:
             # An early claim delivers less than planned: name it by what it credits.
             scaled['label'] = expedition_label(plan.get('label_hero'), plan['label_region'], credited_h)
         apply_delivery_speed(scaled, getattr(args, 'speed', None) or 'normal')
+        # Items the game's loot filter hides: sold / broken down by the plugin
+        # during delivery ("convert"), or kept in the spool ("keep").
+        scaled['filtered_items'] = getattr(args, 'filtered', None) or 'keep'
         rebuild_preview(scaled)
         print(f"elapsed {elapsed_h:.2f} h, credited {credited_h:.2f} h of {armed['hours']:.2f} h")
     print_preview(scaled)
@@ -1024,6 +1027,12 @@ def cmd_claim(args) -> None:
             sys.exit(1)
         print("the clock stays armed; claim again to continue from the saved position")
         return
+    conversion = (pr or {}).get('conversion') or {}
+    if conversion.get('enabled'):
+        fragments = sum((conversion.get('created') or {}).values())
+        print(f"filtered items: sold {conversion.get('sold_items', 0):,} for {conversion.get('sell_gold', 0):,.0f} gold, "
+              f"broke {conversion.get('prospected_items', 0):,} down into {fragments:,} fragments ({conversion.get('output_stacks', 0)} stacks)"
+              + (f" | {conversion['note']}" if conversion.get('note') else ''))
     if run_succeeded(pr):
         credited_h = float(scaled.get("hours", 0)) * float(scaled.get("scale", 1.0)) if reuse else credited_h
         st["last_claim"] = {"expedition_id": claim_id, "credited_hours": credited_h, "at": iso(now_utc()), "result": pr}
@@ -1274,6 +1283,8 @@ def main(argv=None) -> None:
     p = sub.add_parser("pause"); p.set_defaults(fn=cmd_pause)
     p = sub.add_parser("claim"); p.add_argument("--dry-run", action="store_true"); p.add_argument("--no-ingest", action="store_true")
     p.add_argument("--speed", choices=sorted(DELIVERY_SPEEDS), default="normal", help="delivery speed for a new claim (a paused claim keeps its own)")
+    p.add_argument("--filtered", choices=["convert", "keep"], default="keep",
+                   help="items the game's loot filter hides, for a new claim: sell below Satanic and break Satanic and above down like the Prospector, or keep them")
     p.add_argument("--anywhere", action="store_true", help="replay even when not standing in a calibrated zone")
     p.add_argument("--forgepact-ignore", action="store_true", help="replay even if rate-affecting ForgePact settings changed"); p.set_defaults(fn=cmd_claim)
     p = sub.add_parser("run"); p.add_argument("plan"); p.add_argument("--no-ingest", action="store_true")

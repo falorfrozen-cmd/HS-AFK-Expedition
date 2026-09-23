@@ -1,4 +1,5 @@
 #include <AfkExpedition/RuntimeState.hpp>
+#include <AfkExpedition/Conversion.hpp>
 #include <cstdio>
 #include <limits>
 #include <map>
@@ -59,6 +60,42 @@ int main() {
     check(CheckFarmSample(false,true,false,40)==FarmSample::Resume,"loading interval is excluded on return");
     check(CheckFarmSample(false,false,false,1)==FarmSample::Invalid,"changed loadout after loading still refuses");
     check(CheckFarmSample(false,true,true,8)==FarmSample::Invalid,"unexplained clock gaps still invalidate");
+
+    // Filtered items: sell below Satanic, Prospector break-down from Satanic up.
+    // The recipe table mirrors the shape of the game's unique-equipment recipes.
+    auto facts=[](int type,int rarity,int tier,double value,double stack=1,bool corrupted=false){
+        ItemFacts f; f.valid=true; f.type=type; f.rarity=rarity; f.tier=tier; f.value=value; f.stack=stack; f.corrupted=corrupted; f.baseId=7; return f; };
+    std::vector<ProspectRecipe> recipes;
+    const std::vector<int> gear{0,1,2,3,4,5,6,7,8,10,18};
+    const long long scf[4]{6,13,20,25};
+    for(int tier=0;tier<4;++tier){ ProspectRecipe r; r.types=gear; r.unique=true; r.tier=tier; r.outputs.push_back({14,{60},scf[tier],100}); recipes.push_back(r); }
+    { ProspectRecipe r; r.types=gear; r.unique=true; r.tier=4; r.outputs.push_back({14,{72,73},1,100}); recipes.push_back(r); }
+    { ProspectRecipe r; r.types=gear; r.unique=true; r.tier=5; r.outputs.push_back({14,{71,72,73},4,100}); recipes.push_back(r); }
+    { ProspectRecipe r; r.types=gear; r.rarity=5; r.tier=kAnyTier; r.outputs.push_back({14,{66},1,100}); recipes.push_back(r); }
+    check(SellGold(facts(5,2,2,3))==3 && SellGold(facts(12,1,0,2.5,4))==10 && SellGold(facts(3,1,0,7,0))==7 && SellGold(ItemFacts{})==0,
+          "a sale pays ceil(value x stack), a missing or zero stack counts as one");
+    check(DecideConversion(facts(5,2,2,3),recipes,true,true)==Conversion::Sell && DecideConversion(facts(3,5,1,30),recipes,true,true)==Conversion::Sell,
+          "every rarity below Satanic is sold, even one a recipe would take");
+    check(DecideConversion(facts(3,6,1,50),recipes,true,true)==Conversion::Prospect && DecideConversion(facts(18,9,3,225),recipes,true,true)==Conversion::Prospect,
+          "Satanic and above equipment is broken down");
+    check(DecideConversion(facts(15,6,1,50),recipes,true,true)==Conversion::Keep && DecideConversion(facts(3,6,1,50,1,true),recipes,true,true)==Conversion::Keep
+          && DecideConversion(facts(3,6,6,50),recipes,true,true)==Conversion::Keep,
+          "Satanic and above without a recipe (type, corruption, tier) stays in the records and is never sold");
+    check(DecideConversion(facts(5,2,2,3),recipes,false,true)==Conversion::Keep && DecideConversion(facts(3,6,1,50),recipes,true,false)==Conversion::Keep
+          && DecideConversion(facts(5,2,2,0),recipes,true,true)==Conversion::Keep && DecideConversion(ItemFacts{},recipes,true,true)==Conversion::Keep,
+          "a disabled path, a zero value or unread facts keep the item");
+    int type=-1,id=-1; long long amount=0;
+    check(ProspectYield(*FindProspectRecipe(facts(3,6,1,50),recipes),50,[](int){return 0;},type,id,amount) && type==14 && id==60 && amount==13,
+          "a C tier Satanic item yields 13 Satanic Crystal Fragments");
+    check(ProspectYield(*FindProspectRecipe(facts(3,7,5,450),recipes),50,[](int n){return n-1;},type,id,amount) && id==73 && amount==1
+          && ProspectYield(*FindProspectRecipe(facts(3,7,5,450),recipes),50,[](int){return 9;},type,id,amount) && id==73,
+          "a random pick yields one of the listed fragments, its index clamped, never the table amount");
+    { ProspectRecipe r; r.types={3}; r.unique=true; r.outputs.push_back({14,{60},5,25}); std::vector<ProspectRecipe> one{r};
+      check(!ProspectYield(one[0],80,[](int){return 0;},type,id,amount) && ProspectYield(one[0],10,[](int){return 0;},type,id,amount) && amount==5, "a chance output hits only below its chance"); }
+    check(StackSizes(38154,false)==std::vector<long long>(38,999) && StackSizes(38154,true).back()==192 && StackSizes(998,false).empty()
+          && StackSizes(0,true).empty(), "fragments leave as full 999 stacks, the rest at the end");
+    check(OutputKey(14,60)=="14:60" && ParseOutputKey("14:60",type,id) && type==14 && id==60 && !ParseOutputKey("14",type,id)
+          && !ParseOutputKey("a:1",type,id) && !ParseOutputKey("14:6x",type,id), "pending output keys round-trip and refuse junk");
     std::printf("%d checks, %d failures\n", checks, failed);
     return failed ? 1 : 0;
 }

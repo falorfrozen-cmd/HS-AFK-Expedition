@@ -1,4 +1,4 @@
-# AFK FARM 0.6.1 — measured-kill product
+# AFK FARM 0.6.2 — measured-kill product
 
 The earlier combat-reconstruction project is archived outside the active tree.
 The product uses empirical kills per region-second and native reward replay.
@@ -152,3 +152,21 @@ Claim in background uses the verified automatic setup (`game_session`): minimize
 launch, the game's own menu and travel routines, a Maximum-speed claim, and a
 normal window close only when the action started the game and delivery finished
 or paused safely.
+
+## Filtered items: sale and Prospector break-down (0.6.2)
+
+Static reading of the installed build (2026-09-23): a merchant sale pays
+ceil(item info "9" × stack) and credits it with PickUpGoldCheck under a fresh
+GetCounterHash; no player, merchant or difficulty input enters the price. The hash
+is a pure read of a protected counter that PickUpGoldCheck advances on success; a
+stale hash raises ReportClient(112), which sends to the server whenever the API
+exchange is connected, even offline. So the plugin sells only when no report could
+leave the game, takes the hash immediately before each credit, credits once per
+frame, and confirms the credit through GetGoldAmount. The Prospector converts one
+unit at a time with the recipe table the game builds at start; the plugin reads
+that table at expedition start instead of carrying the numbers, and creates the
+outputs through the call mining nodes use for stackable ground drops. Measured on
+the real 2 h claim's records: of 64,123 hidden items, 61,733 were below Satanic
+(3,544,084 gold at their sale value) and 2,390 were Satanic C/B/A tier
+(38,154 Satanic Crystal Fragments). The live credit, the recipe read and one
+created stack still need a game session (`afk convert probe`).

@@ -17,7 +17,7 @@ ROOT=Path(__file__).resolve().parents[1]
 WEB=ROOT/'web'
 CLASSES={i+1:n for i,n in enumerate(('Viking','Pyromancer','Marksman','Pirate','Nomad','Redneck','Necromancer','Samurai','Paladin','Amazon','Demon Slayer','Demonspawn','Shaman','White Mage','Marauder','Plague Doctor','Shield Lancer','Illusionist','Jotunn','Exo','Butcher','Stormweaver','Bard','Prophet'))}
 XOR=bytes.fromhex('e3953db1016bb65854383f46a17429cc454551f2a7f7abb726f137a88191e67e')
-VERSION='0.6.1'
+VERSION='0.6.2'
 IDENTIFIER=re.compile(r'[A-Za-z0-9_-]{1,120}\Z')
 
 def require(ok,message):
@@ -128,12 +128,18 @@ def expedition_label(room,hours,hero=None):
     return afk.expedition_label(hero,zone_names().get(room,room),hours)
 
 
+# What happens to items the game's loot filter hides during delivery: sold
+# below Satanic and broken down like the Prospector from Satanic up, or kept.
+FILTERED_ITEMS=('convert','keep')
+
+
 def load_preferences(data):
     prefs=read(data/'preferences.json',{}) or {}
     prefs=prefs if isinstance(prefs,dict) else {}
-    speed=prefs.get('delivery_speed');ready=prefs.get('ready_notification')
+    speed=prefs.get('delivery_speed');ready=prefs.get('ready_notification');filtered=prefs.get('filtered_items')
     return dict(schema=1,delivery_speed=speed if speed in afk.DELIVERY_SPEEDS else 'normal',
-                ready_notification=ready if type(ready) is bool else True)
+                ready_notification=ready if type(ready) is bool else True,
+                filtered_items=filtered if filtered in FILTERED_ITEMS else 'convert')
 
 
 def delivery_seconds(result):
@@ -470,13 +476,18 @@ class Panel:
             afk.write_json(self.data/'loot-filter.json',settings)
             self.log('Vault transfer filter saved: '+loot_filter.describe(settings)+'. Items it keeps back stay in the expedition records.');return
         if name=='save_preferences':
-            prefs=load_preferences(self.data);require('delivery_speed' in args or 'ready_notification' in args,'Nothing to save.')
+            prefs=load_preferences(self.data);require(any(k in args for k in ('delivery_speed','ready_notification','filtered_items')),'Nothing to save.')
+            if 'filtered_items' in args:
+                mode=args.get('filtered_items');require(mode in FILTERED_ITEMS,'Choose convert or keep.');prefs['filtered_items']=mode
             if 'delivery_speed' in args:
                 speed=args.get('delivery_speed');require(speed in afk.DELIVERY_SPEEDS,'Choose Normal, Fast or Maximum.');prefs['delivery_speed']=speed
             if 'ready_notification' in args:
                 ready=args.get('ready_notification');require(type(ready) is bool,'Choose on or off.');prefs['ready_notification']=ready
             afk.write_json(self.data/'preferences.json',prefs)
             if 'delivery_speed' in args:self.log('Delivery speed saved: '+prefs['delivery_speed']+'. A paused delivery keeps its own speed.')
+            if 'filtered_items' in args:
+                self.log('Items your loot filter hides: '+('sold below Satanic, broken down like the Prospector from Satanic up' if prefs['filtered_items']=='convert'
+                         else 'kept in the expedition records')+'. Applies to the next claim; a paused delivery keeps its own choice.')
             if 'ready_notification' in args:
                 self.log('Windows notification when an expedition is ready: '+('on' if prefs['ready_notification'] else 'off')+'.')
                 threading.Thread(target=self.sync_notification,daemon=True).start()
@@ -652,7 +663,7 @@ class Panel:
             plan=read(Path(armed['plan']),{}) or {};ch=plan.get('character')
             hero=next((c for c in characters(self.data) if valid_identity(ch) and same_character(c,ch)),None)
             afk.write_json(sidecar,dict(level_before=hero.get('level') if hero else None,speed=speed,at=datetime.now(timezone.utc).isoformat()))
-        self.cli('claim','--speed',speed)
+        self.cli('claim','--speed',speed,'--filtered',load_preferences(self.data)['filtered_items'])
 
     def claim_background(self,args):
         """Open the game minimized, load the hero in its region, deliver at Maximum speed, close the game.

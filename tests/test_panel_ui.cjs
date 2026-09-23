@@ -197,6 +197,20 @@ test('region comparison lists the selected hero’s regions, marks the best and 
  f.data.regions[0].rows[1].kills_per_min=900;f.set(f.data);html=f.run('regionCard()');assert.ok(html.indexOf('Arathim')<html.indexOf('The Glacial Trail'),'sorted by the chosen column');
  f.run('selected=9');assert.equal(f.run('regionCard()'),'','no card for a hero without calibrations');
 });
+test('the loot page offers the filtered-items choice and the summary shows what it did',()=>{
+ const f=fixture();const listeners={};f.context.document.addEventListener=(type,fn)=>{(listeners[type]=listeners[type]||[]).push(fn);};
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../web/extras.js'),'utf8'),f.context);
+ let html=f.run('filteredItemsCard()');
+ assert.match(html,/value="convert" checked/);assert.doesNotMatch(html,/value="keep" checked/);assert.match(html,/stacks of up to 999/);assert.match(html,/offline and not connected/);
+ f.data.preferences={filtered_items:'keep'};f.set(f.data);assert.match(f.run('filteredItemsCard()'),/value="keep" checked/);
+ const calls=[];f.context.recorded=calls;f.run('action=(name,args)=>{recorded.push([name,args]);return Promise.resolve();}');
+ for(const fn of listeners.change||[])fn({target:{name:'filtered-items',value:'convert',checked:true,id:'',dataset:{}}});
+ assert.deepEqual(JSON.parse(JSON.stringify(calls)),[['save_preferences',{filtered_items:'convert'}]]);
+ const line=f.run(`conversionLine(${JSON.stringify({enabled:true,sold_items:61733,sell_gold:3544084,prospected_items:2390,output_stacks:39,kept_items:3,created:{'14:60':38154},pending:{},note:''})})`);
+ assert.match(line,/Sold 61,733 filtered items for <b>3,544,084<\/b> gold/);assert.match(line,/broke 2,390 down into <b>38,154<\/b> fragments \(39 stacks\)/);assert.match(line,/3 Satanic and above kept/);
+ assert.match(f.run(`conversionLine(${JSON.stringify({enabled:true,sold_items:0,prospected_items:0,created:{},pending:{'14:60':12},note:'selling stopped: the game is online'})})`),/12 fragments still pending.*selling stopped: the game is online/s);
+ assert.equal(f.run('conversionLine({enabled:false})'),'');assert.equal(f.run('conversionLine(undefined)'),'');
+});
 test('farm again restarts the last settled expedition and the planner warns about a changed loadout',()=>{
  const f=fixture();const p={id:'suh',room:'Act_03_03',character:hero,usable:true,kills_per_min:20,basis_seconds:240,coverage:1,problems:[]};f.data.profiles=[p];
  f.data.repeat={room:'Act_03_03',hours:2,slot:2,name:'Suh',profile:'suh'};f.set(f.data);f.run('selected=2;room="Act_03_03"');

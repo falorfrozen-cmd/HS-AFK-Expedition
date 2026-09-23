@@ -1,4 +1,4 @@
-# AFK FARM 0.6.1 beta
+# AFK FARM 0.6.2 beta
 
 Timed offline expeditions using your hero's measured farming pace and the game's
 native reward system. Windows only. The interface is entirely in English.
@@ -72,6 +72,27 @@ On touch screens, drag with one finger and use the zoom buttons. Keyboard users 
 focus **Map navigation** and use arrow keys to pan (Shift for larger steps), + / −
 to zoom, and Home to center the selection. Region buttons also support normal
 keyboard activation. Map navigation does not require the game to be running.
+
+## Items your loot filter hides
+
+Loot → **Items your loot filter hides** chooses what happens to them during your
+next claim:
+
+- **Sell below Satanic; break Satanic and above down like the Prospector** (default).
+  Each hidden item below Satanic is sold for the gold a merchant pays for it (its own
+  sale value), credited to your hero once per frame. Hidden Satanic, Angelic, Heroic
+  and Unholy equipment is broken down with the game's own Prospector recipes: D, C,
+  B and A tier give 6, 13, 20 and 25 Satanic Crystal Fragments; S gives one Gypsy's
+  or Mallet Fragment and SS one Dice, Gypsy's or Mallet Fragment. The fragments go to
+  the Vault's AFK Materials in stacks of up to 999. Satanic and above items the
+  Prospector does not take are kept.
+- **Keep them in the expedition records**, as before.
+
+Selling runs only while the game is offline and not connected to the Hero Siege
+servers; the gold must rise by exactly the sale, and the first refusal or
+anti-cheat report stops selling and keeps the rest. The expedition summary shows
+how many items were sold for how much gold and how many fragments were made.
+A paused delivery keeps the choice it started with.
 
 ## Region comparison and notifications
 
