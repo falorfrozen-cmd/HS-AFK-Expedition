@@ -66,7 +66,7 @@ All runtime data lives under `%LOCALAPPDATA%/Hero_Siege/afk`.
 
 `farm_context` is `{schema:1,hash:<SHA256>,inputs:{...}}`. New panel profiles use
 `profile_version:3`, `rate_basis:"farm-clock"` and identity version 2. A context
-mismatch refuses claim. Start freezes the selected saved profile without contacting
+mismatch refuses recording and validation; claim requirements are described below. Start freezes the selected saved profile without contacting
 the game; profile identity, eligibility and known build compatibility remain checked.
 The current live hero's loadout has no bearing on another hero's offline timer.
 Legacy profiles remain visible with a remeasure reason.
@@ -283,3 +283,29 @@ not intercept input; only their controls do. Narrow layouts wrap the controls.
 Verification: `node --test tests/test_panel_ui.cjs tests/test_map_ui.cjs`, followed
 by real browser drag, wheel, click, keyboard and narrow-layout checks. No engine,
 reward, calibration or game-save changes are needed for map navigation.
+
+
+### UI presentation refresh (2026-09-24)
+
+The five existing pages use a shared local obsidian/brass theme. Explore keeps the
+interactive map and one expedition planner. Calibration separates the current
+recording, its quality and saved profiles; the recording guide and independent
+validation are optional disclosures. Loot has a single selected-expedition summary
+and searchable collection. Delivery history opens by default while any displayed
+result still needs transfer or review; saved, partial and transferred remain distinct.
+Filter controls, comparison tables, help and setup diagnostics remain accessible in
+labelled disclosures. Delivery failures, recovery decisions and confirmations are
+not hidden by this simplification. A changed loadout notice still appears when known,
+without suggesting that unchanged equipment is required to claim.
+
+Open/closed disclosure choices and identified control focus survive polling and
+rerenders within the page session. Navigation focuses the new page heading. Duration
+presets and world switches expose their selected state to assistive technology.
+Tables scroll within focusable, labelled regions on narrow screens; no data columns
+are removed. The initial fetch waits for DOMContentLoaded so all deferred UI modules
+are present before the first render. No API, reward rules or delivery logic changed.
+
+The isolated browser fixture accepts optional `presentation` fields in its temporary
+control.json for UI-only empty, populated and interrupted states. These overrides
+are not production API fields and do not enable native actions. See
+[UI verification](UI_REFRESH_VERIFICATION.md) for tested paths and limitations.

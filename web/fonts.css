@@ -1,1 +1,2 @@
-/* System fonts keep the local panel fully offline. */
+/* System fonts work offline without downloads. */
+:root{--font-ui:"Segoe UI Variable Text","Segoe UI",Arial,sans-serif;--font-display:"Palatino Linotype","Book Antiqua",Georgia,serif}

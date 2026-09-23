@@ -23,9 +23,17 @@ with tempfile.TemporaryDirectory(prefix='afk-panel-qa-') as tmp:
     afk.write_json(control,dict(live=dict(character=other,room='Act_01_01',capture_on=False,replay_running=False,game_build='QA',farm_context=dict(hash='b'*64))))
     class FixturePanel(panel.Panel):
         def snapshot(self):
-            live=afk.read_json(control,{}).get('live')
+            controls=afk.read_json(control,{})
+            live=controls.get('live')
             self.live=live;self.live_at=time.monotonic();self.game_running=bool(live)
-            return super().snapshot()
+            result=super().snapshot()
+            # Test-only presentation states. They never alter native actions or saves.
+            presentation=controls.get('presentation',{})
+            for key in ('characters','profiles','calibration','rewards','armed','plan',
+                        'progress','recovery','job','background','delivery','regions',
+                        'support_warnings'):
+                if key in presentation:result[key]=presentation[key]
+            return result
         def fresh(self):
             live=afk.read_json(control,{}).get('live')
             if not live:raise ValueError('Game closed in fixture.')

@@ -4,13 +4,13 @@ const source=fs.readFileSync(path.join(__dirname,'../web/app.js'),'utf8');
 const hero={identity_version:2,slot:2,name:'Suh',class:8,class_name:'Samurai',level:100};
 const other={...hero,slot:5,name:'SeraphTest',class:14,class_name:'White Mage'};
 function fixture(){
- const elements=new Map(),timers=[];
+ const elements=new Map(),timers=[],listeners=new Map(),bootRequests=[];
  const element=key=>{if(!elements.has(key))elements.set(key,{innerHTML:'',textContent:'',style:{},addEventListener(){},classList:{add(){},remove(){}}});return elements.get(key);};
- const context=vm.createContext({console,localStorage:{getItem(){return null;}},window:{addEventListener(){}},document:{querySelector:element,addEventListener(){},activeElement:null,hidden:false},fetch:()=>new Promise(()=>{}),setInterval(){},clearTimeout(){},setTimeout(fn,ms){timers.push(ms);return timers.length;}});
+ const context=vm.createContext({console,localStorage:{getItem(){return null;}},window:{addEventListener(){}},document:{querySelector:element,querySelectorAll:()=>[],addEventListener(type,callback){if(!listeners.has(type))listeners.set(type,[]);listeners.get(type).push(callback);},activeElement:null,hidden:false},fetch:url=>{bootRequests.push(url);return new Promise(()=>{});},setInterval(){},clearTimeout(){},setTimeout(fn,ms){timers.push(ms);return timers.length;}});
  vm.runInContext(source,context);vm.runInContext(fs.readFileSync(path.join(__dirname,'../web/modifiers.js'),'utf8'),context);
  const data={version:'0.4.1',characters:[hero,other],profiles:[],live:{character:other,room:'Act_01_01',capture_on:false},game_running:true,calibration:{character:hero,room:'Act_03_03',running:false,seconds:10,kills:2,rate:12},progress:{},job:null,armed:null,rewards:[],installation:{checks:[]},config:{},validations:[],portraits:{}};
  const set=d=>{context.payload=d;vm.runInContext('data=payload;zones=[{room:"Act_01_01",name:"Forest",act:1,world:"old",x:50,y:50},{room:"Act_03_03",name:"Desert",act:3,world:"old",x:55,y:55}];',context);};set(data);
- return {context,data,elements,timers,set,run:code=>vm.runInContext(code,context)};
+ return {context,data,elements,timers,listeners,bootRequests,set,run:code=>vm.runInContext(code,context)};
 }
 test('finished recording never supplies another selected hero’s name, counters or quality',()=>{
  const f=fixture();f.run('selected=5;view="measure"');assert.equal(f.run('visibleCapture()'),null);
@@ -216,6 +216,58 @@ test('farm again restarts the last settled expedition and the planner warns abou
  f.data.repeat={room:'Act_03_03',hours:2,slot:2,name:'Suh',profile:'suh'};f.set(f.data);f.run('selected=2;room="Act_03_03"');
  let html=f.run('explore()');assert.match(html,/FARM AGAIN/);assert.match(html,/Desert · 2 h/);assert.match(html,/data-action="repeat"/);
  f.data.profile_live_matches={suh:false};f.set(f.data);html=f.run('explore()');assert.match(html,/Your loadout changed since this calibration/);assert.equal(f.run('loadoutChanged(profile())'),true);
- f.data.profile_live_matches={suh:true};f.set(f.data);assert.match(f.run('explore()'),/Your current loadout matches this calibration/);
+ f.data.profile_live_matches={suh:true};f.set(f.data);assert.doesNotMatch(f.run('explore()'),/Your loadout changed|loadout are checked/);assert.match(f.run('explore()'),/Saved profile ready/);
  f.data.repeat={room:'Act_03_03',hours:2,slot:2,name:'Suh',profile:null,reason:'Recalibrate first.'};f.set(f.data);assert.doesNotMatch(f.run('explore()'),/data-action="repeat"/);
+});
+
+
+test('disclosures keep open and closed choices across rerenders and ignore detached toggle events',()=>{
+ const f=fixture();f.run('extrasPanel=()=>{};bindMap=()=>{};updateLive=()=>{}');
+ const detail={dataset:{disclosure:'expedition-help'},open:true,isConnected:true,matches:()=>true};
+ f.context.document.querySelectorAll=()=>[detail];f.run('render()');
+ assert.match(f.run("disclosure('expedition-help','Help','Contents')"),/data-disclosure="expedition-help" open/);
+ // Closing it immediately before a render must win even before the toggle event fires.
+ detail.open=false;f.run('render()');
+ assert.doesNotMatch(f.run("disclosure('expedition-help','Help','Contents','',true)"),/data-disclosure="expedition-help" open/);
+ for(const toggle of f.listeners.get('toggle'))toggle({target:{...detail,open:true,isConnected:false}});
+ assert.doesNotMatch(f.run("disclosure('expedition-help','Help','Contents')"),/data-disclosure="expedition-help" open/);
+ f.context.document.querySelectorAll=()=>[];f.run('view="loot";render();view="explore";render()');
+ assert.doesNotMatch(f.run("disclosure('expedition-help','Help','Contents')"),/data-disclosure="expedition-help" open/);
+});
+
+test('control focus survives a rerender and explicit page navigation focuses the page title',()=>{
+ const f=fixture();f.run('extrasPanel=()=>{};bindMap=()=>{};updateLive=()=>{}');
+ let focusCalls=0;
+ f.context.document.activeElement={id:'reward-magic_find-increase',matches:()=>false};
+ f.elements.set('#reward-magic_find-increase',{focus(options){focusCalls++;assert.equal(options.preventScroll,true);}});
+ f.run('render()');assert.equal(focusCalls,1);
+ let headingFocus=false,scrolled=false;
+ f.elements.set('#page-title',{focus(options){headingFocus=options.preventScroll;}});
+ f.context.window.scrollTo=options=>{scrolled=options.top===0;};
+ f.run('switchView("measure")');assert.equal(headingFocus,true);assert.equal(scrolled,true);
+});
+
+test('duration slider keeps pressed preset states and estimates synchronized',()=>{
+ const f=fixture();f.data.profiles=[{id:'suh',room:'Act_03_03',character:hero,usable:true,kills_per_min:20}];f.set(f.data);
+ const buttons=[1,2,4,8].map(hours=>({dataset:{hours:String(hours)},classList:{toggle(key,on){this[key]=on;}},setAttribute(key,value){this[key]=value;}}));
+ f.context.document.querySelectorAll=()=>buttons;
+ for(const input of f.listeners.get('input'))input({target:{id:'duration',value:'4',dataset:{}}});
+ assert.deepEqual(buttons.map(b=>b['aria-pressed']),['false','false','true','false']);
+ assert.equal(f.elements.get('#estimated-kills').textContent,'4,800');
+});
+
+test('delivery history keeps partial and untransferred rewards actionable and distinguishes save from Vault status',()=>{
+ const f=fixture();f.data.rewards=[{id:'r1',character:hero,room:'Act_03_03',state:'partial',partial:true,save_confirmed:false,items:2,stages:{ingest:'pending'}}];f.set(f.data);
+ let html=f.run('loot()');assert.match(html,/data-disclosure="delivery-history" open/);assert.match(html,/>Partial<\/span>/);assert.match(html,/data-ingest="r1"/);
+ f.data.rewards[0]={...f.data.rewards[0],partial:false,save_confirmed:true,stages:{ingest:'done'}};f.set(f.data);
+ html=f.run('loot()');assert.doesNotMatch(html,/data-disclosure="delivery-history" open/);assert.match(html,/>Saved<\/span>/);assert.match(html,/>Transferred<\/span>/);assert.match(html,/Transfer again/);
+});
+
+
+test('startup waits for deferred UI modules before fetching and rendering state',async()=>{
+ const f=fixture();assert.deepEqual(f.bootRequests,[]);
+ const requests=[];f.context.fetch=async url=>{requests.push(url);return {ok:true,json:async()=>url==='/zones.json'?[{room:'Act_03_03',name:'Desert',act:3,world:'old'}]:f.data};};
+ f.run('let rendered=false;extrasPanel=()=>{};bindMap=()=>{};updateLive=()=>{};centerMap=()=>{};render=()=>{rendered=true;};');
+ await f.listeners.get('DOMContentLoaded')[0]();
+ assert.deepEqual(requests,['/zones.json','/api/state']);assert.equal(f.run('rendered'),true);
 });
