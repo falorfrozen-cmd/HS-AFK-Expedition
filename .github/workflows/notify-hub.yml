@@ -1,0 +1,54 @@
+# Sends a `repository_dispatch` to the toolkit hub when a commit lands on
+# `main`, so the hub's recorded submodule pointer for this repository is
+# refreshed instead of drifting until someone bumps it by hand.
+#
+# This is the sending half of `.github/workflows/submodule-dispatch.yml` in
+# `falorfrozen-cmd/hero-siege-offline-toolkit`. The receiving side validates
+# the payload against an allowlist of submodule paths, checks the SHA is 40
+# hex characters, and opens a pointer pull request rather than pushing.
+#
+# Setup, once: add a repository secret named exactly `HUB_DISPATCH_TOKEN`
+# under Settings > Secrets and variables > Actions in THIS repository. Its
+# value is a fine-grained token for the hub repository only, with
+# `Contents: Read and write` (the dispatch endpoint is documented under
+# Contents write). The token the other tool repositories use works here too.
+#
+# With no token set the job reports that it is skipping and succeeds, so this
+# workflow never paints `main` red.
+
+name: Notify hub on merge to main
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for the dispatch token
+        id: token
+        env:
+          TOKEN: ${{ secrets.HUB_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "HUB_DISPATCH_TOKEN is not set; skipping the notification."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The payload carries only the submodule path and the commit. The hub
+      # resolves everything else itself, so a forged payload cannot talk it
+      # into recording a commit that is not on this repository.
+      - name: Tell the hub
+        if: steps.token.outputs.present == 'true'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.HUB_DISPATCH_TOKEN }}
+          repository: falorfrozen-cmd/hero-siege-offline-toolkit
+          event-type: submodule-updated
+          client-payload: >-
+            {"submodule": "HS-AFK-Expedition", "sha": "${{ github.sha }}"}

@@ -50,7 +50,8 @@ The 0.4.0 panel's **Restart region** therefore travels through the corresponding
 town before returning to the original Act. Loading produces `farm_pause` and
 `farm_resume` records in the same capture. It does not reset the sample, count
 loading as farm time, or turn a temporary missing player into a new character.
-See [the current restart receipt](../verification/release-0.4.0/room-restart-check-2.json).
+The restart receipt (`verification/release-0.4.0/room-restart-check-2.json`) is kept
+outside the public repository.
 The game must already be running; `prepare` remains the startup command.
 
 This is developer test travel, not proof that the player unlocked or cleared
@@ -108,8 +109,8 @@ py -3 -B -m unittest discover -s tests -p test_game_session.py -v
 
 Historical startup and cross-act travel receipts are in the external research
 archive under `verification/background-session-20260921` and
-`verification/background-travel-20260921`. Current product evidence is in
-[the 0.4.0 report](../verification/release-0.4.0/REPORT.md).
+`verification/background-travel-20260921`. Current product evidence is the 0.4.0
+report, also kept outside the public repository.
 
 ## Research call arguments
 

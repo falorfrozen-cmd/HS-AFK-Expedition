@@ -84,7 +84,7 @@ cmd /c plugin_build\build.bat
 
 The Python tests use temporary files and fake IPC, and never modify game saves
 or a real Vault. C++ runtime tests exercise the same slot/checkpoint helper used
-by the DLL. Live evidence is in
-`verification/fix-audit-20260918/live-results.json` and the accompanying report.
+by the DLL. The live evidence (`verification/fix-audit-20260918/`) is kept outside
+the public repository.
 The live harness uses fixed IDs and refuses to overwrite them; select new IDs
 for a new campaign rather than deleting an old completed expedition.

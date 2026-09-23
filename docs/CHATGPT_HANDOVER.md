@@ -10,7 +10,8 @@ The panel, native farm-context stamp, room clock and portable Win32 launcher are
 implemented. No pip dependencies were introduced. Existing legacy profiles are
 kept but cannot arm the product; a fresh ordinary Act measurement is required.
 
-Use `verification/release-0.3.0/REPORT.md` for actual checks and limitations. A
+The 0.3.0 verification report (kept outside the public repository) records the
+actual checks and limitations. A
 compiled DLL or matching fingerprint is not evidence for end-to-end reward parity.
 The game helper uses the IPC command channel without mouse/keyboard control.
 The user authorizes normal close/relaunch for tests and wants test games closed

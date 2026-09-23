@@ -4,6 +4,13 @@ A Windows companion that plans timed expeditions using your offline hero’s mea
 farming pace. **0.6.3 — measured farming / beta release.** Kill rates come from your
 calibration; the game generates loot when you claim your rewards.
 
+## Download
+
+**→ [Releases page](../../releases): download `AFK-FARM-<version>.zip`**, extract the
+whole folder and open **AFK FARM.exe**. Python is bundled. Aurie and YYToolkit must
+already be installed for your game version; `START_HERE.md` in the package walks
+through the setup.
+
 Start from a saved eligible profile with the game closed or another hero loaded.
 The selected hero, live hero and past recording are shown separately. Changing
 the selection does not change an active expedition.
@@ -112,12 +119,13 @@ Run `py -3 -B -m unittest discover -s tests -p "test_*.py"` and
 Frontend state regressions use `node --test tests/test_panel_ui.cjs` (Node is a
 development test tool only, not a product dependency). The isolated manual browser
 fixture is `py -3 -B tests/serve_panel_fixture.py`; it serves port 9567 and writes
-its temporary directory and stop sentinel to `verification/independent-rewards-0.5.0/fixture-info.json`.
+its temporary directory and stop sentinel to `verification/independent-rewards-0.5.0/fixture-info.json`
+(a local, git-ignored folder).
 It only permits timer start/cancel and modifier settings; it never connects to the game or real save data.
 
-See [0.5.0 verification](verification/independent-rewards-0.5.0/REPORT.md) for independent
-rewards and [0.4.1 verification](verification/offline-start-0.4.1/REPORT.md) for earlier
-offline-start, character-display and polling checks.
+Live verification reports (0.4.1 offline start, 0.5.0 independent rewards, the 0.6.x
+deliveries) are kept outside this public repository: they contain local paths and the
+tester's characters and items.
 
 Source documentation: [UI contract](docs/UI_CONTRACT.md), [architecture](docs/DESIGN.md),
 [handover](docs/CHATGPT_HANDOVER.md), [background game setup](docs/TEST_SESSIONS.md).
@@ -166,8 +174,8 @@ tiers. Existing Item Editor display names and PNG icons are reused with provenan
 in `web/assets/items/SOURCE.json`. Settings separately checks the game build, Aurie,
 YYToolkit and installed AFK DLL and lists the supported and unsupported mechanics.
 
-The five-step progress and live evidence are in
-[the 0.4.0 report](verification/release-0.4.0/REPORT.md).
+The five-step progress was verified live for 0.4.0; that report is kept outside this
+public repository.
 
 ## Independent reward settings
 

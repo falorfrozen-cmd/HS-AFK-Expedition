@@ -22,11 +22,7 @@ plugin_build/include/
 *.idb
 Export/
 
-# Local live-test backups contain complete player saves and installed binaries.
-verification/**/before-live.zip
-
-# Local release verification includes complete equipped-item snapshots.
-verification/release-*/
-
-# Vault database copies kept as evidence hold the player's items and saves.
-verification/**/*.sqlite3
+# Live verification records (reports, receipts, spool samples, Vault copies,
+# save backups) stay on the machine that made them: they hold local paths and
+# the tester's characters and items. The public repository keeps none of them.
+verification/
