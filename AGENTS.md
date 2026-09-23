@@ -14,6 +14,12 @@ This working tree contains the product and its tests.
 - Python 3.13 standard library only; no pip. Localhost web UI, no hosted service.
 - Hook game routines by SDK names. Never call another plugin's symbols.
 - Rewards come from native drop calls; never generate item structs in Python/JS.
+- Workers (tools/workers.py) are a designed layer: their amounts are our rules, but
+  every stack is created in the game by LootGroundCreate, Gem Sense uses the game's
+  Prospector table and dice, and prices are taken through the game's purchase path.
+  Only the materials Worker.hpp lists may be delivered. Never re-roll a planned haul.
+- Siege is a challenge layer over the measured pace, not a combat model; say so.
+- A special monster (rank outside 1-4) replays only after `afk special verify`.
 - No decompiled game source in this tree. Archive private raw research outside the hub.
 - Keep per-kill capture cheap. Do not reintroduce multi-megabyte research trace buffers.
 - Player identity is version 2: save slot, name and class. Names alone are not unique.

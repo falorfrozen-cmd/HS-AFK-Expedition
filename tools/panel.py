@@ -19,7 +19,7 @@ ROOT=Path(__file__).resolve().parents[1]
 WEB=ROOT/'web'
 CLASSES={i+1:n for i,n in enumerate(('Viking','Pyromancer','Marksman','Pirate','Nomad','Redneck','Necromancer','Samurai','Paladin','Amazon','Demon Slayer','Demonspawn','Shaman','White Mage','Marauder','Plague Doctor','Shield Lancer','Illusionist','Jotunn','Exo','Butcher','Stormweaver','Bard','Prophet'))}
 XOR=bytes.fromhex('e3953db1016bb65854383f46a17429cc454551f2a7f7abb726f137a88191e67e')
-VERSION='0.6.5'
+VERSION='0.7.0'
 IDENTIFIER=re.compile(r'[A-Za-z0-9_-]{1,120}\Z')
 
 def require(ok,message):
@@ -1023,11 +1023,14 @@ class Panel:
         done,total=result.get('calls_done') or 0,result.get('calls_total') or 0
         fraction=done/total if result.get('partial') and total else 1.0
         room=(plan.get('zones') or [{}])[0].get('room')
+        best=[dict(b) for b in (loot.get('best') or [])[:8]]
+        for b in best:   # names shared by a base item have no loot icon; a collectible's name is unique
+            if not b.get('icon'):b['icon']=(self.collection.catalog.by_name.get(b.get('name')) or {}).get('icon')
         return dict(schema=1,id=ident,version=VERSION,hero=dict(name=ch.get('name'),class_name=hero.get('class_name') or CLASSES.get(ch.get('class')),
                     level_before=sidecar.get('level_before'),level_now=hero.get('level')),region=zone_names().get(room,room),room=room,
                     mode=plan.get('mode','farm'),siege=plan.get('siege_claim'),hours=float(plan.get('hours') or 0)*float(plan.get('scale') or 1)*fraction,
                     kills=(plan.get('preview') or {}).get('kills'),exp=result.get('exp'),gold=result.get('gold'),items=loot.get('total'),
-                    visible_rarities=loot.get('visible_rarities'),best=(loot.get('best') or [])[:8],partial=bool(result.get('partial')),
+                    visible_rarities=loot.get('visible_rarities'),best=best,partial=bool(result.get('partial')),
                     wishlist_hits=collection.wishlist_hits(self.collection,ident,collection.load_wishlist(self.data)),
                     new_finds=new_finds[:8],new_finds_total=len(new_finds),delivered_at=result.get('updated') or result.get('settled_at'),
                     delivery_seconds=delivery_seconds(result))

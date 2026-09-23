@@ -1,4 +1,4 @@
-# AFK FARM 0.6.5 — measured-kill product
+# AFK FARM 0.7.0 — measured-kill product
 
 The earlier combat-reconstruction project is archived outside the active tree.
 The product uses empirical kills per region-second and native reward replay.
@@ -176,3 +176,46 @@ the real 2 h claim's records: of 64,123 hidden items, 61,733 were below Satanic
 (3,544,084 gold at their sale value) and 2,390 were Satanic C/B/A tier
 (38,154 Satanic Crystal Fragments). The live credit, the recipe read and one
 created stack still need a game session (`afk convert probe`).
+
+## 0.7.0: roster, collection, Siege, special monsters and workers
+
+**Hero roster.** `state.json` schema 2 keeps one armed expedition per hero under
+`expeditions`; claims, cancels and recoveries name the expedition (`--expedition`)
+or find it through the hero. The clock, plan, checkpoint and spool of every
+expedition were already keyed by its id, so nothing else changed: delivery is still
+one claim at a time, for the hero loaded in the game.
+
+**Collection and wishlist.** Read-only over delivered spools: a Set-or-better record
+whose native display name is a collectible's (web/collection.json, built from the
+Item Editor catalog; names are unique there) counts. Per-spool results are cached by
+size and time. A claim's wishlist drops show one Windows toast. The share card is
+drawn in the browser from `/api/share`; nothing is uploaded.
+
+**Siege.** A challenge layer over the measured pace (tools/siege.py): waves demand
+a growing kill rate; the hero's rate is its calibrated pace times the mean of five
+one-minute factors of its own calibration, damped by the calibration's length (full
+weight from 30 minutes). Waves it cannot keep up with damage a gate. Kills equal
+farming while the gate holds; special waves replay the calibration's own elite,
+goblin or verified boss packets; the level adds Magic Find. The timeline is drawn
+once from a stored seed, so claiming early or late never re-rolls it. It is not a
+combat model: say so wherever it is presented.
+
+**Special monsters.** Packets whose native rank is outside 1-4 no longer close a
+calibration; `afk.replayable` leaves them out of every plan until `afk special
+verify` replayed one cleanly in statistics runs (XP and gold off, items kept out of
+the Vault). Verified packets replay at their measured rate and in boss waves.
+
+**Workers.** A designed game layer (tools/workers.py), not a measurement: levels,
+skills and haul sizes are its own rules. What the game does: the plugin
+(`afk worker pay`) takes a hire or reset price from the loaded offline hero through
+the purchase path the game's merchant uses (`PickUpGoldCheck` with a fresh
+`GetCounterHash` and a negative amount), requires the gold to fall by exactly the
+price with no anti-cheat report and no server link, saves at once and gives the gold
+back if the save fails; one receipt per request. `afk worker deliver` creates every
+stack of a planned haul with `LootGroundCreate` (the call a mining node uses) into
+the delivery's own spool, and rolls the Gem Sense share per unit with the
+Prospector's ore recipe and the game's `irandom` (one roll per output, first hit
+wins, as the Prospector does). Only mining ores (27-32), jewel materials (0-23),
+Satanic Crystal (58), its fragment (60) and Destiny Shard Fragment (66) may be
+delivered. A haul is planned once from the trip's seed and never re-rolled; a
+delivery that stopped part way is never made again and can be closed as partial.
