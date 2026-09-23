@@ -1821,7 +1821,9 @@ static void CmdReplayImpl(const std::string& prefix, int times, bool clean, cons
 // A planned run: a list of (packet, count) replayed a few calls per frame so
 // the game keeps drawing, with progress written to disk after every frame so
 // a controlled abort can resume. A crashed process cannot prove that the game
-// save and spool agree: refuse automatic recovery of a running checkpoint.
+// save and spool agree: refuse automatic recovery of a running checkpoint. It
+// continues only when the checkpoint carries resume_accepted, which the panel
+// writes after the player confirmed a position the item records end at exactly.
 static std::string IdentityKey(const RValue& stamp)
 {
     RValue version = StructGet(stamp, "identity_version"), slot = StructGet(stamp, "slot"), cls = StructGet(stamp, "class"), name = StructGet(stamp, "name");
@@ -1884,7 +1886,13 @@ static std::string ExpeditionProgressJson(const std::string& state)
       << ",\"packet_index\":" << g_Exp.idx << ",\"done_in_packet\":" << g_Exp.doneInPacket
       << ",\"calls_done\":" << g_Exp.callsDone << ",\"calls_total\":" << g_Exp.callsTotal << ",\"failed\":" << g_Exp.failed << ",\"skipped\":" << g_Exp.skipped
       << ",\"checkpoint_version\":2,\"plan_hash\":\"" << g_Exp.planHash << "\""
-      << ",\"checkpoint_write_retries\":" << g_CheckpointWriteRetries
+      << ",\"checkpoint_write_retries\":" << g_CheckpointWriteRetries;
+    // The spool is flushed before every checkpoint: its size here is where the
+    // records of this position end. After a crash the panel sets aside what was
+    // written later, so a player-accepted continue never repeats a record.
+    std::error_code sizeError;
+    const auto spoolBytes = g_SpoolPath.empty() ? 0 : fs::file_size(g_SpoolPath, sizeError);
+    o << ",\"spool_bytes\":" << (g_SpoolPath.empty() || sizeError ? std::string("null") : std::to_string(spoolBytes))
       << ",\"effective_magic_find\":" << (g_Exp.effectiveMagicFind>=0?std::to_string(g_Exp.effectiveMagicFind):"null")
       << ",\"save_committed\":" << (g_Exp.saveNote.rfind("saved (",0)==0 ? "true" : "false");
     CurrentRewards().Fields([&](const char* key, auto& value) { o << ",\"" << key << "\":" << value; });
@@ -2051,7 +2059,10 @@ static void CmdExpeditionStart(const std::string& planPath, bool anywhere = fals
                 if (state == "done") { Out("expedition " + e.id + ": already done"); return; }
                 RValue saved = StructGet(pr, "saved");
                 const bool safeSave = saved.m_Kind == VALUE_STRING && (saved.ToString().find("saved (") == 0 || saved.ToString() == "nothing to save");
-                if (!AfkExpedition::CanResume(state, samePlan, safeSave)) { Out("expedition: checkpoint is unclean, failed or legacy; automatic resume refused, reconciliation required"); return; }
+                RValue acc = StructGet(pr, "resume_accepted");
+                const bool accepted = IsNumberKind(acc) && acc.ToDouble() == 1.0;
+                if (!AfkExpedition::CanResume(state, samePlan, safeSave, accepted)) { Out("expedition: checkpoint is unclean, failed or legacy; automatic resume refused, reconciliation required"); return; }
+                if (state == "running") Out("expedition " + e.id + ": continuing from the recorded position the player accepted (save not confirmed)");
                 if (!restored.Load([&](const char* key) { RValue v = StructGet(pr, key); return IsNumberKind(v) && v.m_Kind != VALUE_BOOL ? v.ToDouble() : std::numeric_limits<double>::quiet_NaN(); })) {
                     Out("expedition: checkpoint reward counters missing/invalid"); return;
                 }

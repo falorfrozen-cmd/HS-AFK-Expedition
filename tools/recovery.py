@@ -39,6 +39,85 @@ def data_lock(data):
 
 
 SAVED='saved (character and account save performed)'
+_SPOOL_CHECKS={}
+
+
+def spool_check(data, ident, progress):
+    """Whether the item records reach exactly the checkpoint: (reason, tail).
+
+    ``reason`` is None when the records up to the checkpoint are complete and
+    consistent: one line per record, contiguous sequence numbers, item records
+    and "partial" markers of earlier pauses only, as many items as the
+    checkpoint counts. ``tail`` = (bytes, lines) written after the checkpoint.
+    The plugin flushes the spool before every checkpoint and records its size
+    as ``spool_bytes``, so a crash can only leave records past that point: the
+    rewards of calls the checkpoint does not count, which a continue delivers
+    again and which must therefore be set aside first. A checkpoint without
+    ``spool_bytes`` (0.6.0 and older) must match the whole file.
+    """
+    items=progress.get('items');limit=progress.get('spool_bytes')
+    if type(items) is not int or items<0: return 'The checkpoint item count is invalid.',(0,0)
+    if limit is not None and (type(limit) is not int or limit<0): return 'The checkpoint spool size is invalid.',(0,0)
+    path=data/'spool'/f'{ident}.ndjson'
+    try: stat=path.stat()
+    except FileNotFoundError:
+        return (None,(0,0)) if items==0 and not limit else (f'The item records are missing but the checkpoint counts {items:,} items.',(0,0))
+    except OSError: return 'The item records are unreadable.',(0,0)
+    key=(str(path),stat.st_mtime_ns,stat.st_size,items,limit)
+    if key in _SPOOL_CHECKS: return _SPOOL_CHECKS[key]
+    try: raw=path.read_bytes()
+    except OSError: return 'The item records are unreadable.',(0,0)
+    end=len(raw) if limit is None else limit
+    if end>len(raw): result=(f'The item records are shorter than the checkpoint recorded ({len(raw):,} of {end:,} bytes).',(0,0))
+    elif end and raw[end-1:end]!=b'\n': result=('The checkpoint does not end at a record boundary.',(0,0))
+    else:
+        lines=count=0;reason=None
+        for line in raw[:end].decode('utf-8',errors='replace').splitlines():
+            if not line.strip(): continue
+            try: row=json.loads(line)
+            except ValueError: reason='The item records are unreadable.';break
+            if not isinstance(row,dict) or row.get('expedition_id')!=ident: reason='The item records contain a foreign or unreadable record.';break
+            lines+=1
+            if row.get('seq')!=lines: reason='The item record sequence has a gap or a duplicate.';break
+            if row.get('kind')=='item': count+=1
+            elif row.get('kind')!='partial': reason='The item records already end with a summary.';break
+        if reason is None and count!=items:
+            reason=f'The item records hold {count:,} items but the checkpoint counts {items:,}.'
+        tail=raw[end:]
+        result=(reason,(len(tail),len([l for l in tail.splitlines() if l.strip()])))
+    if len(_SPOOL_CHECKS)>32: _SPOOL_CHECKS.clear()
+    _SPOOL_CHECKS[key]=result
+    return result
+
+
+def spool_mismatch(data, ident, progress):
+    """Why the item records do not end exactly at the checkpoint, or None."""
+    reason,(tail,_)=spool_check(data,ident,progress)
+    return reason or (f'{tail:,} bytes of item records were written after the checkpoint.' if tail else None)
+
+
+def continuable(data, ident):
+    """Whether an interrupted delivery may continue from its recorded position.
+
+    Only for a checkpoint left "running" by a crash, power loss or a killed
+    game: same plan, no failed calls, no failure record, and item records that
+    end exactly at the checkpoint. The player must still accept it (the save is
+    not confirmed); returns (allowed, reasons it is not).
+    """
+    reasons=[]
+    if (data/'sessions'/f'{ident}.failure.json').exists(): reasons.append('A native failure record exists.')
+    p=read(data/'sessions'/f'{ident}.progress.json') or {}
+    plan_path=data/'plans'/f'{ident}.json'
+    if p.get('state')!='running': reasons.append('Only a delivery that stopped while running can continue from its recorded position.')
+    if p.get('checkpoint_version')!=2 or p.get('expedition_id')!=ident: reasons.append('Checkpoint identity or version is invalid.')
+    if not plan_path.is_file() or p.get('plan_hash')!=hashlib.sha256(plan_path.read_bytes()).hexdigest(): reasons.append('The plan differs from the checkpoint.')
+    done,total=p.get('calls_done'),p.get('calls_total')
+    if type(done) is not int or type(total) is not int or not 0<=done<total: reasons.append('The recorded call counts leave nothing to continue.')
+    if p.get('failed')!=0 or p.get('skipped')!=0: reasons.append('Some reward calls failed or were skipped.')
+    if not reasons:
+        mismatch,_=spool_check(data,ident,p)
+        if mismatch: reasons.append(mismatch)
+    return not reasons,reasons
 
 
 def resumable(data, ident):
@@ -47,17 +126,20 @@ def resumable(data, ident):
     Pause, a closed game window or leaving the region with the expedition hero
     saves the game and writes an "aborted" or "paused" checkpoint with that
     save receipt. Only such a checkpoint, for the exact plan, without failed
-    calls or a failure record, continues; everything else still needs review.
+    calls or a failure record, continues; everything else still needs review,
+    except a running checkpoint whose recorded position the player accepted.
     """
     if not isinstance(ident,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,120}', ident): return False
     if (data/'sessions'/f'{ident}.failure.json').exists(): return False
     p=read(data/'sessions'/f'{ident}.progress.json') or {}
     plan_path=data/'plans'/f'{ident}.json'
-    if p.get('state') not in ('aborted','paused') or p.get('checkpoint_version')!=2 or p.get('expedition_id')!=ident: return False
+    accepted=p.get('state')=='running' and p.get('resume_accepted') is True
+    if (p.get('state') not in ('aborted','paused') and not accepted) or p.get('checkpoint_version')!=2 or p.get('expedition_id')!=ident: return False
     if not plan_path.is_file() or p.get('plan_hash')!=hashlib.sha256(plan_path.read_bytes()).hexdigest(): return False
     done,total=p.get('calls_done'),p.get('calls_total')
     if type(done) is not int or type(total) is not int or not 0<=done<total: return False
     if p.get('failed')!=0 or p.get('skipped')!=0: return False
+    if accepted: return spool_mismatch(data,ident,p) is None
     saved=p.get('save_committed') is True and p.get('saved')==SAVED
     return saved or (p.get('saved')=='nothing to save' and done==0)
 
@@ -110,11 +192,57 @@ def inspect(data, ident):
         elif summaries and summaries[-1].get('gold' if key=='gold' else 'exp_credited')!=int(n):
             reasons.append('The '+key+' summary does not match the checkpoint.')
     if reasons and resumable(data,ident):
-        return dict(id=ident,status='paused',recoverable=False,resumable=True,
-                    reasons=['Delivery was paused at a saved position. Claim again with the same hero in the same region to continue.'],
+        accepted=progress.get('state')=='running' and progress.get('resume_accepted') is True
+        return dict(id=ident,status='paused',recoverable=False,resumable=True,accepted=accepted,
+                    reasons=['You accepted the recorded position. Claim again with the same hero in the same region to continue.' if accepted else
+                             'Delivery was paused at a saved position. Claim again with the same hero in the same region to continue.'],
                     items=len(items),calls_done=progress.get('calls_done'),calls_total=progress.get('calls_total'))
-    return dict(id=ident,status='saved' if not reasons else 'needs_review',recoverable=not reasons,resumable=False,reasons=reasons,
+    result=dict(id=ident,status='saved' if not reasons else 'needs_review',recoverable=not reasons,resumable=False,reasons=reasons,
                 items=len(items),calls_done=progress.get('calls_done'),calls_total=progress.get('calls_total'))
+    if reasons:
+        result['continuable'],result['continue_blockers']=continuable(data,ident)
+        if result['continuable']:
+            result['records_after_checkpoint']=spool_check(data,ident,progress)[1][1]
+    return result
+
+
+def accept_position(data, ident):
+    """The player accepts an interrupted delivery's recorded position.
+
+    Marks the checkpoint resume_accepted so the next claim continues from it.
+    Nothing is replayed here; the delivered calls are never repeated, and the
+    save of the delivered XP and gold stays unconfirmed.
+    """
+    from afk import write_json, iso, now_utc
+    review=inspect(data,ident)
+    if review['status']!='needs_review':raise ValueError('Only a claim that needs review can continue from its recorded position.')
+    state=read(data/'state.json') or {}
+    armed=state.get('armed')
+    if not armed or armed.get('expedition_id')+'_claim'!=ident: raise ValueError('This is not the currently armed claim.')
+    path=data/'sessions'/f'{ident}.progress.json'
+    if path.stat().st_mtime>time.time()-30:
+        raise ValueError('Delivery still looks active. Close the game or wait a moment, then try again.')
+    allowed,reasons=continuable(data,ident)
+    if not allowed: raise ValueError('This claim cannot continue from its recorded position: '+' '.join(reasons))
+    p=read(path)
+    _,(tail_bytes,tail_records)=spool_check(data,ident,p)
+    set_aside=None
+    if tail_bytes:
+        # Records written after the checkpoint belong to calls the continue
+        # delivers again. Keep them in a separate file, then cut the spool at
+        # the checkpoint; a retry after an interruption finds the same state.
+        spool=data/'spool'/f'{ident}.ndjson';folder=data/'spool'/'set-aside';folder.mkdir(parents=True,exist_ok=True)
+        set_aside=folder/f"{ident}.after-checkpoint-{time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())}.ndjson"
+        with spool.open('r+b') as stream:
+            stream.seek(p['spool_bytes']);set_aside.write_bytes(stream.read())
+            stream.seek(p['spool_bytes']);stream.truncate();stream.flush();os.fsync(stream.fileno())
+        _SPOOL_CHECKS.clear()
+        if spool_mismatch(data,ident,p): raise ValueError('The item records could not be cut at the checkpoint; nothing was accepted.')
+    p.update(resume_accepted=True,resume_accepted_by='player',resume_accepted_at=iso(now_utc()),
+             resume_basis=dict(calls_done=p['calls_done'],items=p['items'],spool_bytes=p.get('spool_bytes'),
+                               set_aside=str(set_aside) if set_aside else None,set_aside_records=tail_records if set_aside else 0))
+    write_json(path,p)
+    return p
 
 
 def settle_partial(data, ident):
@@ -127,7 +255,8 @@ def settle_partial(data, ident):
     """
     from afk import write_json, iso, now_utc
     review=inspect(data,ident)
-    if review['status']!='needs_review':raise ValueError('Only a claim that needs review can be closed as partial.')
+    if review['status']!='needs_review' and not (review['status']=='paused' and review.get('accepted')):
+        raise ValueError('Only a claim that needs review can be closed as partial.')
     state=read(data/'state.json') or {}
     armed=state.get('armed')
     if not armed or armed.get('expedition_id')+'_claim'!=ident: raise ValueError('This is not the currently armed claim.')

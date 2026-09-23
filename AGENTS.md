@@ -41,7 +41,10 @@ This working tree contains the product and its tests.
 - `tools/calibration.py`, `tools/validate_farm.py`: descriptive quality and frozen
   independent comparisons. Never lower a frozen acceptance target after seeing data.
 - `tools/recovery.py`: reconcile confirmed completed saves only. Partial or
-  contradictory evidence refuses recovery and transfer; never replay to repair it.
+  contradictory evidence refuses automatic recovery; never replay to repair it.
+  The player may close such a claim as partial (keeps records, allows transfer)
+  or, when the records end exactly at a running checkpoint's `spool_bytes`, accept
+  that position to deliver the rest. Both are explicit, confirmed player actions.
 - `tools/product_data.py`, `tools/item_labels.py`, `web/extras.js`: presentation,
   native rarity labels, loot journal, support matrix and optional user screenshot.
 

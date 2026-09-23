@@ -161,6 +161,42 @@ test('a claim that needs review can be closed as a partial delivery after a conf
  f.data.job=null;f.data.editor='http://127.0.0.1:8791';f.data.rewards=[{id:'farm_claim',state:'partial',partial:true,save_confirmed:false,items:5,gold:0,stages:{ingest:'pending'}}];f.set(f.data);
  const chest=f.run('loot()');assert.match(chest,/<span class="badge ">Partial<\/span>/);assert.match(chest,/data-ingest="farm_claim" >Transfer to Vault/);assert.doesNotMatch(chest,/Review save receipt/);
 });
+test('a delivery a crash cut short offers to continue from its recorded position, then shows it accepted',()=>{
+ const f=delivering();f.data.job=null;
+ f.data.recovery={id:'farm_claim',status:'needs_review',recoverable:false,continuable:true,continue_blockers:[],reasons:['Native delivery has no completed checkpoint.'],calls_done:80223,calls_total:102006};f.set(f.data);
+ const listeners={};f.context.document.addEventListener=(type,fn)=>{listeners[type]=fn;};
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../web/extras.js'),'utf8'),f.context);
+ let html=f.run('expeditionPanel()');
+ assert.match(html,/item records end exactly at that position/);assert.match(html,/data-accept-position >|data-accept-position>/);
+ assert.match(html,/Continue from recorded position/);assert.match(html,/Delivers the remaining 21,783 reward calls/);assert.match(html,/data-settle-partial/);
+ const calls=[];f.context.recorded=calls;f.run('action=(name,args)=>{recorded.push(name);return Promise.resolve();}');
+ let asked='';const button={disabled:false,dataset:{},hasAttribute:n=>n==='data-accept-position'};
+ f.context.confirm=m=>{asked=m;return true;};listeners.click({target:{closest:()=>button}});
+ assert.match(asked,/remaining 21,783 are delivered when you claim again/);assert.match(asked,/not confirmed/);assert.deepEqual(calls,['accept_position']);
+ f.data.recovery={...f.data.recovery,continuable:false,continue_blockers:['The item records hold 4 items but the checkpoint counts 3.']};f.set(f.data);
+ html=f.run('expeditionPanel()');assert.match(html,/It cannot continue from there: The item records hold 4 items/);assert.doesNotMatch(html,/data-accept-position/);
+ const a=armedHere();a.data.progress={expedition_id:'farm_claim',state:'running',resumable:true,resume_accepted:true,calls_done:80223,calls_total:102006,percent:78.6};
+ a.data.recovery={status:'paused',resumable:true,accepted:true,recoverable:false,reasons:['You accepted the recorded position.']};a.set(a.data);
+ html=a.run('expeditionPanel()');
+ assert.match(html,/Recorded position accepted/);assert.match(html,/80,223 of 102,006 reward calls were delivered/);assert.match(html,/Continue delivery/);
+ assert.match(html,/Continues from the recorded position/);assert.match(html,/Close as partial delivery instead/);assert.doesNotMatch(html,/delivered and saved|uncertain outcome/);
+});
+test('region comparison lists the selected hero’s regions, marks the best and sorts by a column',()=>{
+ const f=fixture();vm.runInContext(fs.readFileSync(path.join(__dirname,'../web/extras.js'),'utf8'),f.context);
+ f.data.regions=[{character:hero,rows:[
+   {profile:'glacier',usable:true,room:'Act_02_05',name:'The Glacial Trail',kills_per_min:778.7,xp_per_hour:1306084290,gold_per_hour:234923,rarities_per_hour:{Unholy:0,Angelic:0,Heroic:59.8,Satanic:3820.3},expeditions:1,hours:1.57,magic_find:[10]},
+   {profile:'desert',usable:false,room:'Act_03_03',name:"Mos'Arathim Desert",kills_per_min:201.4,xp_per_hour:48329858,gold_per_hour:14686,rarities_per_hour:{},expeditions:0,hours:0,magic_find:[]}]},
+  {character:other,rows:[{profile:'x',usable:true,room:'Act_01_01',name:'Other place',kills_per_min:1,xp_per_hour:1,gold_per_hour:null,rarities_per_hour:{},expeditions:0,hours:0,magic_find:[]}]}];
+ f.set(f.data);f.run('selected=2');
+ let html=f.run('regionCard()');
+ assert.match(html,/Where Suh farms best/);assert.doesNotMatch(html,/Other place/);
+ assert.match(html,/<td class="best">1,306,084,290<\/td>/);assert.match(html,/1\.57 h · 1 expedition · MF ×10/);assert.match(html,/Calibration only/);
+ assert.match(html,/data-use-profile="glacier">Plan here/);assert.match(html,/Needs recalibration/);assert.match(html,/Mos&#39;Arathim Desert|Mos'Arathim Desert/);
+ assert.ok(html.indexOf('The Glacial Trail')<html.indexOf('Arathim'),'highest XP per hour first');
+ f.run('regionSort="kills_per_min"');html=f.run('regionCard()');assert.ok(html.indexOf('The Glacial Trail')<html.indexOf('Arathim'));
+ f.data.regions[0].rows[1].kills_per_min=900;f.set(f.data);html=f.run('regionCard()');assert.ok(html.indexOf('Arathim')<html.indexOf('The Glacial Trail'),'sorted by the chosen column');
+ f.run('selected=9');assert.equal(f.run('regionCard()'),'','no card for a hero without calibrations');
+});
 test('farm again restarts the last settled expedition and the planner warns about a changed loadout',()=>{
  const f=fixture();const p={id:'suh',room:'Act_03_03',character:hero,usable:true,kills_per_min:20,basis_seconds:240,coverage:1,problems:[]};f.data.profiles=[p];
  f.data.repeat={room:'Act_03_03',hours:2,slot:2,name:'Suh',profile:'suh'};f.set(f.data);f.run('selected=2;room="Act_03_03"');

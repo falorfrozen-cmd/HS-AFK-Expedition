@@ -9,6 +9,7 @@ import afk
 import reward_modifiers
 import ingest_spool
 import loot_filter
+import notify
 import calibration, recovery, validate_farm
 from product_data import Presentation, SUPPORT, support_warnings
 
@@ -16,7 +17,7 @@ ROOT=Path(__file__).resolve().parents[1]
 WEB=ROOT/'web'
 CLASSES={i+1:n for i,n in enumerate(('Viking','Pyromancer','Marksman','Pirate','Nomad','Redneck','Necromancer','Samurai','Paladin','Amazon','Demon Slayer','Demonspawn','Shaman','White Mage','Marauder','Plague Doctor','Shield Lancer','Illusionist','Jotunn','Exo','Butcher','Stormweaver','Bard','Prophet'))}
 XOR=bytes.fromhex('e3953db1016bb65854383f46a17429cc454551f2a7f7abb726f137a88191e67e')
-VERSION='0.6.0'
+VERSION='0.6.1'
 IDENTIFIER=re.compile(r'[A-Za-z0-9_-]{1,120}\Z')
 
 def require(ok,message):
@@ -122,15 +123,17 @@ def zone_names():
     except (OSError,ValueError,KeyError,TypeError):return {}
 
 
-def expedition_label(room,hours):
-    """Readable name of an expedition's Vault category: region and duration."""
-    return f"{zone_names().get(room,room)} · {hours:g} h"
+def expedition_label(room,hours,hero=None):
+    """Readable name of an expedition's Vault category: hero, region and duration."""
+    return afk.expedition_label(hero,zone_names().get(room,room),hours)
 
 
 def load_preferences(data):
     prefs=read(data/'preferences.json',{}) or {}
-    speed=prefs.get('delivery_speed') if isinstance(prefs,dict) else None
-    return dict(schema=1,delivery_speed=speed if speed in afk.DELIVERY_SPEEDS else 'normal')
+    prefs=prefs if isinstance(prefs,dict) else {}
+    speed=prefs.get('delivery_speed');ready=prefs.get('ready_notification')
+    return dict(schema=1,delivery_speed=speed if speed in afk.DELIVERY_SPEEDS else 'normal',
+                ready_notification=ready if type(ready) is bool else True)
 
 
 def delivery_seconds(result):
@@ -146,7 +149,7 @@ class Panel:
         self.lock=threading.Lock(); self.job_lock=threading.Lock(); self.state_lock=threading.Lock(); self.closed=threading.Event()
         self.capture_lock=threading.Lock(); self.capture_cache=None
         self.job=None; self.live=None; self.live_at=0; self.game_running=False; self.connection_error=None
-        self.editor=None; self.editor_at=0; self.last_profiles=0; self.profiles=[]; self.chars=[]
+        self.editor=None; self.editor_at=0; self.last_profiles=0; self.profiles=[]; self.chars=[]; self.notification={}; self.results_cache=None
         self.calibration=read(self.data/'panel-calibration.json',{}) or {}
         self.presentation=Presentation(ROOT)
         self.recovery_cache=None; self.recovery_checked_at=0
@@ -185,6 +188,17 @@ class Panel:
                 finally:self.lock.release()
             if time.monotonic()-self.editor_at>20:
                 self.editor=ingest_spool.discover_editor(.1);self.editor_at=time.monotonic()
+            self.sync_notification()
+
+    def sync_notification(self):
+        # Keeps the Windows "expedition ready" task in step with the armed
+        # expedition and the setting; a failure is shown, never raised.
+        try:
+            armed=(read(self.data/'state.json',{}) or {}).get('armed')
+            plan=read(Path(armed['plan']),{}) if armed else None
+            self.notification=notify.sync(self.data,armed,load_preferences(self.data)['ready_notification'],plan)
+        except Exception as e:
+            self.notification=dict(error=f'Notification task not updated: {e}')
 
     def current_live(self):
         return self.live if time.monotonic()-self.live_at<15 else None
@@ -266,7 +280,8 @@ class Panel:
                     portraits={str(c['slot']):self.portrait_key(c) for c in self.chars if (self.data/'portraits'/(self.portrait_key(c)+'.png')).is_file()},
                     loot_filter=vault_filter,loot_filter_error=filter_error,loot_filter_rarities=list(loot_filter.GEAR_RARITIES),
                     preferences=load_preferences(self.data),delivery=self.delivery_view(armed,plan,progress),
-                    repeat=self.repeat_view(state,armed),profile_live_matches=self.live_matches(live),
+                    notification=dict(windows=os.name=='nt',scheduled=(self.notification or {}).get('scheduled'),error=(self.notification or {}).get('error')),
+                    repeat=self.repeat_view(state,armed),profile_live_matches=self.live_matches(live),regions=self.regions_view(),
                     background=self.background_view(armed,progress,review,live),pause_note=self.pause_note)
 
     def delivery_view(self,armed,plan,progress):
@@ -296,6 +311,53 @@ class Panel:
         profile=next((p for p in self.profiles if p['usable'] and p.get('room')==room and same_character(p.get('character'),ch)),None)
         return dict(room=room,hours=float(plan['hours']),slot=ch['slot'],name=ch['name'],profile=profile['id'] if profile else None,
                     reason=None if profile else 'The saved calibration for this hero and region is no longer usable. Recalibrate first.')
+
+    def expedition_results(self):
+        """Delivered claims (saved, or closed as partial by the player) with their plans."""
+        try:files=sorted((self.data/'sessions').glob('*.result.json'));key=tuple((f.name,f.stat().st_mtime_ns) for f in files)
+        except OSError:return []
+        if self.results_cache and self.results_cache[0]==key:return self.results_cache[1]
+        out=[]
+        for f in files:
+            ident=f.name.removesuffix('.result.json');result=read(f,{}) or {};plan=read(self.data/'plans'/f'{ident}.json',{}) or {}
+            if plan.get('panel_version') and (result.get('rewards_saved') is True or result.get('partial') is True):out.append((ident,result,plan))
+        self.results_cache=(key,out);return out
+
+    def regions_view(self):
+        """Per hero, each calibrated region's measured pace and XP next to what its
+        delivered expeditions yielded per hour: gold at x1, items at the Magic
+        Find used. One row per region: the newest usable calibration, else the
+        newest one, marked as needing recalibration."""
+        latest={}
+        for p in self.profiles:
+            if not valid_identity(p.get('character')):continue
+            key=(json.dumps(p['character'],sort_keys=True),p.get('room'))
+            rank=(bool(p.get('usable')),str(p.get('built_at') or ''))
+            if key not in latest or rank>(bool(latest[key].get('usable')),str(latest[key].get('built_at') or '')):latest[key]=p
+        heroes={}
+        for (hero,room),p in latest.items():heroes.setdefault(hero,[]).append(p)
+        results=self.expedition_results();names=zone_names();out=[]
+        for hero,profiles in heroes.items():
+            rows=[]
+            for p in profiles:
+                hours=gold=0.0;counts={r:0 for r in ('Unholy','Angelic','Heroic','Satanic')};runs=0;magic=set()
+                for ident,result,plan in results:
+                    if (plan.get('zones') or [{}])[0].get('room')!=p['room'] or not same_character(plan.get('character'),p['character']):continue
+                    done,total=result.get('calls_done') or 0,result.get('calls_total') or 0
+                    fraction=done/total if result.get('partial') and total else 1.0
+                    h=float(plan.get('hours') or 0)*float(plan.get('scale') or 1)*fraction
+                    if h<=0:continue
+                    mods=plan.get('reward_modifiers') or {}
+                    hours+=h;runs+=1;gold+=float(result.get('gold') or 0)/float(mods.get('gold') or 1);magic.add(float(mods.get('magic_find') or 1))
+                    found=self.presentation.loot(self.data,ident).get('rarities',{})
+                    for r in counts:counts[r]+=found.get(r,0)
+                rows.append(dict(profile=p['id'],usable=bool(p.get('usable')),room=p['room'],name=names.get(p['room'],p['room']),kills_per_min=p.get('kills_per_min'),
+                                 xp_per_hour=(p.get('exp_per_min') or 0)*60 or None,gold_per_hour=gold/hours if hours else None,
+                                 rarities_per_hour={r:c/hours for r,c in counts.items()} if hours else {},
+                                 expeditions=runs,hours=hours,magic_find=sorted(magic)))
+            rows.sort(key=lambda r:-(r['xp_per_hour'] or 0))
+            out.append(dict(character=profiles[0]['character'],rows=rows))
+        return out
 
     def live_matches(self,live):
         """Per profile of the loaded hero: does the current loadout still match?"""
@@ -375,7 +437,7 @@ class Panel:
         with self.state_lock:self.job=dict(id=uuid.uuid4().hex,action=action,state='running',output='',error=None,started_at=time.time())
         def run():
             try:
-                if action in ('plan','start','cancel','recover','ingest','portrait','configure','save_modifiers','save_loot_filter','save_preferences','settle_partial'):
+                if action in ('plan','start','cancel','recover','ingest','portrait','configure','save_modifiers','save_loot_filter','save_preferences','settle_partial','accept_position'):
                     self.action(action,args)
                 else:
                     with self.lock:self.action(action,args)
@@ -408,9 +470,17 @@ class Panel:
             afk.write_json(self.data/'loot-filter.json',settings)
             self.log('Vault transfer filter saved: '+loot_filter.describe(settings)+'. Items it keeps back stay in the expedition records.');return
         if name=='save_preferences':
-            speed=args.get('delivery_speed');require(speed in afk.DELIVERY_SPEEDS,'Choose Normal, Fast or Maximum.')
-            afk.write_json(self.data/'preferences.json',dict(schema=1,delivery_speed=speed))
-            self.log('Delivery speed saved: '+speed+'. A paused delivery keeps its own speed.');return
+            prefs=load_preferences(self.data);require('delivery_speed' in args or 'ready_notification' in args,'Nothing to save.')
+            if 'delivery_speed' in args:
+                speed=args.get('delivery_speed');require(speed in afk.DELIVERY_SPEEDS,'Choose Normal, Fast or Maximum.');prefs['delivery_speed']=speed
+            if 'ready_notification' in args:
+                ready=args.get('ready_notification');require(type(ready) is bool,'Choose on or off.');prefs['ready_notification']=ready
+            afk.write_json(self.data/'preferences.json',prefs)
+            if 'delivery_speed' in args:self.log('Delivery speed saved: '+prefs['delivery_speed']+'. A paused delivery keeps its own speed.')
+            if 'ready_notification' in args:
+                self.log('Windows notification when an expedition is ready: '+('on' if prefs['ready_notification'] else 'off')+'.')
+                threading.Thread(target=self.sync_notification,daemon=True).start()
+            return
         if name=='save_modifiers':
             settings=reward_modifiers.normalize(args.get('settings'))
             afk.write_json(self.data/'reward-modifiers.json',settings)
@@ -500,7 +570,9 @@ class Panel:
             hours=float(args.get('hours',1));require(math.isfinite(hours) and .25<=hours<=8,'Duration must be between 15 minutes and 8 hours.')
             ident='farm_'+datetime.now().strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:6]
             plan=afk.make_plan(hours,[(p['room'],1)],ident,40,'pickup',profile_overrides={p['room']:p})
-            plan['farm_context']=p['farm_context'];plan['panel_version']=VERSION;plan['label']=expedition_label(p['room'],hours)
+            plan['farm_context']=p['farm_context'];plan['panel_version']=VERSION
+            hero=(p.get('character') or {}).get('name')
+            plan.update(label=expedition_label(p['room'],hours,hero),label_hero=hero,label_region=zone_names().get(p['room'],p['room']))
             reward_modifiers.apply_to_plan(plan,p,reward_modifiers.load(self.data/'reward-modifiers.json'))
             afk.rebuild_preview(plan)
             path=self.data/'plans'/f'{ident}.json';afk.write_json(path,plan)
@@ -533,6 +605,16 @@ class Panel:
             with recovery.data_lock(self.data):result=recovery.settle_partial(self.data,armed['expedition_id']+'_claim')
             self.log(f"Claim closed as a partial delivery ({result.get('calls_done',0):,} of {result.get('calls_total',0):,} reward calls). "
                      'Delivered rewards stay; nothing was generated again. The expedition clock is free.');return
+        if name=='accept_position':
+            # The player accepts the recorded position of a delivery a crash cut
+            # short; the item records end exactly there. Nothing runs here.
+            armed=(read(self.data/'state.json',{}) or {}).get('armed');require(armed,'No active expedition.')
+            live=self.current_live()
+            require(not (live and live.get('replay_running')),'Delivery is running in the game. Pause it first.')
+            with recovery.data_lock(self.data):p=recovery.accept_position(self.data,armed['expedition_id']+'_claim')
+            self.recovery_cache=None
+            self.log(f"Recorded position accepted ({p['calls_done']:,} of {p['calls_total']:,} reward calls). "
+                     'Claim with the same hero in the same region to deliver the rest. Delivered calls are not repeated.');return
         if name=='cancel':
             armed=(read(self.data/'state.json',{}) or {}).get('armed')
             require(not armed or not progress_view(self.data,armed['expedition_id']+'_claim').get('state'),'An expedition cannot be cancelled here once delivery has started.')
@@ -544,7 +626,8 @@ class Panel:
             require(review['recoverable'] or (settled.get('partial') is True and settled.get('settled_by')=='player'),
                     'Only complete, saved and consistent rewards, or a claim you closed as partial, can be transferred.')
             plan=read(self.data/'plans'/f'{ident}.json',{}) or {}
-            label=plan.get('label') or expedition_label((plan.get('zones') or [{}])[0].get('room',''),float(plan.get('hours') or 0)*float(plan.get('scale') or 1))
+            label=plan.get('label') or expedition_label((plan.get('zones') or [{}])[0].get('room',''),float(plan.get('hours') or 0)*float(plan.get('scale') or 1),
+                                                          (plan.get('character') or {}).get('name'))
             with recovery.data_lock(self.data):self.cli('ingest',spool,'--label',label)
             path=self.data/'sessions'/f'{ident}.result.json';result=read(path)
             if result:

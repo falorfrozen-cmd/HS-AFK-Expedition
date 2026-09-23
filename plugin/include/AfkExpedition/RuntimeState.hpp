@@ -86,7 +86,12 @@ struct RewardTotals {
 // "paused" counts only when it carries a save: the hero left the region and
 // the plugin saved before waiting. A running or unsaved checkpoint may hide
 // rewards the save does not contain, so it still needs reconciliation.
-inline bool CanResume(const std::string& state, bool samePlan, bool saved) {
-    return (state == "aborted" || state == "paused") && samePlan && saved;
+// A running checkpoint (crash, power loss) continues only after the player
+// accepted its recorded position in the panel, which first checks that the item
+// records end exactly there (resume_accepted). The save stays unconfirmed.
+inline bool CanResume(const std::string& state, bool samePlan, bool saved, bool accepted = false) {
+    if (!samePlan) return false;
+    if (state == "aborted" || state == "paused") return saved;
+    return state == "running" && accepted;
 }
 }

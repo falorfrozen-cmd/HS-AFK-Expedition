@@ -1,4 +1,4 @@
-# AFK FARM panel contract — 0.6.0
+# AFK FARM panel contract — 0.6.1
 
 The product interface is English only, including accessibility labels, server
 messages and launcher dialogs. Number formatting uses en-US. Player names, game
@@ -132,6 +132,20 @@ in the last 30 seconds. It writes a result with state `partial`, `partial: true`
 the delivered fraction of the hours and frees the armed clock. The checkpoint,
 plan and spool stay untouched; no reward call is made. Such a result shows a
 Partial badge and may be transferred to the Vault.
+`recovery.inspect` reports `continuable` and `continue_blockers` for a claim that
+needs review, and `records_after_checkpoint` when it can continue. Continue from
+recorded position (`accept_position`, after a confirmation that states the counts)
+requires a "running" checkpoint for the same plan, no failure sidecar, no failed or
+skipped calls, and a spool whose records up to `spool_bytes` (the checkpoint's own
+record of the spool size; older checkpoints must match the whole file) are complete:
+contiguous sequence numbers, items and earlier "partial" markers only, as many items
+as the checkpoint counts. It is refused while the game reports a running replay or
+the checkpoint changed in the last 30 seconds. Bytes after `spool_bytes` are copied
+to `spool/set-aside/<id>.after-checkpoint-<UTC>.ndjson` and cut from the spool; then
+the checkpoint gets `resume_accepted: true`, `resume_accepted_by: player` and
+`resume_basis`. The plugin's `CanResume` accepts a running checkpoint only with that
+flag; the claim then continues like a saved pause and keeps its speed. An accepted
+claim can still be closed as partial.
 Reward operations share an OS lock. Snapshot recovery checks may be cached for two
 seconds; actions always recheck the files. Vault retries never replay native rewards.
 
@@ -141,6 +155,29 @@ native spools remain intact. Favorites stay in browser localStorage. Rarity labe
 refer to native itemInfoStruct[27], not unrelated rarity enums. Unknown tiers remain
 numbered. Portrait uploads accept PNG screenshots up to 4 MB and 4096 pixels per
 dimension. Portraits are indexed by character identity, not player name alone.
+
+## Notifications and region comparison
+
+`preferences.json` holds `delivery_speed` and `ready_notification` (default true).
+`save_preferences` accepts either key. The panel's monitor keeps one Task Scheduler
+task, `AFK FARM\Expedition ready`, in step with the armed expedition and the setting
+(`tools/notify.py`, record `notify-ready.json`): created with `schtasks /XML` for the
+local end time (StartWhenAvailable, least privilege, interactive token) running
+`conhost --headless powershell.exe -File notify-ready.ps1`, which shows a toast under
+Windows PowerShell's app id and deletes the task. It is deleted when the expedition
+is claimed, cancelled or the setting is off; a refused request is shown and not
+retried for the same expedition. The snapshot's `notification` reports `scheduled`
+and `error`; the page's own "ready" notification is skipped while the task covers
+the expedition.
+
+The snapshot's `regions` lists, per hero with calibrations, one row per region (the
+newest usable calibration, else the newest one with `usable: false`): calibration
+`kills_per_min` and `xp_per_hour` (exp_per_min × 60), and from delivered claims
+(saved, or closed as partial for their delivered share of the hours) `gold_per_hour`
+divided by each claim's gold setting, `rarities_per_hour` for Unholy, Angelic, Heroic
+and Satanic items at the Magic Find recorded (`magic_find`), `expeditions` and
+`hours`. Vault labels are `<hero> · <region> · <time>`; a claim relabels its plan
+with the credited time.
 
 ## User-facing limits
 

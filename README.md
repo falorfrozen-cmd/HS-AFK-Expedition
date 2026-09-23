@@ -1,7 +1,7 @@
 # AFK FARM · Hero Siege
 
 A Windows companion that plans timed expeditions using your offline hero’s measured
-farming pace. **0.6.0 — measured farming / beta release.** Kill rates come from your
+farming pace. **0.6.1 — measured farming / beta release.** Kill rates come from your
 calibration; the game generates loot when you claim your rewards.
 
 Start from a saved eligible profile with the game closed or another hero loaded.
@@ -22,6 +22,13 @@ and materials go to Infinite Vault; items left out stay in the records and
 **Transfer again** adds them later. Explore offers **Farm again**, warns when the
 loaded hero's loadout no longer matches a calibration, and can notify you when an
 expedition is ready and when delivery finishes.
+
+0.6.1 adds a **Region comparison** on Explore (each calibrated region's pace and XP
+per hour next to the gold and rare drops per hour your delivered expeditions there
+yielded), a **Windows notification** when an expedition is ready that also works
+while AFK FARM and the game are closed, **Continue from recorded position** for a
+delivery a crash cut short, and Vault category names with the hero and the time
+actually claimed (`AFK · <date> · <hero> · <region> · <time>`).
 
 ## Getting started
 
@@ -131,7 +138,12 @@ checkpoint, incomplete spool or inconsistent totals blocks recovery and transfer
 The recovery report explains the missing evidence; no automatic rollback edits saves.
 **Close as partial delivery** lets the player accept such a claim as it stands: the
 delivered records are kept and can be transferred, the rest is given up, nothing
-is replayed, and the expedition clock is freed.
+is replayed, and the expedition clock is freed. When a crash left a running
+checkpoint whose item records end exactly at its position (0.6.1 checkpoints record
+the spool size, so records written after it are set aside first),
+**Continue from recorded position** lets the player deliver the rest instead. It is
+never automatic, delivered calls are not repeated, and the save of the delivered
+XP and gold stays unconfirmed.
 Older receipts that confirm only the controller's room-end save need review: that
 path did not reliably persist character XP. The corrected path explicitly saves
 both the character and account through native game routines.

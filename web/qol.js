@@ -13,10 +13,10 @@ function chime(){
     gain.gain.exponentialRampToValueAtTime(.0001,audio.currentTime+.6);tone.stop(audio.currentTime+.62);
   }catch{}
 }
-function announce(key,title,body){
+function announce(key,title,body,system=true){
   if(notified.has(key))return;
   rememberNotice(key);toast(title+'. '+body);
-  if(!notifyOn)return;
+  if(!notifyOn||!system)return;
   chime();
   if('Notification' in window&&Notification.permission==='granted'){try{new Notification(title,{body,icon:'/assets/emblem.svg',tag:key});}catch{}}
 }
@@ -24,7 +24,8 @@ function watchExpedition(){
   if(!data)return;
   const armed=data.armed,pr=data.progress||{},job=data.job;
   if(armed&&!pr.state&&Date.now()>=Date.parse(armed.started_at)+armed.hours*3600000)
-    announce('ready:'+armed.expedition_id,'Expedition complete','Return to the recorded hero and region to claim your rewards.');
+    announce('ready:'+armed.expedition_id,'Expedition complete','Return to the recorded hero and region to claim your rewards.',
+             data.notification?.scheduled?.expedition_id!==armed.expedition_id);
   const recent=job&&job.finished_at&&Date.now()/1000-job.finished_at<600;
   if(recent&&['claim','claim_background'].includes(job.action)){
     if(job.state==='done'&&pr.resumable)announce('paused:'+job.id,'Delivery paused','Your progress is saved. Claim again to continue.');

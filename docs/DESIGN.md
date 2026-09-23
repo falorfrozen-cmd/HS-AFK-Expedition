@@ -1,4 +1,4 @@
-# AFK FARM 0.6.0 — measured-kill product
+# AFK FARM 0.6.1 — measured-kill product
 
 The earlier combat-reconstruction project is archived outside the active tree.
 The product uses empirical kills per region-second and native reward replay.
@@ -128,6 +128,18 @@ stopped like Pause, and the same request is posted again; a repeated request pas
 at once. `CanResume` accepts "aborted" and saved "paused" checkpoints for the same
 plan. A crash, a close without the expedition hero, or any unsaved checkpoint
 still requires review. None of this suspends the game's own loop.
+
+Crash continuation (0.6.1): the spool is flushed every frame but a checkpoint is
+written at most every 250 ms, so after a crash the spool usually runs ahead of the
+checkpoint. Each checkpoint therefore records `spool_bytes`, the flushed spool size
+at that moment. When the player accepts the recorded position, the panel verifies the
+records up to that size, copies the rest to `spool/set-aside` and cuts the spool
+there; the checkpoint's counters, the spool and the next sequence number then agree,
+and `CanResume` continues a running checkpoint that carries `resume_accepted`.
+The cut-off records belong to calls the checkpoint does not count, so they are
+delivered again rather than transferred twice. XP or gold the game may have saved
+for those calls (an autosave between checkpoint and crash) is the remaining
+uncertainty, as is whether the delivered part was saved at all.
 
 Vault transfer: `loot-filter.json` keeps back gear of unticked rarities and, if
 chosen, keys and materials; records stay in the spool, so Transfer again adds them

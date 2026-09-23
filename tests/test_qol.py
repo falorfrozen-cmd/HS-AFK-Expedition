@@ -161,6 +161,141 @@ class SettlePartialTests(unittest.TestCase):
         self.assertEqual(cli.call_args.args[:2],('ingest',self.d/'spool/e_claim.ndjson'))
 
 
+class ContinueFromRecordedPositionTests(unittest.TestCase):
+    """A delivery a crash cut short continues only from a position its item
+    records end at exactly, and only after the player accepts it."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.d=Path(self.tmp.name)
+        recovery._SPOOL_CHECKS.clear()
+        self.path=self.d/'plans/e_claim.json';afk.write_json(self.path,dict(expedition_id='e_claim',hours=2,scale=1,packets=[dict(count=100)]))
+        afk.write_json(self.d/'state.json',dict(armed=dict(expedition_id='e',plan=str(self.d/'plans/e.json'))))
+        self.progress=dict(expedition_id='e_claim',checkpoint_version=2,state='running',plan_hash=hashlib.sha256(self.path.read_bytes()).hexdigest(),
+                           calls_done=80,calls_total=100,failed=0,skipped=0,save_committed=False,saved='',items=3)
+        (self.d/'spool').mkdir();self.spool(3);self.write()
+    def write(self,**changes):
+        afk.write_json(self.d/'sessions/e_claim.progress.json',dict(self.progress,**changes))
+        old=time.time()-120;os.utime(self.d/'sessions/e_claim.progress.json',(old,old))
+    def spool(self,count,tail=''):
+        recovery._SPOOL_CHECKS.clear()
+        (self.d/'spool/e_claim.ndjson').write_text(''.join(json.dumps(item(n,6))+'\n' for n in range(1,count+1))+tail)
+    def test_matching_records_continue_only_after_the_player_accepts(self):
+        review=recovery.inspect(self.d,'e_claim')
+        self.assertEqual((review['status'],review['continuable'],review['continue_blockers']),('needs_review',True,[]))
+        self.assertFalse(recovery.resumable(self.d,'e_claim'),'never without the player')
+        accepted=recovery.accept_position(self.d,'e_claim')
+        self.assertEqual((accepted['resume_accepted'],accepted['resume_accepted_by'],accepted['resume_basis']),(True,'player',dict(calls_done=80,items=3,spool_bytes=None,set_aside=None,set_aside_records=0)))
+        self.assertEqual(accepted['state'],'running','the checkpoint position and state are kept')
+        self.assertTrue(recovery.resumable(self.d,'e_claim'))
+        review=recovery.inspect(self.d,'e_claim')
+        self.assertEqual((review['status'],review['resumable'],review['accepted']),('paused',True,True))
+        self.assertIn('recorded position',review['reasons'][0])
+        view=panel.progress_view(self.d,'e_claim')
+        self.assertTrue(view['resumable']);self.assertTrue(view['resume_accepted']);self.assertFalse(view.get('reconciliation_required'))
+    def test_records_that_do_not_end_at_the_checkpoint_refuse(self):
+        seq_gap=json.dumps(dict(item(5,6)))+'\n'
+        cases=[('ahead',lambda:self.spool(4),'hold 4 items but the checkpoint counts 3'),
+               ('behind',lambda:self.spool(2),'hold 2 items but the checkpoint counts 3'),
+               ('summary',lambda:self.spool(3,json.dumps(dict(expedition_id='e_claim',seq=4,kind='summary'))+'\n'),'already end with a summary'),
+               ('gap',lambda:self.spool(2,seq_gap),'gap or a duplicate'),
+               ('unreadable',lambda:self.spool(3,'{not json\n'),'unreadable'),
+               ('error state',lambda:self.write(state='error'),'stopped while running'),
+               ('failed calls',lambda:self.write(failed=2),'failed or were skipped'),
+               ('changed plan',lambda:self.write(plan_hash='x'*64),'plan differs'),
+               ('failure record',lambda:afk.write_json(self.d/'sessions/e_claim.failure.json',{}),'failure record')]
+        for label,apply,reason in cases:
+            with self.subTest(label):
+                self.setUp();apply()
+                allowed,reasons=recovery.continuable(self.d,'e_claim')
+                self.assertFalse(allowed);self.assertIn(reason,' '.join(reasons))
+                with self.assertRaises(ValueError):recovery.accept_position(self.d,'e_claim')
+                self.assertNotIn('resume_accepted',recovery.read(self.d/'sessions/e_claim.progress.json') or {})
+    def test_records_written_after_the_checkpoint_are_set_aside_before_continuing(self):
+        spool=self.d/'spool/e_claim.ndjson';size=spool.stat().st_size
+        tail=json.dumps(item(4,6))+'\n'+'{"expedition_id":"e_claim","seq":5,"ki'
+        with spool.open('a',encoding='utf-8') as stream:stream.write(tail)
+        self.write(spool_bytes=size);recovery._SPOOL_CHECKS.clear()
+        review=recovery.inspect(self.d,'e_claim')
+        self.assertEqual((review['continuable'],review['records_after_checkpoint']),(True,2),'a torn last line is part of the tail')
+        self.assertFalse(recovery.resumable(self.d,'e_claim'))
+        accepted=recovery.accept_position(self.d,'e_claim')
+        self.assertEqual(spool.stat().st_size,size,'the spool ends at the checkpoint again')
+        basis=accepted['resume_basis']
+        self.assertEqual((basis['spool_bytes'],basis['set_aside_records']),(size,2))
+        self.assertEqual(Path(basis['set_aside']).read_text(encoding='utf-8'),tail,'nothing is lost')
+        self.assertEqual(Path(basis['set_aside']).parent.name,'set-aside')
+        self.assertTrue(recovery.resumable(self.d,'e_claim'))
+    def test_a_checkpoint_size_outside_the_records_refuses(self):
+        size=(self.d/'spool/e_claim.ndjson').stat().st_size
+        for limit,reason in ((size+10,'shorter than the checkpoint'),(size-5,'record boundary'),(-1,'spool size is invalid')):
+            with self.subTest(limit=limit):
+                self.write(spool_bytes=limit);recovery._SPOOL_CHECKS.clear()
+                allowed,reasons=recovery.continuable(self.d,'e_claim')
+                self.assertFalse(allowed);self.assertIn(reason,' '.join(reasons))
+    def test_pause_markers_of_an_earlier_resume_are_allowed(self):
+        rows=[item(1,6),item(2,6),dict(expedition_id='e_claim',seq=3,kind='partial',calls=40),item(4,6)]
+        recovery._SPOOL_CHECKS.clear()
+        (self.d/'spool/e_claim.ndjson').write_text(''.join(json.dumps(r)+'\n' for r in rows))
+        self.assertEqual(recovery.continuable(self.d,'e_claim'),(True,[]))
+    def test_accepting_refuses_a_live_checkpoint_and_another_claim(self):
+        afk.write_json(self.d/'sessions/e_claim.progress.json',self.progress)
+        with self.assertRaises(ValueError):recovery.accept_position(self.d,'e_claim')
+        self.write();afk.write_json(self.d/'state.json',{})
+        with self.assertRaises(ValueError):recovery.accept_position(self.d,'e_claim')
+    def test_records_that_change_after_acceptance_stop_the_continue(self):
+        recovery.accept_position(self.d,'e_claim')
+        self.spool(4)
+        self.assertFalse(recovery.resumable(self.d,'e_claim'))
+        self.assertEqual(recovery.inspect(self.d,'e_claim')['status'],'needs_review')
+    def test_panel_accepts_only_while_the_game_is_not_delivering(self):
+        app=panel.Panel(self.d);app.job=dict(output='')
+        with patch.object(app,'current_live',return_value=dict(replay_running=True)),self.assertRaises(ValueError):
+            app.action('accept_position',{})
+        with patch.object(app,'current_live',return_value=None):app.action('accept_position',{})
+        self.assertTrue(recovery.read(self.d/'sessions/e_claim.progress.json')['resume_accepted'])
+    def test_an_accepted_position_can_still_be_closed_as_partial(self):
+        recovery.accept_position(self.d,'e_claim');self.write(**dict(recovery.read(self.d/'sessions/e_claim.progress.json')))
+        result=recovery.settle_partial(self.d,'e_claim')
+        self.assertTrue(result['partial']);self.assertNotIn('armed',recovery.read(self.d/'state.json'))
+
+
+class RegionComparisonTests(unittest.TestCase):
+    """Calibrated regions of one hero side by side: calibration pace and XP,
+    delivered gold per hour at x1 and item rarities per hour."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.d=Path(self.tmp.name)
+        self.app=panel.Panel(self.d)
+        other=dict(HERO,slot=4,name='Other')
+        self.app.profiles=[
+            dict(id='desert_old',room='Act_03_03',character=HERO,usable=True,built_at='2026-09-01',kills_per_min=100.0,exp_per_min=1000.0),
+            dict(id='desert_new',room='Act_03_03',character=HERO,usable=True,built_at='2026-09-20',kills_per_min=200.0,exp_per_min=5000.0),
+            dict(id='glacier',room='Act_02_05',character=HERO,usable=False,built_at='2026-09-21',kills_per_min=700.0,exp_per_min=90000.0),
+            dict(id='elsewhere',room='Act_01_01',character=other,usable=True,built_at='2026-09-21',kills_per_min=50.0,exp_per_min=10.0)]
+    def claim(self,ident,room,hours,scale,gold,tiers,mods=None,**result):
+        afk.write_json(self.d/'plans'/f'{ident}.json',dict(expedition_id=ident,panel_version='0.6.0',character=HERO,zones=[dict(room=room)],
+                                                          hours=hours,scale=scale,reward_modifiers=mods))
+        afk.write_json(self.d/'sessions'/f'{ident}.result.json',dict(dict(rewards_saved=True,gold=gold),**result))
+        (self.d/'spool').mkdir(exist_ok=True)
+        (self.d/'spool'/f'{ident}.ndjson').write_text(''.join(json.dumps(dict(item(n,t),expedition_id=ident))+'\n' for n,t in enumerate(tiers,1)))
+    def test_rows_per_region_with_gold_at_x1_and_rarities_per_hour(self):
+        self.claim('a_claim','Act_03_03',2,0.5,1000,[10,7,9,9,6,6,6,1],mods=dict(gold=5.0,magic_find=10.0))
+        self.claim('b_claim','Act_03_03',1,1,300,[6])
+        self.claim('c_claim','Act_02_05',2,1,8000,[6,6],rewards_saved=False,partial=True,calls_done=50,calls_total=100)
+        self.claim('d_claim','Act_02_05',1,1,999,[10],rewards_saved=False)
+        mine=next(e for e in self.app.regions_view() if e['character']==HERO)
+        self.assertEqual([r['room'] for r in mine['rows']],['Act_02_05','Act_03_03'],'highest calibration XP per hour first')
+        glacier,desert=mine['rows']
+        self.assertEqual((desert['profile'],desert['usable'],desert['xp_per_hour'],desert['expeditions'],desert['hours']),('desert_new',True,300000.0,2,2.0))
+        self.assertAlmostEqual(desert['gold_per_hour'],(1000/5+300)/2)
+        self.assertEqual(desert['rarities_per_hour'],dict(Unholy=.5,Angelic=.5,Heroic=1.0,Satanic=2.0))
+        self.assertEqual(desert['magic_find'],[1.0,10.0])
+        self.assertEqual((glacier['usable'],glacier['expeditions'],glacier['hours'],glacier['gold_per_hour']),(False,1,1.0,8000.0),
+                         'a partial claim counts its delivered share; an unsaved one does not count')
+        self.assertEqual(len(self.app.regions_view()),2,'one entry per hero')
+    def test_calibration_only_regions_have_no_expedition_numbers(self):
+        row=next(e for e in self.app.regions_view() if e['character']==HERO)['rows'][1]
+        self.assertEqual((row['gold_per_hour'],row['rarities_per_hour'],row['expeditions']),(None,{},0))
+
+
 class DeliverySpeedTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.rates=Path(self.tmp.name)/'delivery-rate.json'
@@ -243,7 +378,9 @@ class PanelQolTests(unittest.TestCase):
         self.assertEqual(normal['seconds'],round(5000/afk.DEFAULT_CALL_RATES['normal']))
     def test_expedition_label_names_region_and_duration(self):
         self.assertEqual(panel.expedition_label('Act_01_01',2.0),'Outskirts of Inoya · 2 h')
-        self.assertEqual(panel.expedition_label('Unknown_rm',.5),'Unknown_rm · 0.5 h')
+        self.assertEqual(panel.expedition_label('Unknown_rm',.5),'Unknown_rm · 30 min')
+        self.assertEqual(panel.expedition_label('Act_01_01',1.25,'Suh'),'Suh · Outskirts of Inoya · 1.25 h')
+        self.assertEqual(afk.expedition_label('Suh','The Glacial Trail',0.4972),'Suh · The Glacial Trail · 30 min')
 
 
 class SummaryTests(unittest.TestCase):

@@ -610,6 +610,16 @@ def make_plan(hours: float, zones: list[tuple[str, float]], exp_id: str, per_fra
     return plan
 
 
+def duration_label(hours: float) -> str:
+    minutes = round(float(hours) * 60)
+    return f"{minutes} min" if minutes < 60 else f"{round(float(hours), 2):g} h"
+
+
+def expedition_label(hero, region, hours) -> str:
+    """Readable name of an expedition's Vault category: hero, region, time."""
+    return " · ".join(part for part in (hero, region, duration_label(hours)) if part)
+
+
 def scale_plan(plan: dict, factor: float, new_id: str) -> dict:
     factor = max(0.0, min(1.0, factor))
     out = json.loads(json.dumps(plan))
@@ -992,6 +1002,9 @@ def cmd_claim(args) -> None:
               f"({pr_old.get('calls_done', 0)}/{pr_old.get('calls_total', 0)} calls); following it")
     else:
         scaled = scale_plan(plan, factor, claim_id)
+        if plan.get('label_region'):
+            # An early claim delivers less than planned: name it by what it credits.
+            scaled['label'] = expedition_label(plan.get('label_hero'), plan['label_region'], credited_h)
         apply_delivery_speed(scaled, getattr(args, 'speed', None) or 'normal')
         rebuild_preview(scaled)
         print(f"elapsed {elapsed_h:.2f} h, credited {credited_h:.2f} h of {armed['hours']:.2f} h")

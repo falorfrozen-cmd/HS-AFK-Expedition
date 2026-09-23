@@ -82,3 +82,5 @@
 .item-art.small{width:34px;height:40px}.item-art.small img{max-width:30px;max-height:36px}
 @media(max-width:1150px){.summary-block .metric-row{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:850px){.summary-block .metric-row{grid-template-columns:repeat(2,minmax(0,1fr))}.repeat-card{flex-direction:column;align-items:stretch}.speed-select{max-width:170px}}
+.settings-note.error-text{color:var(--red)}
+.table-wrap{overflow-x:auto;margin-top:12px}.region-table td,.region-table th{white-space:nowrap}.region-table .sort-header{background:none;border:0;padding:0;color:inherit;font:inherit;letter-spacing:inherit;text-transform:inherit;cursor:pointer}.region-table .sort-header.active{color:var(--gold)}.region-table td.best{color:var(--gold);font-weight:600}

@@ -1,4 +1,4 @@
-# AFK FARM 0.6.0 beta
+# AFK FARM 0.6.1 beta
 
 Timed offline expeditions using your hero's measured farming pace and the game's
 native reward system. Windows only. The interface is entirely in English.
@@ -73,6 +73,22 @@ focus **Map navigation** and use arrow keys to pan (Shift for larger steps), + /
 to zoom, and Home to center the selection. Region buttons also support normal
 keyboard activation. Map navigation does not require the game to be running.
 
+## Region comparison and notifications
+
+Explore shows a **Region comparison** for the selected hero: each calibrated region's
+kills per minute and XP per hour from the calibration (before reward settings), and
+the gold (at ×1) and Unholy, Angelic, Heroic and Satanic drops per hour of the
+expeditions you delivered there, at the Magic Find you used. Short expeditions give
+rough numbers; a calibration that no longer matches your game shows "Needs
+recalibration". Click a column to sort and **Plan here** to open that region.
+
+Settings → **Notifications** turns on a Windows notification when an expedition is
+ready. It works while AFK FARM and the game are closed: the panel creates one
+Task Scheduler task, `AFK FARM\Expedition ready`, which shows the notification at
+the end time and removes itself. Claiming, cancelling or switching the setting off
+removes it too. The in-page notification switch on Explore is separate and needs the
+panel page open.
+
 ## Reading your calibration
 
 The result card distinguishes **Calibration saved** from **No profile saved**.
@@ -122,8 +138,11 @@ The **Vault transfer filter** chooses what a transfer sends to Infinite Vault: g
 rarities, keys and materials, and whether the game's loot filter applies. Items it
 leaves out are not deleted; they stay in the expedition records. Widen the filter
 and use **Transfer again** to add them later; items already in the Vault are skipped.
-Each new expedition gets its own Vault category, with stashes named after the
-rarity of the gear inside (best drops first).
+Each new expedition gets its own Vault category, named after the hero, region and
+the time actually claimed (for example `AFK · 2026-09-23 · Suh · The Glacial Trail ·
+45 min`), with stashes named after the rarity of the gear inside (best drops first).
+Item Editor's **SPLIT BY EXPEDITION…** (category menu of the older shared AFK Farm
+category) moves earlier expeditions into the same layout.
 
 You can choose a PNG character screenshot in Settings. It stays on this computer;
 it is not an automatic rendering of your current equipment.
@@ -139,6 +158,17 @@ delivered (the item records and the reward calls already made) and gives up the
 remaining calls. Nothing is generated again, the expedition clock becomes free,
 and the kept items can be transferred to the Vault. Whether the game saved the
 delivered XP and gold is not confirmed. It is refused while delivery is running.
+
+If the game crashed or the computer lost power during delivery, the panel checks
+whether the item records end exactly at the last recorded position. When they do,
+**Continue from recorded position** appears next to Close as partial delivery.
+Accepting it (after a confirmation) keeps everything delivered so far and delivers
+the rest when you claim again with the same hero in the same region. Records the
+game wrote after that position are moved to `spool\set-aside` first, because their
+reward calls are delivered again; nothing is deleted. Delivered calls are never
+repeated, but whether the game saved the XP and gold of the delivered part is not
+confirmed. If the records do not match, the panel says why and only Close as
+partial delivery is offered.
 Older room-end-only save receipts require review. Game saves and item records are
 not one atomic transaction, so recovery is not guaranteed after power loss.
 
