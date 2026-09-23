@@ -26,7 +26,7 @@ def main():
             z.write(p,relative.as_posix())
     (runtime/'python313._pth').write_text('python313.zip\nDLLs\n.\n../app/tools\n../hs-game-sdk/python\n',encoding='utf-8')
     for p in (ROOT/'tools').glob('*.py'):
-        if p.name not in ('build_release.py','build_item_assets.py'):copy(p,OUT/'app/tools'/p.name)
+        if p.name not in ('build_release.py','build_item_assets.py','build_collection.py'):copy(p,OUT/'app/tools'/p.name)
     shutil.copytree(ROOT/'web',OUT/'app/web',dirs_exist_ok=True)
     for p in (ROOT.parent/'hs-game-sdk/python/hs_game_sdk').rglob('*.py'):
         copy(p,OUT/'hs-game-sdk/python/hs_game_sdk'/p.relative_to(ROOT.parent/'hs-game-sdk/python/hs_game_sdk'))

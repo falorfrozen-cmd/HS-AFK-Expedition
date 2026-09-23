@@ -11,6 +11,7 @@ import ingest_spool
 import loot_filter
 import notify
 import calibration, recovery, validate_farm
+import collection
 from product_data import Presentation, SUPPORT, support_warnings
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -158,6 +159,7 @@ class Panel:
         self.editor=None; self.editor_at=0; self.last_profiles=0; self.profiles=[]; self.chars=[]; self.notification={}; self.results_cache=None
         self.calibration=read(self.data/'panel-calibration.json',{}) or {}
         self.presentation=Presentation(ROOT)
+        self.collection=collection.Collection(self.data,ROOT)
         self.recovery_cache=None; self.recovery_checked_at=0
         self.pause_lock=threading.Lock(); self.pause_note=None
         self.refresh_profiles()
@@ -336,6 +338,11 @@ class Panel:
             ch=reward.get('character')
             reward['level_now']=levels.get(afk.character_key(ch)) if valid_identity(ch) else None
             reward['delivery_seconds']=delivery_seconds(reward)
+        if rewards:
+            wishlist=collection.load_wishlist(self.data);_,firsts=self.collection.log(self.expedition_results())
+            for reward in rewards:
+                reward['wishlist_hits']=collection.wishlist_hits(self.collection,reward['id'],wishlist)
+                reward['new_finds']=len(firsts.get(reward['id'],[]))
         filter_error=None
         try: vault_filter=loot_filter.load(self.data/'loot-filter.json')
         except ValueError as error:
@@ -359,7 +366,8 @@ class Panel:
                     notification=self.notification_view(armed),
                     repeat=self.repeat_view(state,armed,afk.hero_key(focus_hero) if focus_hero else None),profile_live_matches=self.live_matches(live),regions=self.regions_view(),
                     background=self.background_view(armed,progress,review,live) if armed else self.background_view(None,{},None,live),pause_note=self.pause_note,
-                    expeditions=[self.roster_view(a,live) for a in afk.armed_list(state)],focus=dict(focus or {}))
+                    expeditions=[self.roster_view(a,live) for a in afk.armed_list(state)],focus=dict(focus or {}),
+                    collection=self.collection_summary())
 
     def delivery_view(self,armed,plan,progress):
         """Delivery speeds with this computer's estimate for the calls due now."""
@@ -536,7 +544,8 @@ class Panel:
         with self.state_lock:self.job=dict(id=uuid.uuid4().hex,action=action,state='running',output='',error=None,started_at=time.time())
         def run():
             try:
-                if action in ('plan','start','cancel','recover','ingest','portrait','configure','save_modifiers','save_loot_filter','save_preferences','settle_partial','accept_position'):
+                if action in ('plan','start','cancel','recover','ingest','portrait','configure','save_modifiers','save_loot_filter','save_preferences','settle_partial','accept_position',
+                              'wishlist_add','wishlist_remove'):
                     self.action(action,args)
                 else:
                     with self.lock:self.action(action,args)
@@ -755,7 +764,55 @@ class Panel:
             width,height=struct.unpack('>II',raw[16:24]);require(0<width<=4096 and 0<height<=4096,'Portrait dimensions must be 4096 pixels or smaller.')
             path=self.data/'portraits'/(self.portrait_key(c)+'.png');path.parent.mkdir(parents=True,exist_ok=True)
             path.write_bytes(raw);self.log('Character screenshot saved locally. It does not change the game save.');return
+        if name=='wishlist_add':
+            collection.wishlist_add(self.data,self.collection.catalog,args.get('key'))
+            self.log('Added to the wishlist: '+self.collection.catalog.by_key[args['key']]['name']+'. You get a Windows notification when an expedition brings it.');return
+        if name=='wishlist_remove':
+            collection.wishlist_remove(self.data,args.get('key'));self.log('Removed from the wishlist.');return
         raise ValueError('Unknown action.')
+
+    def collection_summary(self):
+        found,_=self.collection.log(self.expedition_results())
+        return dict(total=len(self.collection.catalog.items),found=len(found),wishlist=len(collection.load_wishlist(self.data)['items']))
+
+    def collection_view(self):
+        return self.collection.view(self.expedition_results(),collection.load_wishlist(self.data))
+
+    def announce_wishlist(self,ident):
+        """After a delivered claim: one Windows notification for its wishlist drops."""
+        try:
+            result=read(self.data/'sessions'/f'{ident}.result.json',{}) or {}
+            if not (result.get('rewards_saved') is True or result.get('partial') is True):return
+            plan=read(self.data/'plans'/f'{ident}.json',{}) or {}
+            hits=collection.wishlist_hits(self.collection,ident,collection.load_wishlist(self.data))
+            if hits and collection.notify_hits_once(self.data,ident,hits,lambda title,message:notify.toast(self.data,title,message),
+                                                    (plan.get('character') or {}).get('name'),plan.get('label_region')):
+                self.log('Wishlist drop: '+', '.join(h['name'] for h in hits)+'.')
+        except Exception as error:
+            self.log(f'Wishlist check skipped: {error}')
+
+    def share_summary(self,ident):
+        """What a share card shows for one delivered claim (read-only)."""
+        require(isinstance(ident,str) and bool(IDENTIFIER.fullmatch(ident)),'Invalid reward ID.')
+        result=read(self.data/'sessions'/f'{ident}.result.json',{}) or {};plan=read(self.data/'plans'/f'{ident}.json',{}) or {}
+        require(plan.get('panel_version') and (result.get('rewards_saved') is True or result.get('partial') is True),'Only a delivered expedition can be shared.')
+        loot=self.presentation.loot(self.data,ident);ch=plan.get('character') or {}
+        hero=next((c for c in self.chars if valid_identity(ch) and same_character(c,ch)),None) or {}
+        sidecar=read(self.data/'sessions'/f'{ident}.panel.json',{}) or {}
+        _,firsts=self.collection.log(self.expedition_results())
+        by_key=self.collection.catalog.by_key
+        new_finds=[dict(key=k,name=by_key[k]['name'],rarity=by_key[k]['rarity'],icon=by_key[k].get('icon')) for k in firsts.get(ident,[]) if k in by_key]
+        done,total=result.get('calls_done') or 0,result.get('calls_total') or 0
+        fraction=done/total if result.get('partial') and total else 1.0
+        room=(plan.get('zones') or [{}])[0].get('room')
+        return dict(schema=1,id=ident,version=VERSION,hero=dict(name=ch.get('name'),class_name=hero.get('class_name') or CLASSES.get(ch.get('class')),
+                    level_before=sidecar.get('level_before'),level_now=hero.get('level')),region=zone_names().get(room,room),room=room,
+                    mode=plan.get('mode','farm'),siege=plan.get('siege_claim'),hours=float(plan.get('hours') or 0)*float(plan.get('scale') or 1)*fraction,
+                    kills=(plan.get('preview') or {}).get('kills'),exp=result.get('exp'),gold=result.get('gold'),items=loot.get('total'),
+                    visible_rarities=loot.get('visible_rarities'),best=(loot.get('best') or [])[:8],partial=bool(result.get('partial')),
+                    wishlist_hits=collection.wishlist_hits(self.collection,ident,collection.load_wishlist(self.data)),
+                    new_finds=new_finds[:8],new_finds_total=len(new_finds),delivered_at=result.get('updated') or result.get('settled_at'),
+                    delivery_seconds=delivery_seconds(result))
 
     def claim(self,armed,speed=None):
         """Start or continue delivery; remember the hero's level for the summary."""
@@ -765,7 +822,8 @@ class Panel:
             plan=read(Path(armed['plan']),{}) or {};ch=plan.get('character')
             hero=next((c for c in characters(self.data) if valid_identity(ch) and same_character(c,ch)),None)
             afk.write_json(sidecar,dict(level_before=hero.get('level') if hero else None,speed=speed,at=datetime.now(timezone.utc).isoformat()))
-        self.cli('claim','--expedition',armed['expedition_id'],'--speed',speed,'--filtered',load_preferences(self.data)['filtered_items'])
+        try:self.cli('claim','--expedition',armed['expedition_id'],'--speed',speed,'--filtered',load_preferences(self.data)['filtered_items'])
+        finally:self.announce_wishlist(ident)
 
     def claim_background(self,args):
         """Open the game minimized, load the hero in its region, deliver at Maximum speed, close the game.
@@ -838,6 +896,10 @@ class Handler(BaseHTTPRequestHandler):
             route=urlsplit(self.path).path
             if route=='/api/state':return self.send(200,self.app.snapshot(focus_query(urlsplit(self.path).query)))
             if route=='/api/instance':return self.send(200,dict(application='hero-siege-afk-farm',version=VERSION))
+            if route=='/api/collection':return self.send(200,self.app.collection_view())
+            if route=='/api/share':
+                from urllib.parse import parse_qs
+                return self.send(200,self.app.share_summary(parse_qs(urlsplit(self.path).query).get('id',[''])[0]))
             if route=='/api/recovery-report':
                 from urllib.parse import parse_qs
                 ident=parse_qs(urlsplit(self.path).query).get('id',[''])[0]
