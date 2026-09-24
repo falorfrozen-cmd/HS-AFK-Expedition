@@ -12,7 +12,7 @@ import loot_filter
 import notify
 import calibration, recovery, validate_farm
 import collection
-import workers
+import workers, camp, traits
 from product_data import Presentation, SUPPORT, support_warnings
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -548,7 +548,8 @@ class Panel:
         def run():
             try:
                 if action in ('plan','start','cancel','recover','ingest','portrait','configure','save_modifiers','save_loot_filter','save_preferences','settle_partial','accept_position',
-                              'wishlist_add','wishlist_remove','worker_learn','worker_rename','worker_start','worker_cancel','worker_transfer','worker_settle_partial'):
+                              'wishlist_add','wishlist_remove','worker_learn','worker_rename','worker_start','worker_cancel','worker_transfer','worker_settle_partial',
+                              'worker_route'):
                     self.action(action,args)
                 else:
                     with self.lock:self.action(action,args)
@@ -697,7 +698,7 @@ class Panel:
             if mode=='siege':
                 import siege
                 level=args.get('siege_level')
-                plan=siege.build_plan(p,level,hours,ident,modifiers,specials=self.verified_for(p))
+                plan=siege.build_plan(p,level,hours,ident,modifiers,specials=self.verified_for(p),gate=self.camp_gate())
                 label='Siege L'+str(level)+' · '+expedition_label(p['room'],plan['hours'],hero)
             else:
                 plan=afk.make_plan(hours,[(p['room'],1)],ident,40,'pickup',profile_overrides={p['room']:p})
@@ -778,7 +779,7 @@ class Panel:
             width,height=struct.unpack('>II',raw[16:24]);require(0<width<=4096 and 0<height<=4096,'Portrait dimensions must be 4096 pixels or smaller.')
             path=self.data/'portraits'/(self.portrait_key(c)+'.png');path.parent.mkdir(parents=True,exist_ok=True)
             path.write_bytes(raw);self.log('Character screenshot saved locally. It does not change the game save.');return
-        if name.startswith('worker_'):return self.worker_action(name,args)
+        if name.startswith('worker_') or name=='camp_build':return self.worker_action(name,args)
         if name=='verify_special':
             ident=args.get('hash','');require(isinstance(ident,str) and bool(re.fullmatch(r'[a-f0-9]{12,64}',ident)),'Choose a special monster to verify.')
             s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
@@ -805,9 +806,9 @@ class Panel:
         try:level=int((values.get('level') or ['0'])[0]);hours=float((values.get('hours') or ['2'])[0])
         except ValueError:raise ValueError('Invalid Siege level or duration.')
         require(1<=level<=siege.MAX_LEVEL and math.isfinite(hours) and .25<=hours<=afk.MAX_HOURS,'Invalid Siege level or duration.')
-        result=siege.forecast(p,level,hours,specials=self.verified_for(p))
+        gate=self.camp_gate();result=siege.forecast(p,level,hours,specials=self.verified_for(p),gate=gate)
         hero=afk.hero_key(p['character'])
-        result.update(suggested_level=siege.suggest_level(p,hours),best_waves=siege.best(self.data,hero,p['room'],level) if hero else 0,
+        result.update(suggested_level=siege.suggest_level(p,hours,gate=gate),gate_hp=gate['gate_hp'],best_waves=siege.best(self.data,hero,p['room'],level) if hero else 0,
                       wave_minutes=siege.WAVE_MINUTES,max_level=siege.MAX_LEVEL)
         return result
 
@@ -829,19 +830,30 @@ class Panel:
         return (siege.load_records(self.data)['heroes'].get(hero) or {}) if hero else {}
 
     # ------------------------------------------------------------ workers
+    def camp_gate(self):
+        """The Siege gate the camp's Walls give (camp effects: gate_hp, gate_repair, gate_max_damage)."""
+        return camp.effects(workers.load(self.data)['camp'])
+
     def workers_view(self):
         """The crew in /api/state: levels, points and trips (details: /api/workers)."""
         state=workers.load(self.data)
         crew=[]
         for w in state['workers']:
-            v=workers.view(w)
-            crew.append(dict((k,v[k]) for k in ('id','name','type','level','xp_into_level','xp_for_next','points','max_trip_hours','trip')))
-        return dict(crew=crew,hire_price=workers.hire_price(state),max_workers=workers.MAX_WORKERS,
+            v=workers.view(w,state=state)
+            crew.append(dict((k,v[k]) for k in ('id','name','type','type_name','level','xp_into_level','xp_for_next','points','max_trip_hours','trip','traits','tool')))
+        eff=camp.effects(state['camp'])
+        return dict(crew=crew,hire_price=workers.hire_price(state),max_workers=workers.max_workers(state),
                     pending_payments=[dict(request_id=k,**{x:v.get(x) for x in ('purpose','amount','state','error')})
-                                      for k,v in state.get('payments',{}).items() if v.get('state') in ('pending','unknown','refused')][-5:])
+                                      for k,v in state.get('payments',{}).items() if v.get('state') in ('pending','unknown','refused')][-5:],
+                    camp=dict(resources=dict(state['camp']['resources']),resource_cap=eff['resource_cap'],hq=camp.level(state['camp'],'hq'),
+                              queue=[dict(q,name=camp.BY_KEY[q['building']]['name']) for q in state['camp']['queue']]))
 
     def workers_overview(self):
-        return workers.overview(workers.load(self.data))
+        state=workers.load(self.data);out=workers.overview(state)
+        out['candidates']={t:workers.describe_candidates(state,t) for t in camp.effects(state['camp'])['types']}
+        out['hotspots']=camp.hotspots(state['camp'],workers.TARGETS)
+        workers.save(self.data,state)   # candidates rolled for the first time are kept
+        return out
 
     def worker_entries(self):
         entries=[]
@@ -877,16 +889,30 @@ class Panel:
             if entry['state']=='paid' and not entry.get('applied'):
                 self.log(f"Paid {entry['amount']:,} gold ({receipt.get('gold_before'):,.0f} -> {receipt.get('gold_after'):,.0f}); the game saved.")
                 self.apply_payment(state,request,entry,receipt);entry['applied']=True
+            if entry['state']=='refused' and entry.get('reserved') and not entry.get('released'):
+                camp.give_back(state['camp'],entry['reserved']);entry['released']=True   # the camp resources set aside for it
         workers.save(self.data,state)
         return entry
 
     def apply_payment(self,state,request,entry,receipt):
-        if entry['purpose']=='hire' and not any((w.get('payment') or {}).get('request_id')==request for w in state['workers']):
-            w=workers.new_worker(state,entry.get('name'),payment=dict(request_id=request,amount=entry['amount'],at=receipt.get('at'),character=receipt.get('character')))
+        purpose=entry['purpose']
+        if purpose=='hire' and not any((w.get('payment') or {}).get('request_id')==request for w in state['workers']):
+            w=workers.new_worker(state,entry.get('name'),payment=dict(request_id=request,amount=entry['amount'],at=receipt.get('at'),character=receipt.get('character')),
+                                 worker_type=entry.get('type','miner'),worker_traits=entry.get('traits'))
+            workers.roll_candidates(state,w['type'])
             self.log(f"{w['name']} joined your crew. Send them on a trip from the Workers page.")
-        elif entry['purpose']=='respec':
+        elif purpose=='respec':
             w=workers.respec(workers.find(state,entry.get('worker')))
             self.log(f"{w['name']}'s skills were reset; every point can be spent again.")
+        elif purpose=='build':
+            site=camp.start(state['camp'],entry['building'],request)
+            self.log(f"{camp.BY_KEY[entry['building']]['name']} level {site['to']} is being built; ready at {site['ready_at']}.")
+        elif purpose=='tool':
+            w=workers.find(state,entry.get('worker'));w['tool']=max(int(w.get('tool',0)),int(entry['tier']))
+            self.log(f"{w['name']} got a tier {entry['tier']} {camp.TOOL_NAMES.get(w['type'],'tool').lower()}.")
+        elif purpose=='retrain':
+            w=workers.retrain(state,entry.get('worker'),entry.get('what','trait'))
+            self.log(f"{w['name']} was retrained: "+', '.join(t['name'] for t in traits.describe(w['traits']))+'.')
 
     def unanswered_payments(self):
         return [k for k,v in workers.load(self.data)['payments'].items() if v.get('state') in ('pending','unknown')]
@@ -919,14 +945,16 @@ class Panel:
         if completed:self.log('The earlier purchase was completed; nothing else was charged.')
         return completed
 
-    def worker_pay(self,purpose,amount,extra=None):
+    def worker_pay(self,purpose,amount,extra=None,reserve=None):
         """Take ``amount`` gold from the loaded hero through the game's purchase path and complete the purchase.
+        ``reserve``: camp resources set aside with the payment, given back if the game refuses it.
         Returns None, and charges nothing new, when an earlier unanswered purchase was completed instead."""
         s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
         if self.finish_earlier_payments():return None
         state=workers.load(self.data);request=uuid.uuid4().hex
+        reserved=camp.take(state['camp'],reserve) if reserve else None
         state['payments'][request]=dict(purpose=purpose,amount=amount,state='pending',at=datetime.now(timezone.utc).isoformat(),
-                                        character=s['character'],**(extra or {}))
+                                        character=s['character'],reserved=reserved,**(extra or {}))
         workers.save(self.data,state)
         self.log(f"Paying {amount:,} gold from {s['character']['name']} in the game...")
         entry=self.record_payment(request,self.send_payment(request,amount))
@@ -964,7 +992,9 @@ class Panel:
         state=workers.load(self.data)
         applied=workers.apply_delivery(state,worker_id,plan,result);workers.save(self.data,state)
         w=applied['worker']
-        self.log(f"{w['name']}: +{plan['xp']:,} XP" + (f", now level {w['level']}" if applied['levels'] else '') + f"; {plan['ore_total']:,} ore mined.")
+        stone=(applied.get('camp') or {}).get('stone',0)
+        self.log(f"{w['name']}: +{plan['xp']:,} XP" + (f", now level {w['level']}" if applied['levels'] else '') + f"; {plan['ore_total']:,} ore mined"
+                 + (f"; +{stone:,} stone for the camp." if stone else '.'))
         self.transfer_worker_haul(ident,w['name'])
         return applied
 
@@ -1017,16 +1047,42 @@ class Panel:
     def worker_action(self,name,args):
         state=workers.load(self.data)
         if name=='worker_hire':
-            price=workers.hire_price(state);require(price,f'Your crew is full ({workers.MAX_WORKERS} workers).')
+            price=workers.hire_price(state);require(price,f'Your crew is full ({workers.max_workers(state)} workers). Build the Barracks up for more.')
+            kind=args.get('type') or 'miner';require(kind in workers.TYPE_NAMES,'Unknown worker type.')
+            rows=workers.candidates(state,kind);workers.save(self.data,state)
+            slot=args.get('candidate',0);require(type(slot) is int and 0<=slot<len(rows),'Choose one of the candidates.')
             wanted=str(args.get('name') or '').strip() or None
             if wanted:require(bool(workers.NAME.fullmatch(wanted)),'Names use letters, digits, spaces, apostrophes and hyphens (up to 24).')
-            self.worker_pay('hire',price,dict(name=wanted));return
+            self.worker_pay('hire',price,dict(name=wanted,type=kind,traits=rows[slot]['traits']));return
         if name=='worker_respec':
             w=workers.find(state,args.get('worker'));require(workers.spent(w),f"{w['name']} has no skill points to reset.")
-            self.worker_pay('respec',workers.respec_price(w),dict(worker=w['id']));return
+            week=datetime.now(timezone.utc).strftime('%G-W%V')
+            if camp.effects(state['camp'])['weekly_free_respec'] and state['camp'].get('free_respec_week')!=week:
+                workers.respec(w);state['camp']['free_respec_week']=week;workers.save(self.data,state)   # Training Grounds 5: one free reset a week
+                self.log(f"{w['name']}'s skills were reset for free (Training Grounds, once a week).");return
+            self.worker_pay('respec',workers.respec_price(w,state),dict(worker=w['id']));return
+        if name=='worker_retrain':
+            w=workers.find(state,args.get('worker'));what=args.get('what','trait')
+            require(camp.effects(state['camp'])['retrain'],'Retraining needs Tavern level 3.')
+            require(what in ('trait','quirk'),"Choose 'trait' or 'quirk'.")
+            if what=='quirk':require(any(t.get('quirk') for t in w.get('traits') or []),f"{w['name']} has no quirk.")
+            self.worker_pay('retrain',workers.retrain_price(w),dict(worker=w['id'],what=what));return
+        if name=='worker_tool':
+            w=workers.find(state,args.get('worker'));tier=int(w.get('tool',0))+1
+            require(tier<=camp.effects(state['camp'])['tool_tier'],f"A tier {tier} {camp.TOOL_NAMES.get(w['type'],'tool').lower()} needs Forge level {tier}.")
+            cost=camp.tool_cost(tier);factor=workers.cost_factor(w)
+            cost={k:int(round(v*factor)) for k,v in cost.items()}
+            self.worker_pay('tool',cost['gold'],dict(worker=w['id'],tier=tier),reserve=cost);return
+        if name=='worker_route':
+            w=workers.set_route(state,args.get('worker'),args.get('route'));workers.save(self.data,state)
+            self.log(f"{w['name']}'s jewelcrafting materials now go to "+('the Jeweler\'s stock.' if w['route']=='stock' else 'the Vault.'));return
+        if name=='camp_build':
+            plan=camp.next_build(state['camp'],args.get('building'))
+            require(plan['to'] and not plan['blockers'],f"{camp.BY_KEY[plan['key']]['name']}: "+'; '.join(plan['blockers'])+'.')
+            self.worker_pay('build',plan['cost']['gold'],dict(building=plan['key'],to=plan['to']),reserve=plan['cost']);return
         if name=='worker_learn':
             w=workers.learn(state,args.get('worker'),args.get('skill'));workers.save(self.data,state)
-            self.log(f"{w['name']} learned {workers.NODES[args['skill']]['name']} (rank {workers.ranks(w,args['skill'])}).");return
+            self.log(f"{w['name']} learned {workers.nodes_for(w)[args['skill']]['name']} (rank {workers.ranks(w,args['skill'])}).");return
         if name=='worker_rename':
             w=workers.rename(state,args.get('worker'),args.get('name'));workers.save(self.data,state);self.log(f"Renamed to {w['name']}.");return
         if name=='worker_start':

@@ -62,11 +62,16 @@ with tempfile.TemporaryDirectory(prefix='afk-panel-qa-') as tmp:
     held.update(panel_version=panel.VERSION,label='Siege L3 · SeraphTest · The Forest · 4 h',label_hero='SeraphTest',label_region='The Forest',farm_context=dict(schema=1,hash='a'*64))
     arm(held)
     siege.record_claim(afk.DATA,afk.hero_key(other),'Act_01_01',dict(level=3,waves_fought=31))
-    # A worker on a trip, and a level 14 one ready to collect.
-    crew=workers.empty();a=workers.new_worker(crew,'Brom');a['xp']=sum(workers.xp_to_next(l) for l in range(1,14));a['level']=14
+    # A camp with a few buildings (one being built) and resources; a worker on a
+    # trip, and a level 14 one with a trait and a tool, ready to collect.
+    crew=workers.empty()
+    crew['camp']['buildings'].update(hq=2,storehouse=2,tavern=2,walls=1,forge=1)
+    crew['camp']['resources']=dict(stone=2350,spoils=410,dust=0)
+    crew['camp']['queue']=[dict(building='barracks',to=2,started_at=workers.iso(now-timedelta(minutes=20)),ready_at=workers.iso(now+timedelta(minutes=40)),request='fixture')]
+    a=workers.new_worker(crew,'Brom',worker_traits=[dict(id='night_owl'),dict(id='greedy',quirk=True)]);a['xp']=sum(workers.xp_to_next(l) for l in range(1,14));a['level']=14;a['tool']=1
     a['skills']=dict(swift_pick=3,full_cart=3,long_shift=2,keen_eye=2,gem_sense=2,foreman=1)
     workers.start_trip(crew,a['id'],29,6,at=now-timedelta(hours=7),seed=3)
-    b=workers.new_worker(crew,'Dulga');workers.start_trip(crew,b['id'],27,2,at=now-timedelta(minutes=30),seed=4)
+    b=workers.new_worker(crew,'Dulga',worker_traits=[dict(id='quick_learner')]);workers.start_trip(crew,b['id'],27,2,at=now-timedelta(minutes=30),seed=4)
     workers.save(afk.DATA,crew)
     control=Path(tmp)/'control.json';stop=Path(tmp)/'stop'
     afk.write_json(control,dict(gold=5000000,live=dict(character=other,room='Act_01_01',capture_on=False,replay_running=False,game_build='QA',farm_context=dict(hash='b'*64))))
@@ -110,7 +115,7 @@ with tempfile.TemporaryDirectory(prefix='afk-panel-qa-') as tmp:
             self.log(f"Fixture: {w['name']} delivered {plan['ore_total']:,} ore (+{plan['xp']:,} XP).");return applied
         def action(self,name,args):
             allowed=('start','cancel','save_modifiers','wishlist_add','wishlist_remove','worker_hire','worker_respec','worker_learn',
-                     'worker_rename','worker_start','worker_cancel','worker_collect')
+                     'worker_rename','worker_start','worker_cancel','worker_collect','worker_tool','worker_retrain','worker_route','camp_build')
             if name not in allowed:raise ValueError('Fixture allows local actions only.')
             return super().action(name,args)
     app=FixturePanel(afk.DATA);server=panel.ThreadingHTTPServer(('127.0.0.1',9567),panel.Handler);server.app=app

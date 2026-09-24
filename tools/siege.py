@@ -120,14 +120,23 @@ def wave_kind(wave: int, available: dict) -> str:
     return 'normal'
 
 
-def timeline(pace: float, breaks_per_min: float, factors, level: int, waves: int, seed: int, available: dict):
+def gate_rules(gate: dict | None = None) -> dict:
+    """The gate: health, repair per comfortable wave and the most one wave can take.
+    The camp's Walls raise them (``gate`` = camp effects' gate_hp, gate_repair, gate_max_damage)."""
+    gate = gate or {}
+    return dict(hp=float(gate.get('gate_hp', GATE_HP)), repair=REPAIR + float(gate.get('gate_repair', 0.0)),
+                max_damage=float(gate.get('gate_max_damage', MAX_DAMAGE)))
+
+
+def timeline(pace: float, breaks_per_min: float, factors, level: int, waves: int, seed: int, available: dict, gate: dict | None = None):
     """The siege, wave by wave: (waves, the wave that broke the gate or None)."""
     rng = random.Random(seed)
+    rules = gate_rules(gate)
     # A short calibration says little about how uneven the hero's minutes are
     # (a first idle minute weighs a lot in five): its variation counts in
     # proportion to its length, fully from FULL_EVIDENCE_WINDOWS minutes on.
     weight = min(1.0, len(factors) / FULL_EVIDENCE_WINDOWS) if factors else 0.0
-    hp, out = GATE_HP, []
+    hp, out = rules['hp'], []
     for k in range(1, waves + 1):
         if factors:
             f = 1.0 + (statistics.mean(rng.choice(factors) for _ in range(WAVE_MINUTES)) - 1.0) * weight
@@ -137,9 +146,9 @@ def timeline(pace: float, breaks_per_min: float, factors, level: int, waves: int
         kills = _round(rate * WAVE_MINUTES, rng)
         breaks = _round(breaks_per_min * WAVE_MINUTES * f, rng)
         if rate < need:
-            hp -= MAX_DAMAGE * (1 - rate / need)
+            hp -= rules['max_damage'] * (1 - rate / need)
         elif rate >= REPAIR_MARGIN * need:
-            hp = min(GATE_HP, hp + REPAIR)
+            hp = min(rules['hp'], hp + rules['repair'])
         kind = wave_kind(k, available)
         row = dict(wave=k, kind=kind, demand=round(need, 3), rate=round(rate, 3), kills=kills, breaks=breaks, hp=round(max(hp, 0.0), 1),
                    held=rate >= need)
@@ -189,7 +198,7 @@ def report_hours(plan: dict) -> float:
     return float(plan['hours'])
 
 
-def build_plan(profile: dict, level, hours, expedition_id: str, modifiers: dict, seed=None, specials=()) -> dict:
+def build_plan(profile: dict, level, hours, expedition_id: str, modifiers: dict, seed=None, specials=(), gate=None) -> dict:
     """A Siege expedition plan for one calibrated region (see the module note)."""
     if type(level) is not int or not 1 <= level <= MAX_LEVEL:
         raise ValueError(f'Choose a Siege level from 1 to {MAX_LEVEL}.')
@@ -218,9 +227,10 @@ def build_plan(profile: dict, level, hours, expedition_id: str, modifiers: dict,
     seed = seed if isinstance(seed, int) else random.SystemRandom().randrange(1 << 62)
     factors = pace_factors(profile)
     available = {k: bool(v) for k, v in grouped.items()}
-    waves, fell = timeline(pace, ordinary_breaks_per_min(profile), factors, level, total, seed, available)
+    rules = gate_rules(gate)
+    waves, fell = timeline(pace, ordinary_breaks_per_min(profile), factors, level, total, seed, available, gate)
     siege = dict(version=VERSION, level=level, seed=seed, wave_minutes=WAVE_MINUTES, growth=GROWTH, base_demand=BASE_DEMAND,
-                 level_step=LEVEL_STEP, gate_hp=GATE_HP, pace=pace, pace_source='calibration windows' if factors else 'fixed spread',
+                 level_step=LEVEL_STEP, gate_hp=rules['hp'], gate=rules, pace=pace, pace_source='calibration windows' if factors else 'fixed spread',
                  waves=waves, fell_at=fell, groups=grouped, packet_info=info, magic_find_bonus=1 + MF_BONUS_PER_LEVEL * level)
     plan['mode'] = 'siege'
     plan['siege'] = siege
@@ -277,7 +287,7 @@ def live_view(plan: dict, elapsed_hours: float) -> dict:
                 magic_find_bonus=s['magic_find_bonus'])
 
 
-def forecast(profile: dict, level: int, hours: float, runs: int = 120, specials=()) -> dict:
+def forecast(profile: dict, level: int, hours: float, runs: int = 120, specials=(), gate=None) -> dict:
     """What a Siege at this level usually looks like for this calibration (simulated)."""
     pace = float(profile.get('kills_per_min') or 0)
     if not pace > 0:
@@ -287,7 +297,7 @@ def forecast(profile: dict, level: int, hours: float, runs: int = 120, specials=
     total = wave_count(hours)
     reached, kills, falls = [], [], 0
     for run in range(runs):
-        waves, fell = timeline(pace, 0.0, factors, level, total, 7919 * run + level, available)
+        waves, fell = timeline(pace, 0.0, factors, level, total, 7919 * run + level, available, gate)
         reached.append(len(waves)); kills.append(sum(w['kills'] for w in waves)); falls += fell is not None
     reached.sort()
     ordinary = pace * total * WAVE_MINUTES
@@ -298,7 +308,7 @@ def forecast(profile: dict, level: int, hours: float, runs: int = 120, specials=
                 elite=available['elite'], treasure=available['goblin'], boss=available['boss'])
 
 
-def suggest_level(profile: dict, hours: float = 2.0) -> int:
+def suggest_level(profile: dict, hours: float = 2.0, gate=None) -> int:
     """The highest level whose siege usually lasts the chosen time with the gate
     still standing. Lasting is not enough: a gate that breaks on the very last
     wave also "lasts", and at the next level up it broke in every run
@@ -307,7 +317,7 @@ def suggest_level(profile: dict, hours: float = 2.0) -> int:
     total = wave_count(hours)
     while lo <= hi:
         mid = (lo + hi) // 2
-        f = forecast(profile, mid, hours, runs=40)
+        f = forecast(profile, mid, hours, runs=40, gate=gate)
         if f['waves_median'] >= total and f['fall_chance'] <= SUGGEST_MAX_FALL:
             best, lo = mid, mid + 1
         else:

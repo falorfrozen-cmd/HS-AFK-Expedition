@@ -480,7 +480,7 @@ the game is open. Worker trips schedule `worker-<id>` ready notifications.
 
 | File | Meaning |
 | --- | --- |
-| workers.json | Crew (levels, skills, trips, stats, history) and payment records (schema 1) |
+| workers.json | Crew (levels, skills, traits, tools, trips, stats, history), payment records, the camp and the Tavern's candidates (schema 2 since 0.8; a schema 1 file is migrated on load) |
 | models/worker-pay-<request>.json | The plugin's receipt of one payment |
 | plans/worker_<id>_<time>.json | A planned haul (items, Gem Sense units, XP) |
 | sessions/worker_<id>_<time>.result.json | The plugin's delivery result (`done`, `error` or `partial`), `ingest` |
@@ -488,3 +488,60 @@ the game is open. Worker trips schedule `worker-<id>` ready notifications.
 | collection-cache.json | Collectibles found per spool (display cache) |
 | siege-records.json | Best wave per hero, region and level |
 | special-packets.json | Verified special monster packets |
+
+## 0.8: the camp, traits and more worker types (engine; UI to be designed)
+
+Rules and numbers: tools/camp.py and tools/traits.py module notes. The camp and
+traits are AFK FARM's own game layer: they change the crew's numbers and the Siege
+gate, never what the game creates. Stone, spoils and gem dust exist only in AFK
+FARM; gold is always the game's, taken through the payment path above.
+
+### Camp
+
+`GET /api/workers` adds `camp`: `buildings` [{`key`, `name`, `text`, `level`,
+`max_level` (5), `unlock_hq`, `next` {`to`, `cost` {`gold`, `stone`, `spoils`,
+`dust`}, `hours`, `blockers` [text]}}], `queue` [{`building`, `name`, `to`,
+`started_at`, `ready_at`, `progress`}], `sites`, `resources` {`stone`, `spoils`,
+`dust`}, `resource_cap`, `stock`, `stock_cap`, `keys`, `key_cap`, `effects` (every
+number the buildings set, e.g. `max_workers`, `team_size`, `candidates`, `types`,
+`gate_hp`, `tool_tier`, `xp_bonus`, `hotspots`). It also adds `hotspots` (today's:
+{`type`, `target`, `bonus`}), `candidates` {type: [{`slot`, `type_name`,
+`traits`, `price`}]} for every type the camp allows, `types`, `trees` (every
+worker type's skill tree), `traits` and `quirks` (the tables).
+`/api/state` → `workers.camp` = `resources`, `resource_cap`, `hq`, `queue`.
+
+Buildings: Headquarters (the camp level; no building may pass it; level 3 gives a
+second building site), Barracks (crew size 3-7, team size 2-4), Tavern (worker
+types, candidates, trait odds, retraining at 3, daily candidates at 5), Walls (the
+Siege gate: 110-150 health, better repairs, at 5 at most 45 damage a wave),
+Storehouse (resource cap, Jeweler's stock, key rack), Forge (tool tiers), Training
+Grounds (worker XP, cheaper resets, apprentices, a free weekly reset at 5),
+Jeweler's Bench (the Jeweler and its recipe tiers), Watchtower (daily hot spots).
+A building finishes on its own when its time is up (lazily, on the next read).
+
+| Action | Arguments | Needs the game |
+| --- | --- | --- |
+| `camp_build` | `building` | an offline hero loaded; takes `next.cost.gold`, sets the camp resources aside |
+| `worker_hire` | `type` (default miner), `candidate` (slot, default 0), `name` (optional) | as before |
+| `worker_tool` | `worker` | the next tool tier (up to the Forge level); gold and camp resources |
+| `worker_retrain` | `worker`, `what` (`trait` or `quirk`) | Tavern 3; `retrain_price` gold |
+| `worker_route` | `worker`, `route` (`vault`/`stock`) | no; `stock` opens with the Jeweler |
+
+A payment's `purpose` is now `hire`, `respec`, `build`, `tool` or `retrain`. Camp
+resources set aside for a `build` or `tool` payment are given back if the game
+refuses it; an `unknown` payment keeps them until its receipt decides.
+
+### Traits
+
+Every worker has `traits` [{`id`, `name`, `rarity` (common, rare, epic,
+legendary, quirk), `text`, `quirk`, `target` (a Specialist's favourite)}], `tool`,
+`tool_name`, `route`, `retrain_price`, `type_name`. Crew entries in `/api/state`
+carry `traits`, `tool` and `type_name` too. A trip stores `mods` (its multipliers
+from traits, the camp and the hot spot, frozen at the start): `speed`, `amount`,
+`xp`, `rare`, `tool`, `hotspot`, `bonus_find`; trip views show them.
+
+### Siege and the Walls
+
+Siege plans and `/api/siege-forecast` use the gate the Walls give; the forecast adds
+`gate_hp`, and the plan's `siege` carries `gate_hp` and `gate` {`hp`, `repair`,
+`max_damage`}.
