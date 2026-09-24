@@ -1033,6 +1033,10 @@ class Panel:
             require(plan.get('expedition_id')==trip['delivery']['delivery_id'],'The planned haul is missing; it was not made again.')
         else:
             view=workers.trip_view(w);require(view['credited_work_hours']>0,f"{w['name']} has only just left.")
+            build=(read(self.data/'build.json',{}) or {}).get('game_build')
+            require(not trip.get('build') or trip['build']==build,
+                    f"The game was updated since {w['name']} left: the recorded packets of the old game build cannot replay. "
+                    f"Cancel the trip (its keys come back to the rack) and send {w['name']} again.")
             prefs=load_preferences(self.data)
             label='AFK · Workers · '+w['name']+' · '+datetime.now().strftime('%Y-%m-%d')
             plan=worker_loot.delivery_plan(w,trip,view['credited_work_hours'],s['character'],label,prefs['filtered_items'],prefs['delivery_speed'])

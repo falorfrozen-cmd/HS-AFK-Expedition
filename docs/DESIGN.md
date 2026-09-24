@@ -262,3 +262,45 @@ What that check and the review of the pull request changed:
   crystal chests without spending keys. Chests are left out of expeditions and
   Siege waves; the Siege's break rate leaves them out too. Siege treasure waves now
   also count orb and ore goblins (all five loot goblins).
+
+## 0.8: the camp, traits and three more worker types
+
+**The camp is AFK FARM's own layer.** Buildings (tools/camp.py), camp resources
+(stone, spoils, gem dust) and traits (tools/traits.py) change the crew's numbers
+and the Siege gate; none of them is an item and none reaches the game. Gold is the
+game's, taken through the same payment path as hiring (one receipt per request,
+never charged twice); camp resources set aside for a building or a tool come back
+if the game refuses the gold. Buildings take real time, one site at a time (two
+from Headquarters 3), and finish on their own. A trip freezes its multipliers
+(traits, tool, Headquarters bonus, hot spot, team) when it starts, so a building
+finished later never re-rolls a haul.
+
+**Adventurers and goblin hunters replay what was recorded.** A world chest's or a
+loot goblin's loot is not a rule of ours: every opened chest or caught goblin is a
+packet the plugin recorded in that region (current game build, protected values
+present), replayed through the game's drop routine exactly like an expedition's
+kills, with experience off (the hero did not kill it) and gold picked up. How many
+chests or goblins a trip meets, which tier opens and who escapes are AFK FARM's
+rules; world chests keep the game's key costs (a golden chest takes a Basic Key, a
+crystal chest a Crystal Key) from the camp's key rack. A replay reads the live
+room (item level, heroic chance and zone tables come from it), so a haul is
+collected with an offline hero standing in the trip's region, through `afk.py
+worker-replay` (the claim machinery: resumable, never twice). A game update ends
+the replayability of old packets; such a trip is cancelled (keys come back).
+Real chest objects are never created (the game's spawn check reports them).
+
+**The Jeweler uses the game's recipes.** The plugin reads the craft cube's table
+(`worker recipes`: global.craftComboList / craftComboResult, result types 37-41,
+amounts through PilipaliDecrypt) and, at delivery, reads the recipe again and
+creates only its jewel or gem (15:78-96) with the ground-drop routine. Materials
+come from the camp's stock, which miners fill by routing their Gem Sense share
+there: the plugin rolls that share with the Prospector's recipe and dice but does
+not make it (`route_prospect`, result `routed: true`; only such a result counts).
+The hero's own Jewelcrafting level is neither needed nor changed.
+
+**Teams** are several workers leaving together (tools/teams.py): each keeps its
+own target and delivery; synergies and auras are multipliers, nothing more.
+
+Chest openings were also taken out of expedition and Siege plans (0.7.x): they
+had scaled like breakables and opened rare Abyss chests and locked chests
+without keys.
