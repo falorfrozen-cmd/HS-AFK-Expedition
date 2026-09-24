@@ -226,6 +226,13 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(p['coverage'],1/3)
         self.assertAlmostEqual(p['kills_per_min'],60/121)
 
+    def test_counts_print_as_whole_numbers(self):
+        # MEASURED 2026-09-24: an XP multiplier made a claim print "16,111,940.635554502 exp".
+        self.assertEqual(afk.whole(16111940.635554502), '16,111,941')
+        self.assertEqual(afk.whole(987947340), '987,947,340')
+        self.assertEqual((afk.whole(None), afk.whole(0.4)), ('0', '0'))
+        self.assertEqual(afk.whole('n/a'), 'n/a')
+
     def test_settings_change_invalidates_session(self):
         with patch.object(afk,'read_ndjson',return_value=[{'kind':'context_invalid'}]):
             with self.assertRaises(SystemExit): afk.build_profile(Path('memory'),None,False)

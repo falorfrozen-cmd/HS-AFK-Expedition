@@ -54,11 +54,18 @@ ELITE_EVERY, TREASURE_EVERY, BOSS_EVERY = 5, 10, 25
 ORDINARY_RANKS = (1, 2, 3, 4)
 GOBLIN_KEYS = ('treasure_goblin', 'goblinrune', 'goblinshadow')
 FALLBACK_SPREAD = 0.10          # no calibration windows: +-10% per wave
+SUGGEST_MAX_FALL = 0.25         # the suggested level holds in at least 3 of 4 simulated sieges
 RECORDS = 'siege-records.json'
 
 
 def demand(level: int, wave: int) -> float:
     return BASE_DEMAND * LEVEL_STEP ** (level - 1) * GROWTH ** (wave - 1)
+
+
+def wave_count(hours: float, wave_minutes: float = WAVE_MINUTES) -> int:
+    """Whole waves in ``hours``. Planning, claims and the live view all count
+    this way; the margin keeps e.g. 35 minutes (0.58333 h) at 7 waves, not 6."""
+    return max(0, int(math.floor(float(hours) * 60.0 / wave_minutes + 1e-9)))
 
 
 def pace_factors(profile: dict) -> list[float] | None:
@@ -177,6 +184,10 @@ def build_plan(profile: dict, level, hours, expedition_id: str, modifiers: dict,
     pace = float(profile.get('kills_per_min') or 0)
     if not pace > 0:
         raise ValueError('This calibration has no kill pace.')
+    # A siege lasts whole waves: the armed time is exactly the planned waves, so
+    # every wave can be credited and the siege always reaches its end.
+    total = wave_count(hours)
+    hours = total * WAVE_MINUTES / 60.0
     room = profile['room']
     plan = afk.make_plan(hours, [(room, 1)], expedition_id, 40, 'pickup', profile_overrides={room: profile})
     grouped = groups(profile, specials)
@@ -192,8 +203,7 @@ def build_plan(profile: dict, level, hours, expedition_id: str, modifiers: dict,
     seed = seed if isinstance(seed, int) else random.SystemRandom().randrange(1 << 62)
     factors = pace_factors(profile)
     available = {k: bool(v) for k, v in grouped.items()}
-    waves, fell = timeline(pace, float(profile.get('breaks_per_min') or 0), factors, level,
-                           int(round(hours * 60 / WAVE_MINUTES)), seed, available)
+    waves, fell = timeline(pace, float(profile.get('breaks_per_min') or 0), factors, level, total, seed, available)
     siege = dict(version=VERSION, level=level, seed=seed, wave_minutes=WAVE_MINUTES, growth=GROWTH, base_demand=BASE_DEMAND,
                  level_step=LEVEL_STEP, gate_hp=GATE_HP, pace=pace, pace_source='calibration windows' if factors else 'fixed spread',
                  waves=waves, fell_at=fell, groups=grouped, packet_info=info, magic_find_bonus=1 + MF_BONUS_PER_LEVEL * level)
@@ -214,7 +224,7 @@ def build_plan(profile: dict, level, hours, expedition_id: str, modifiers: dict,
 def claim_plan(plan: dict, credited_hours: float, claim_id: str) -> dict:
     """The waves complete by the credited time, as a normal claim plan."""
     s = plan['siege']
-    done = max(0, min(len(s['waves']), int(float(credited_hours) * 60 // s['wave_minutes'])))
+    done = max(0, min(len(s['waves']), wave_count(credited_hours, s['wave_minutes'])))
     out = deepcopy(plan)
     out['expedition_id'] = claim_id
     out['scaled_from'] = plan['expedition_id']
@@ -240,7 +250,7 @@ def claim_plan(plan: dict, credited_hours: float, claim_id: str) -> dict:
 def live_view(plan: dict, elapsed_hours: float) -> dict:
     """What the player may see while it runs: completed waves only, never the future."""
     s = plan['siege']
-    done = max(0, min(len(s['waves']), int(max(0.0, elapsed_hours) * 60 // s['wave_minutes'])))
+    done = max(0, min(len(s['waves']), wave_count(max(0.0, elapsed_hours), s['wave_minutes'])))
     fought = s['waves'][:done]
     fell = bool(s.get('fell_at')) and done >= s['fell_at']
     over = fell or done >= len(s['waves'])
@@ -259,7 +269,7 @@ def forecast(profile: dict, level: int, hours: float, runs: int = 120, specials=
         raise ValueError('This calibration has no kill pace.')
     factors = pace_factors(profile)
     available = {k: bool(v) for k, v in groups(profile, specials).items()}
-    total = int(round(float(hours) * 60 / WAVE_MINUTES))
+    total = wave_count(hours)
     reached, kills, falls = [], [], 0
     for run in range(runs):
         waves, fell = timeline(pace, 0.0, factors, level, total, 7919 * run + level, available)
@@ -274,12 +284,16 @@ def forecast(profile: dict, level: int, hours: float, runs: int = 120, specials=
 
 
 def suggest_level(profile: dict, hours: float = 2.0) -> int:
-    """The highest level whose median siege still lasts about the chosen time."""
+    """The highest level whose siege usually lasts the chosen time with the gate
+    still standing. Lasting is not enough: a gate that breaks on the very last
+    wave also "lasts", and at the next level up it broke in every run
+    (MEASURED 2026-09-24: Suh, Act 2-5, 30 min - level 35 fell in 40 of 40)."""
     lo, hi, best = 1, MAX_LEVEL, 1
-    total = int(round(hours * 60 / WAVE_MINUTES))
+    total = wave_count(hours)
     while lo <= hi:
         mid = (lo + hi) // 2
-        if forecast(profile, mid, hours, runs=40)['waves_median'] >= total:
+        f = forecast(profile, mid, hours, runs=40)
+        if f['waves_median'] >= total and f['fall_chance'] <= SUGGEST_MAX_FALL:
             best, lo = mid, mid + 1
         else:
             hi = mid - 1

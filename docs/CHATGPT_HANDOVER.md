@@ -19,7 +19,8 @@ collecting are simulated). Never run tools/panel.py against real data for UI wor
 2. **Siege in the planner.** A mode switch (Expedition / Siege), a level picker
    1-50 with the forecast from `/api/siege-forecast` (median waves and 10-90% range,
    fall chance, Magic Find bonus, suggested level, the hero's best at that level),
-   then `start` with `mode: "siege", siege_level`. While it runs: current wave, gate
+   then `start` with `mode: "siege", siege_level`. Offer durations in 5- or 15-minute
+   steps: a Siege lasts whole waves and the engine rounds down. While it runs: current wave, gate
    bar (`hp`/`gate_hp`), the last waves (held or damaged), the next special wave,
    and "Report ready" when `over`. Never reveal future waves. Records table from
    `siege_records`. Say plainly that Siege is a challenge layer over the measured
@@ -38,7 +39,9 @@ collecting are simulated). Never run tools/panel.py against real data for UI wor
    `max_trip_hours`, the real duration from `time_factor`), Collect (game open with
    any offline hero; also happens after every claim), history and stats, Transfer
    to Vault for a waiting haul, Close as partial for a stopped haul. Show `job.error`
-   texts as they come.
+   texts as they come. A `pending_payments` entry in state `unknown` means the game
+   has not answered yet (the purchase completes by itself once it does): show it as
+   waiting, never as failed, and do not invite another purchase meanwhile.
 6. **Special monsters** (Settings or Calibration): `/api/specials` with a Verify
    button per monster (`verify_special`), explaining that any offline hero must stand
    in that region and that the check makes no rewards.

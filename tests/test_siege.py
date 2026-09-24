@@ -148,6 +148,28 @@ class PlanTests(Folder):
         self.assertGreater(siege.suggest_level(profile(pace=300.0)), siege.suggest_level(profile(pace=40.0)))
         self.assertTrue(0 <= hard['fall_chance'] <= 1)
 
+    def test_the_suggested_level_keeps_the_gate_standing(self):
+        # MEASURED 2026-09-24 (Suh, Act 2-5, 778.68 kills/min, a 90 s calibration,
+        # 30 minutes): the next level up still "lasted" 6 of 6 waves, but its gate
+        # broke on the last wave in every run - it must not be the suggestion.
+        p = profile(pace=778.68, windows=[])
+        level = siege.suggest_level(p, 0.5)
+        chosen, above = siege.forecast(p, level, 0.5, runs=40), siege.forecast(p, level + 1, 0.5, runs=40)
+        self.assertLessEqual(chosen['fall_chance'], siege.SUGGEST_MAX_FALL); self.assertEqual(chosen['waves_median'], 6)
+        self.assertEqual(above['waves_median'], 6, 'the level above lasts too...')
+        self.assertGreater(above['fall_chance'], siege.SUGGEST_MAX_FALL, '...but its gate falls')
+
+    def test_a_siege_lasts_whole_waves_and_always_reaches_its_end(self):
+        odd = self.plan(pace=500.0, hours=0.3)                     # 18 minutes: 3 whole waves
+        self.assertEqual(len(odd['siege']['waves']), 3); self.assertAlmostEqual(odd['hours'], 0.25)
+        self.assertEqual(siege.claim_plan(odd, odd['hours'], 'c')['siege_claim']['waves_fought'], 3)
+        self.assertTrue(siege.live_view(odd, odd['hours'])['over'], 'the last planned wave is reached')
+        long = self.plan(pace=500.0, hours=49 / 12)                 # 245 minutes; 4.0833 h is below 49/12 in binary
+        self.assertEqual(len(long['siege']['waves']), 49)
+        self.assertEqual(siege.claim_plan(long, long['hours'], 'c')['siege_claim']['waves_fought'], 49)
+        self.assertTrue(siege.live_view(long, long['hours'])['over'])
+        self.assertEqual([siege.wave_count(h) for h in (0.25, 0.3, 0.5, 49 / 12, 8)], [3, 3, 6, 49, 96])
+
     def test_records_keep_the_best_wave_per_hero_region_and_level(self):
         self.assertTrue(siege.record_claim(self.d, 'h', 'Act_01_01', dict(level=5, waves_fought=12)))
         self.assertFalse(siege.record_claim(self.d, 'h', 'Act_01_01', dict(level=5, waves_fought=9)))

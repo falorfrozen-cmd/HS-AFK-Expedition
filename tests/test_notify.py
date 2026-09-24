@@ -47,6 +47,18 @@ class ReadyNotificationTests(unittest.TestCase):
         self.assertFalse((self.d / 'notify-ready.xml').exists(), 'the request file is removed')
         script = (self.d / notify.SCRIPT).read_text(encoding='utf-8-sig')
         self.assertIn(notify.POWERSHELL_APP_ID, script); self.assertIn('/Delete /TN $Task /F', script)
+        # It stays on screen until closed (a plain toast vanished behind a full-screen
+        # game, MEASURED 2026-09-24) and opens the panel.
+        self.assertIn("<toast scenario='reminder'", script)
+        self.assertIn("<action content='Open AFK FARM' activationType='protocol' arguments='$url'/>", script)
+        self.assertIn("activationType='system' arguments='dismiss'", script, 'a reminder needs a button to stay')
+        self.assertIn('-Url &quot;http://127.0.0.1:8787/&quot;', run.xml)
+
+    def test_the_toast_button_opens_only_the_local_panel(self):
+        self.assertEqual(notify.panel_url('http://127.0.0.1:8790/'), 'http://127.0.0.1:8790/')
+        for bad in ('https://example.com/', 'http://127.0.0.1:8787/x', 'file:///c:/x', 'http://127.0.0.1:8787/" -Task "x', None):
+            with self.subTest(bad=bad):
+                self.assertEqual(notify.panel_url(bad), notify.PANEL_URL if bad is None else 'http://127.0.0.1:8787/')
 
     def test_unchanged_state_does_nothing_and_a_claim_or_the_setting_removes_it(self):
         run = FakeScheduler()

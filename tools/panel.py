@@ -200,6 +200,7 @@ class Panel:
                 finally:self.lock.release()
             if time.monotonic()-self.editor_at>20:
                 self.editor=ingest_spool.discover_editor(.1);self.editor_at=time.monotonic()
+            self.settle_late_payments()
             self.sync_notification()
 
     def sync_notification(self):
@@ -696,7 +697,7 @@ class Panel:
                 import siege
                 level=args.get('siege_level')
                 plan=siege.build_plan(p,level,hours,ident,modifiers,specials=self.verified_for(p))
-                label='Siege L'+str(level)+' · '+expedition_label(p['room'],hours,hero)
+                label='Siege L'+str(level)+' · '+expedition_label(p['room'],plan['hours'],hero)
             else:
                 plan=afk.make_plan(hours,[(p['room'],1)],ident,40,'pickup',profile_overrides={p['room']:p})
                 reward_modifiers.apply_to_plan(plan,p,modifiers)
@@ -836,7 +837,7 @@ class Panel:
             crew.append(dict((k,v[k]) for k in ('id','name','type','level','xp_into_level','xp_for_next','points','max_trip_hours','trip')))
         return dict(crew=crew,hire_price=workers.hire_price(state),max_workers=workers.MAX_WORKERS,
                     pending_payments=[dict(request_id=k,**{x:v.get(x) for x in ('purpose','amount','state','error')})
-                                      for k,v in state.get('payments',{}).items() if v.get('state') in ('pending','refused')][-5:])
+                                      for k,v in state.get('payments',{}).items() if v.get('state') in ('pending','unknown','refused')][-5:])
 
     def workers_overview(self):
         return workers.overview(workers.load(self.data))
@@ -850,23 +851,88 @@ class Panel:
                                f"{w['name']} is back from the mine with {trip['ore_name']}. Open AFK FARM and collect it with any offline hero loaded."))
         return entries
 
+    # A payment request gets exactly one receipt, written by the game when it runs
+    # the command, and the game never runs one request twice. A reply that times
+    # out is therefore not a refusal: the command may still run, so the payment
+    # stays 'unknown' until its receipt appears, the purchase is completed then
+    # (once), and no new payment starts while one is unanswered.
+    def payment_receipt(self,request):
+        return read(self.data/'models'/f'worker-pay-{request}.json',{}) or {}
+
+    def send_payment(self,request,amount):
+        """Ask the game to run one request: its receipt, {} if the game answered without one, None if it did not answer."""
+        reply=afk.Ipc(self.game_bin()).send(f'afk worker pay {request} {int(amount)}',timeout=60)
+        receipt=self.payment_receipt(request)
+        return receipt if receipt or reply is not None else None
+
+    def record_payment(self,request,receipt):
+        """Store what the game did with a request; a paid purchase is completed exactly once."""
+        state=workers.load(self.data);entry=state['payments'][request]
+        if receipt is None:
+            entry.update(state='unknown',error='the game did not answer in time')
+        else:
+            entry.update(state='paid' if receipt.get('ok') is True else 'refused',error=receipt.get('error') or (None if receipt else 'no receipt from the game'),
+                         receipt=receipt or None)
+            if entry['state']=='paid' and not entry.get('applied'):
+                self.log(f"Paid {entry['amount']:,} gold ({receipt.get('gold_before'):,.0f} -> {receipt.get('gold_after'):,.0f}); the game saved.")
+                self.apply_payment(state,request,entry,receipt);entry['applied']=True
+        workers.save(self.data,state)
+        return entry
+
+    def apply_payment(self,state,request,entry,receipt):
+        if entry['purpose']=='hire' and not any((w.get('payment') or {}).get('request_id')==request for w in state['workers']):
+            w=workers.new_worker(state,entry.get('name'),payment=dict(request_id=request,amount=entry['amount'],at=receipt.get('at'),character=receipt.get('character')))
+            self.log(f"{w['name']} joined your crew. Send them on a trip from the Workers page.")
+        elif entry['purpose']=='respec':
+            w=workers.respec(workers.find(state,entry.get('worker')))
+            self.log(f"{w['name']}'s skills were reset; every point can be spent again.")
+
+    def unanswered_payments(self):
+        return [k for k,v in workers.load(self.data)['payments'].items() if v.get('state') in ('pending','unknown')]
+
+    def settle_payments(self):
+        """Complete payments whose receipt arrived after the panel stopped waiting (no game call)."""
+        for request in self.unanswered_payments():
+            receipt=self.payment_receipt(request)
+            if receipt:self.record_payment(request,receipt)
+
+    def settle_late_payments(self):
+        # From the monitor: only between actions, so the worker records have one writer at a time.
+        try:
+            if not self.unanswered_payments() or not self.job_lock.acquire(blocking=False):return
+            try:self.settle_payments()
+            finally:self.job_lock.release()
+        except Exception as error:
+            if str(error)!=getattr(self,'settle_error',None):self.settle_error=str(error);self.log(f'An earlier payment is not settled yet: {error}')
+
+    def finish_earlier_payments(self):
+        """Before a new payment: settle earlier ones, sending a still unanswered one again under its own
+        request id. True when an earlier purchase was completed now (the new one is not made)."""
+        self.settle_payments();completed=False
+        for request in self.unanswered_payments():
+            entry=workers.load(self.data)['payments'][request]
+            self.log(f"Finishing an earlier payment of {entry['amount']:,} gold first...")
+            entry=self.record_payment(request,self.send_payment(request,entry['amount']))
+            require(entry['state']!='unknown','The game has not answered an earlier payment yet. Nothing new was charged; try again with an offline hero loaded.')
+            completed=completed or entry['state']=='paid'
+        if completed:self.log('The earlier purchase was completed; nothing else was charged.')
+        return completed
+
     def worker_pay(self,purpose,amount,extra=None):
-        """Take ``amount`` gold from the loaded hero through the game's purchase path; returns the receipt."""
+        """Take ``amount`` gold from the loaded hero through the game's purchase path and complete the purchase.
+        Returns None, and charges nothing new, when an earlier unanswered purchase was completed instead."""
         s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
+        if self.finish_earlier_payments():return None
         state=workers.load(self.data);request=uuid.uuid4().hex
         state['payments'][request]=dict(purpose=purpose,amount=amount,state='pending',at=datetime.now(timezone.utc).isoformat(),
                                         character=s['character'],**(extra or {}))
         workers.save(self.data,state)
         self.log(f"Paying {amount:,} gold from {s['character']['name']} in the game...")
-        afk.Ipc(self.game_bin()).send(f'afk worker pay {request} {int(amount)}',timeout=60)
-        receipt=read(self.data/'models'/f'worker-pay-{request}.json',{}) or {}
-        state=workers.load(self.data);entry=state['payments'].get(request,{})
-        entry.update(state='paid' if receipt.get('ok') is True else 'refused',error=receipt.get('error') or (None if receipt else 'no receipt from the game'),
-                     receipt=receipt or None)
-        state['payments'][request]=entry;workers.save(self.data,state)
-        require(receipt.get('ok') is True,'The game did not take the gold: '+(receipt.get('error') or 'no receipt came back')+'. Nothing was bought.')
-        self.log(f"Paid {amount:,} gold ({receipt.get('gold_before'):,.0f} -> {receipt.get('gold_after'):,.0f}); the game saved.")
-        return request,receipt
+        entry=self.record_payment(request,self.send_payment(request,amount))
+        require(entry['state']!='unknown','The game did not answer in time. If it takes the gold, AFK FARM completes the purchase by itself; '
+                'it is never charged twice.')
+        require(entry['state']=='paid','The game did not take the gold: '+(entry.get('error') or 'no receipt came back')+'. Nothing was bought.')
+        return request,entry['receipt']
 
     def collect_worker(self,worker_id):
         """Deliver one worker's haul through the game, then send it to the Vault."""
@@ -953,16 +1019,10 @@ class Panel:
             price=workers.hire_price(state);require(price,f'Your crew is full ({workers.MAX_WORKERS} workers).')
             wanted=str(args.get('name') or '').strip() or None
             if wanted:require(bool(workers.NAME.fullmatch(wanted)),'Names use letters, digits, spaces, apostrophes and hyphens (up to 24).')
-            request,receipt=self.worker_pay('hire',price,dict(name=wanted))
-            state=workers.load(self.data)
-            w=workers.new_worker(state,wanted,payment=dict(request_id=request,amount=price,at=receipt.get('at'),character=receipt.get('character')))
-            workers.save(self.data,state);self.log(f"{w['name']} joined your crew. Send them on a trip from the Workers page.");return
+            self.worker_pay('hire',price,dict(name=wanted));return
         if name=='worker_respec':
             w=workers.find(state,args.get('worker'));require(workers.spent(w),f"{w['name']} has no skill points to reset.")
-            price=workers.respec_price(w)
-            self.worker_pay('respec',price,dict(worker=w['id']))
-            state=workers.load(self.data);workers.respec(workers.find(state,w['id']));workers.save(self.data,state)
-            self.log(f"{w['name']}'s skills were reset; every point can be spent again.");return
+            self.worker_pay('respec',workers.respec_price(w),dict(worker=w['id']));return
         if name=='worker_learn':
             w=workers.learn(state,args.get('worker'),args.get('skill'));workers.save(self.data,state)
             self.log(f"{w['name']} learned {workers.NODES[args['skill']]['name']} (rank {workers.ranks(w,args['skill'])}).");return
@@ -1026,10 +1086,14 @@ class Panel:
         best=[dict(b) for b in (loot.get('best') or [])[:8]]
         for b in best:   # names shared by a base item have no loot icon; a collectible's name is unique
             if not b.get('icon'):b['icon']=(self.collection.catalog.by_name.get(b.get('name')) or {}).get('icon')
+        # The gold the claim brought: gold drops plus the filtered items the game sold
+        # (MEASURED 2026-09-24: 808,164 dropped + 1,911,459 from sales; the card showed 808K).
+        sales=int((result.get('conversion') or {}).get('sell_gold') or 0)
+        gold=None if result.get('gold') is None else int(result['gold'])+sales
         return dict(schema=1,id=ident,version=VERSION,hero=dict(name=ch.get('name'),class_name=hero.get('class_name') or CLASSES.get(ch.get('class')),
                     level_before=sidecar.get('level_before'),level_now=hero.get('level')),region=zone_names().get(room,room),room=room,
                     mode=plan.get('mode','farm'),siege=plan.get('siege_claim'),hours=float(plan.get('hours') or 0)*float(plan.get('scale') or 1)*fraction,
-                    kills=(plan.get('preview') or {}).get('kills'),exp=result.get('exp'),gold=result.get('gold'),items=loot.get('total'),
+                    kills=(plan.get('preview') or {}).get('kills'),exp=result.get('exp'),gold=gold,gold_drops=result.get('gold'),gold_sales=sales,items=loot.get('total'),
                     visible_rarities=loot.get('visible_rarities'),best=best,partial=bool(result.get('partial')),
                     wishlist_hits=collection.wishlist_hits(self.collection,ident,collection.load_wishlist(self.data)),
                     new_finds=new_finds[:8],new_finds_total=len(new_finds),delivered_at=result.get('updated') or result.get('settled_at'),
@@ -1185,7 +1249,8 @@ def main():
         try:server=LocalPanelServer(('127.0.0.1',port),Handler);break
         except OSError:continue
     require(server,'Could not open a local panel port.');server.app=app
-    threading.Thread(target=app.monitor,daemon=True).start();url=f'http://127.0.0.1:{server.server_port}'
+    url=f'http://127.0.0.1:{server.server_port}';notify.PANEL_URL=url+'/'   # the notifications' "Open AFK FARM" button
+    threading.Thread(target=app.monitor,daemon=True).start()
     print(url,flush=True)
     if not args.no_browser:webbrowser.open(url)
     try:server.serve_forever()

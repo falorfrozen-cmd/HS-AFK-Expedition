@@ -226,7 +226,33 @@ character and account, no anti-cheat report; the same request again was refused)
 `afk worker deliver` made 50 Copper Ore and 3 Satanic Crystal Fragments and turned
 30 Copper Ore through the Prospector's recipe into 12 jewelcrafting materials (40%;
 about 41% expected), 5 stacks recorded in the delivery's spool and nothing given to
-the hero; the same delivery again was refused. Not yet live: gold after a restart,
-the panel's hire/collect with real prices, a roster or Siege claim, a boss verify.
-The research commands `call`/`gvar`/`gvars` no longer resolve numbers as protected
-handles: a gold amount in that range crashed the game in the anti-cheat module.
+the hero; the same delivery again was refused. The research commands
+`call`/`gvar`/`gvars` no longer resolve numbers as protected handles: a gold amount
+in that range crashed the game in the anti-cheat module.
+
+Panel check (2026-09-24, same build, two heroes): the 1-gold payment above was still
+missing after a game restart; Suh's 30-minute Siege (Act 2-5, level 34) and Sgham's
+15-minute expedition (Act 4-3) ran at the same time; a claim of Suh's Siege with
+Sgham loaded was refused; each claim delivered with its own hero (the Siege: 6 waves,
+gate at 20 of 100, a new record, 3,864 items, 808,164 gold plus 1,911,459 from sold
+items - the in-game gold matched to the unit - a wishlist drop and 31 new collection
+entries); hiring the first miner took exactly 250,000 gold and saved; its 1-hour
+Copper trip was collected right after a claim (179 ore to the Vault, level 3).
+Not yet live: a boss verify (no boss packet captured).
+
+What that check and the review of the pull request changed:
+- A payment whose reply timed out was recorded as refused although the game could
+  still run it; a retry under a new request could then pay twice. It is now
+  `unknown` until its receipt appears; the purchase is completed then, once, and a
+  new payment first finishes the unanswered one under its own request id.
+- The suggested Siege level must also keep the gate standing (fall chance at most
+  25%): level 35 lasted the 6 waves but fell on the last one in every run.
+- A Siege lasts whole waves (the duration rounds down to 5 minutes); a duration
+  between two waves left the last planned wave out of reach.
+- The collection cache is shared by the panel's request threads; it is now written
+  under one lock with a temporary file per writer.
+- The share card counted waves fully held ("0 WAVES" after 6) and only the dropped
+  gold; it shows the waves fought and all the gold the claim paid.
+- Ready notifications stay on screen until closed: over a full-screen game a plain
+  toast was only heard (Windows had it at 11:24:33; nothing was seen).
+- Claim output prints XP as a whole number.

@@ -68,6 +68,40 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual((view['by_rarity']['Satanic']['found'], view['by_rarity']['Set']['found']), (1, 1), 'Angel is a set piece')
         self.assertEqual(sum(s['found'] for s in view['sets']), 1)
 
+    def test_request_threads_share_the_cache_one_at_a_time(self):
+        # The panel's request threads (state polls, collection page, share card,
+        # wishlist check) use one Collection; the cache must never be written by
+        # two of them at once (a shared temp file made one request fail).
+        for n in range(12):
+            self.spool(f'c{n}', [record(f'c{n}', 1, self.crest['name'], 6)])
+        box = collection.Collection(self.d, ROOT)
+        inside, most, errors, real = [0], [0], [], collection._write
+        guard = threading.Lock()
+
+        def slow_write(path, value):
+            with guard:
+                inside[0] += 1; most[0] = max(most[0], inside[0])
+            threading.Event().wait(0.01)
+            real(path, value)
+            with guard:
+                inside[0] -= 1
+
+        def reader(n):
+            try:
+                for m in range(12):
+                    box.finds(f'c{(n + m) % 12}')
+            except Exception as error:   # any failure here is what the lock prevents
+                errors.append(error)
+
+        with patch.object(collection, '_write', slow_write):
+            threads = [threading.Thread(target=reader, args=(n,)) for n in range(6)]
+            for t in threads: t.start()
+            for t in threads: t.join()
+        self.assertEqual(errors, []); self.assertEqual(most[0], 1)
+        cached = afk.read_json(self.d / 'collection-cache.json')
+        self.assertEqual(len(cached['spools']), 12)
+        self.assertEqual(list(self.d.glob('*.tmp')), [], 'no temporary file is left behind')
+
     def test_wishlist_accepts_catalog_items_once_and_reports_hits(self):
         with self.assertRaisesRegex(ValueError, 'Choose a unique'): collection.wishlist_add(self.d, self.catalog, 'no_such_item')
         collection.wishlist_add(self.d, self.catalog, 'helmet_harlequin_crest'); collection.wishlist_add(self.d, self.catalog, 'helmet_harlequin_crest')
@@ -95,6 +129,12 @@ class CollectionTests(unittest.TestCase):
             self.assertEqual(reward['new_finds'], 1); self.assertEqual(reward['wishlist_hits'][0]['key'], 'helmet_harlequin_crest')
             share = app.share_summary('farm_1_claim')
             self.assertEqual((share['hero']['name'], share['hero']['class_name'], share['hours'], share['new_finds_total']), ('Suh', 'Samurai', 2.0, 1))
+            self.assertEqual((share['gold'], share['gold_drops'], share['gold_sales']), (5, 5, 0))
+            result = afk.read_json(self.d / 'sessions' / 'farm_1_claim.result.json')
+            afk.write_json(self.d / 'sessions' / 'farm_1_claim.result.json', dict(result, conversion=dict(sell_gold=1_911_459)))
+            share = app.share_summary('farm_1_claim')
+            self.assertEqual((share['gold'], share['gold_drops'], share['gold_sales']), (1_911_464, 5, 1_911_459),
+                             'the card counts the gold the game paid for sold items too')
             with self.assertRaisesRegex(ValueError, 'Invalid'): app.share_summary('../x')
             with self.assertRaisesRegex(ValueError, 'Only a delivered'): app.share_summary('missing_claim')
             server = panel.ThreadingHTTPServer(('127.0.0.1', 0), panel.Handler); server.app = app

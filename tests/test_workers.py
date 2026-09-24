@@ -114,23 +114,37 @@ class TripTests(unittest.TestCase):
 
 class FakeGame:
     """The plugin's side of `afk worker pay` / `afk worker deliver`."""
-    def __init__(self, data, gold=1_000_000, pay_ok=True, deliver_ok=True):
+    def __init__(self, data, gold=1_000_000, pay_ok=True, deliver_ok=True, silent=0):
         self.data, self.gold, self.pay_ok, self.deliver_ok, self.commands = Path(data), gold, pay_ok, deliver_ok, []
+        self.silent, self.late = silent, []   # payments left unanswered (the panel times out), run later by run_late()
 
     def __call__(self, *_):
         return self
+
+    def pay(self, request, amount):
+        if (self.data / 'models' / f'worker-pay-{request}.json').exists():
+            return ['already processed']      # the plugin never runs one request twice
+        ok = self.pay_ok and self.gold >= amount
+        before = self.gold
+        if ok: self.gold -= amount
+        afk.write_json(self.data / 'models' / f'worker-pay-{request}.json',
+                       dict(request_id=request, ok=ok, amount=amount, gold_before=before, gold_after=self.gold,
+                            saved='saved (character and account save performed)' if ok else '', error='' if ok else 'not enough gold'))
+        return ['ok']
+
+    def run_late(self):
+        """The game runs the payments it did not answer in time."""
+        for line in self.late:
+            words = line.split(); self.pay(words[3], int(words[4]))
+        self.late = []
 
     def send(self, line, timeout=30):
         self.commands.append(line)
         words = line.split()
         if words[1:3] == ['worker', 'pay']:
-            request, amount = words[3], int(words[4])
-            ok = self.pay_ok and self.gold >= amount
-            before = self.gold
-            if ok: self.gold -= amount
-            afk.write_json(self.data / 'models' / f'worker-pay-{request}.json',
-                           dict(request_id=request, ok=ok, amount=amount, gold_before=before, gold_after=self.gold,
-                                saved='saved (character and account save performed)' if ok else '', error='' if ok else 'not enough gold'))
+            if self.silent:
+                self.silent -= 1; self.late.append(line); return None
+            return self.pay(words[3], int(words[4]))
         elif words[1:3] == ['worker', 'deliver']:
             plan = json.loads(Path(' '.join(words[3:])).read_text(encoding='utf-8'))
             created = {f"{i['type']}:{i['id']}": i['amount'] for i in plan['items']}
@@ -175,6 +189,56 @@ class PanelWorkerTests(unittest.TestCase):
         self.assertEqual(len(st['workers']), 1, 'a refused payment hires nobody')
         self.assertEqual(sorted(p['state'] for p in st['payments'].values()), ['paid', 'refused'])
         self.assertEqual(self.app.workers_view()['hire_price'], 1_000_000)
+
+    def test_an_unanswered_payment_is_completed_once_when_its_receipt_arrives(self):
+        game = FakeGame(self.d, silent=1)
+        with self.assertRaisesRegex(ValueError, 'did not answer in time.*never charged twice'):
+            self.run_action('worker_hire', dict(name='Brom'), game)
+        st = W.load(self.d)
+        self.assertEqual(st['workers'], []); self.assertEqual([p['state'] for p in st['payments'].values()], ['unknown'])
+        self.assertEqual(self.app.workers_view()['pending_payments'][0]['state'], 'unknown')
+        game.run_late()                                   # the game ran it after the panel stopped waiting
+        self.app.settle_late_payments()
+        st = W.load(self.d)
+        self.assertEqual([w['name'] for w in st['workers']], ['Brom']); self.assertEqual(game.gold, 750_000)
+        self.assertEqual([p['state'] for p in st['payments'].values()], ['paid'])
+        self.app.settle_late_payments()
+        self.assertEqual(len(W.load(self.d)['workers']), 1, 'a receipt completes its purchase once')
+
+    def test_buying_again_finishes_the_unanswered_payment_instead_of_charging_twice(self):
+        game = FakeGame(self.d, silent=1)
+        with self.assertRaisesRegex(ValueError, 'did not answer in time'):
+            self.run_action('worker_hire', dict(name='Brom'), game)
+        self.run_action('worker_hire', dict(name='Other'), game)       # the player tries again
+        st = W.load(self.d)
+        self.assertEqual([w['name'] for w in st['workers']], ['Brom'], 'the earlier purchase is completed, not a second one')
+        self.assertEqual(game.gold, 750_000); self.assertEqual(len(st['payments']), 1)
+        requests = {c.split()[3] for c in game.commands if c.startswith('afk worker pay ')}
+        self.assertEqual(len(requests), 1, 'sent again under its own request id')
+        game.run_late()                                   # the first, queued command runs after all
+        self.app.settle_late_payments()
+        self.assertEqual(game.gold, 750_000); self.assertEqual(len(W.load(self.d)['workers']), 1)
+
+    def test_no_new_payment_starts_while_an_earlier_one_is_unanswered(self):
+        game = FakeGame(self.d, silent=2)
+        with self.assertRaisesRegex(ValueError, 'did not answer in time'):
+            self.run_action('worker_hire', {}, game)
+        with self.assertRaisesRegex(ValueError, 'has not answered an earlier payment'):
+            self.run_action('worker_hire', {}, game)
+        st = W.load(self.d)
+        self.assertEqual(len(st['payments']), 1, 'nothing new was requested'); self.assertEqual(st['workers'], [])
+        self.assertEqual(game.gold, 1_000_000)
+
+    def test_a_late_respec_resets_the_skills_once_the_game_takes_the_gold(self):
+        st = W.empty(); w = W.new_worker(st, 'Brom'); w['xp'] = 10 ** 5; w['level'] = W.level_for(10 ** 5)[0]
+        w['skills'] = dict(swift_pick=2); W.save(self.d, st)
+        game = FakeGame(self.d, silent=1)
+        with self.assertRaisesRegex(ValueError, 'did not answer in time'):
+            self.run_action('worker_respec', dict(worker=w['id']), game)
+        self.assertEqual(W.load(self.d)['workers'][0]['skills'], dict(swift_pick=2), 'nothing is reset before the gold is taken')
+        game.run_late(); self.app.settle_late_payments()
+        self.assertEqual(W.load(self.d)['workers'][0]['skills'], {})
+        self.assertEqual(game.gold, 1_000_000 - W.respec_price(w))
 
     def test_a_trip_is_collected_through_the_game_and_sent_to_the_vault(self):
         st = W.empty(); w = W.new_worker(st, 'Brom'); w['xp'] = 10 ** 6; w['level'] = W.level_for(10 ** 6)[0]

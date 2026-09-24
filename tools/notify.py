@@ -23,20 +23,33 @@ RECORD = 'notify-ready.json'
 SCRIPT = 'notify-ready.ps1'
 # Windows PowerShell's own application id: toasts need a registered sender.
 POWERSHELL_APP_ID = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
+# The page "Open AFK FARM" opens; the running panel sets its own address.
+PANEL_URL = 'http://127.0.0.1:8787/'
+# A reminder stays on screen until the player closes it. A plain toast is gone in
+# a few seconds, and over a full-screen game only its sound gets through
+# (MEASURED 2026-09-24: the "haul ready" toast reached Windows at 11:24:33, the
+# player heard it in game and never saw it). Reminders need a button to stay.
 SCRIPT_TEXT = """# AFK FARM: shows "expedition ready" once, then removes its own scheduled task.
-param([string]$Title, [string]$Message, [string]$Task)
+param([string]$Title, [string]$Message, [string]$Task, [string]$Url = '%PANEL_URL%')
 try {
     [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
     [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
     $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
     $title = [System.Security.SecurityElement]::Escape($Title)
     $message = [System.Security.SecurityElement]::Escape($Message)
-    $xml.LoadXml("<toast><visual><binding template='ToastGeneric'><text>$title</text><text>$message</text></binding></visual></toast>")
+    $url = [System.Security.SecurityElement]::Escape($Url)
+    $xml.LoadXml("<toast scenario='reminder' activationType='protocol' launch='$url'><visual><binding template='ToastGeneric'><text>$title</text><text>$message</text></binding></visual><actions><action content='Open AFK FARM' activationType='protocol' arguments='$url'/><action content='' activationType='system' arguments='dismiss'/></actions></toast>")
     $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
     [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('%APP_ID%').Show($toast)
 } catch { }
 if ($Task) { & schtasks.exe /Delete /TN $Task /F | Out-Null }
-""".replace('%APP_ID%', POWERSHELL_APP_ID)
+""".replace('%APP_ID%', POWERSHELL_APP_ID).replace('%PANEL_URL%', PANEL_URL)
+
+
+def panel_url(url=None):
+    """The panel address for the toast button: a local http URL only, else the default."""
+    url = str(url or PANEL_URL)
+    return url if re.fullmatch(r'http://127\.0\.0\.1:\d{2,5}/', url) else 'http://127.0.0.1:8787/'
 
 
 def _quiet():
@@ -79,11 +92,11 @@ def task_name(key):
     return TASK_PREFIX + key
 
 
-def task_xml(when, script, title, message, task=TASK):
+def task_xml(when, script, title, message, task=TASK, url=None):
     """Task Scheduler XML: one run at ``when`` (local time), catch up after sleep."""
     local = when.astimezone().replace(tzinfo=None, microsecond=0)
     arguments = (f'--headless powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{script}" '
-                 f'-Title "{title}" -Message "{message}" -Task "{task}"')
+                 f'-Title "{title}" -Message "{message}" -Task "{task}" -Url "{panel_url(url)}"')
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>AFK FARM: tells you once when your expedition is ready to claim, then removes itself.</Description></RegistrationInfo>
@@ -208,7 +221,7 @@ def toast(data, title, message, run=subprocess.Popen):
     safe = lambda text: str(text).replace('"', "'")
     try:
         run(['conhost.exe', '--headless', 'powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-             '-File', str(script), '-Title', safe(title), '-Message', safe(message), '-Task', ''], **_quiet())
+             '-File', str(script), '-Title', safe(title), '-Message', safe(message), '-Task', '', '-Url', panel_url()], **_quiet())
         return True
     except OSError:
         return False

@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,7 +34,8 @@ def _read(path, default=None):
 def _write(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + '.tmp')
+    # One temporary file per writer: two writers never replace each other's half-written file.
+    tmp = path.with_name(f'{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=1), encoding='utf-8')
     os.replace(tmp, path)
 
@@ -94,12 +96,18 @@ def scan_spool(path, catalog: Catalog) -> dict:
 
 
 class Collection:
-    """Per-expedition finds (cached by spool size and time) and the account-wide log."""
+    """Per-expedition finds (cached by spool size and time) and the account-wide log.
+
+    One instance serves every panel request thread (state polls, the collection
+    page, share cards, the post-claim wishlist check), so the cache is read,
+    changed and written under one lock.
+    """
     def __init__(self, data, root):
         self.data = Path(data)
         self.catalog = Catalog(root)
         self.cache_path = self.data / 'collection-cache.json'
         self._memory = None
+        self._lock = threading.Lock()
 
     def _cache(self):
         if self._memory is None:
@@ -114,14 +122,15 @@ class Collection:
             stat = path.stat()
         except OSError:
             return {}
-        cache = self._cache()
         stamp = [stat.st_mtime_ns, stat.st_size]
-        entry = cache['spools'].get(ident)
-        if not entry or entry.get('stamp') != stamp:
-            entry = dict(stamp=stamp, found=scan_spool(path, self.catalog))
-            cache['spools'][ident] = entry
-            _write(self.cache_path, cache)
-        return entry['found']
+        with self._lock:
+            cache = self._cache()
+            entry = cache['spools'].get(ident)
+            if not entry or entry.get('stamp') != stamp:
+                entry = dict(stamp=stamp, found=scan_spool(path, self.catalog))
+                cache['spools'][ident] = entry
+                _write(self.cache_path, cache)
+            return entry['found']
 
     def log(self, results):
         """The collection over delivered claims, oldest first.

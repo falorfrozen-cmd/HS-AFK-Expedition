@@ -244,6 +244,14 @@ def write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
+def whole(value) -> str:
+    """A count for people: 16,111,941, never 16,111,940.635554502 (XP multipliers make fractional sums)."""
+    try:
+        return f"{int(round(float(value or 0))):,}"
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+
+
 def serialized_rewards(function):
     @wraps(function)
     def call(*args, **kwargs):
@@ -784,7 +792,7 @@ def print_preview(plan: dict) -> None:
         print(f"  {z['room']:14s} {z['minutes']:6.1f} min  kills {z['kills']:6d}  breaks {z['breaks']:5d}")
     for e in plan.get("extras", []):
         print(f"  extra {e['monster_key'] or e['packet'][:12]:22s} {e['per_hour']:.1f}/h -> {e['count']} kills")
-    print(f"  total: {pv['kills']} kills, {pv['breaks']} breaks, {pv['calls']} drop calls, exp {pv['exp']:,}"
+    print(f"  total: {pv['kills']} kills, {pv['breaks']} breaks, {pv['calls']} drop calls, exp {whole(pv['exp'])}"
           + (f", ~{pv['items_estimate']} items" if pv.get("items_estimate") is not None else ", items: no rate learned yet")
           + (f", ~{pv['gold_estimate']} gold" if pv.get("gold_estimate") is not None else ", gold: no rate learned yet")
           + "; delivery time depends on game performance and reward-call cost")
@@ -1003,7 +1011,7 @@ def run_plan(plan_path: Path, plan: dict, bin_dir: Path, ingest: bool, anywhere:
         state = pr.get("state")
         if time.time() - last_print > 5:
             print(f"  {state}: {pr.get('calls_done', 0)}/{pr.get('calls_total', 0)} calls, items {pr.get('items', 0)}, "
-                  f"gold {pr.get('gold', 0)}, exp {pr.get('exp', 0):,}" + (f" [{pr.get('pause')}]" if pr.get("pause") else ""))
+                  f"gold {pr.get('gold', 0)}, exp {whole(pr.get('exp', 0))}" + (f" [{pr.get('pause')}]" if pr.get("pause") else ""))
             last_print = time.time()
         if state in ("done", "error", "aborted"):
             break
@@ -1028,7 +1036,7 @@ def run_plan(plan_path: Path, plan: dict, bin_dir: Path, ingest: bool, anywhere:
     saved = ipc.send("afk save") or []
     print("  " + " ".join(l for l in saved if l.startswith("save:")))
     print(f"expedition {plan['expedition_id']}: {pr.get('state')} - {pr.get('calls_done', 0)}/{pr.get('calls_total', 0)} calls, "
-          f"{pr.get('items', 0)} items, {pr.get('gold', 0)} gold, {pr.get('exp', 0):,} exp"
+          f"{pr.get('items', 0)} items, {pr.get('gold', 0)} gold, {whole(pr.get('exp', 0))} exp"
           + (f", failed {pr.get('failed')}" if pr.get("failed") else "") + (f" - {pr.get('error')}" if pr.get("error") else ""))
     expected_calls = sum(q['count'] for q in plan.get('packets', []))
     replay_ok = (pr.get('state') == 'done' and expected_calls > 0
@@ -1242,7 +1250,7 @@ def cmd_status(args) -> None:
     lc = st.get("last_claim")
     if lc:
         r = lc.get("result", {})
-        print(f"last claim: {lc['expedition_id']} at {lc['at']} - {lc['credited_hours']:.2f} h, {r.get('items', 0)} items, {r.get('gold', 0)} gold, {r.get('exp', 0):,} exp")
+        print(f"last claim: {lc['expedition_id']} at {lc['at']} - {lc['credited_hours']:.2f} h, {r.get('items', 0)} items, {r.get('gold', 0)} gold, {whole(r.get('exp', 0))} exp")
     for f in sorted(SESSIONS.glob("*.progress.json")):
         pr = read_json(f) or {}
         if pr.get("state") in ("running", "paused", "error", "aborted"):

@@ -33,7 +33,8 @@ window.AfkShare=(()=>{
     ctx.fillStyle='#f4e7cf';ctx.font='700 58px Georgia, serif';ctx.fillText(fit(ctx,title,760),44,82);
     ctx.fillStyle='#d8c29a';ctx.font='26px Georgia, serif';ctx.fillText(fit(ctx,sub,1110),44,152);
     if(summary.mode==='siege'&&summary.siege){
-      const s=summary.siege,badge=`SIEGE L${s.level} · ${s.waves_held} WAVES${s.fell?' · FELL':' · HELD'}${s.record?' · NEW RECORD':''}`;
+      // Waves fought (faced), not waves_held (waves whose demand the hero fully met).
+      const s=summary.siege,badge=`SIEGE L${s.level} · ${s.waves_fought} WAVES${s.fell?' · FELL':' · HELD'}${s.record?' · NEW RECORD':''}`;
       ctx.font='700 22px Georgia, serif';const bw=ctx.measureText(badge).width+36;
       ctx.fillStyle='#5a1e1e';ctx.fillRect(W-44-bw,90,bw,44);ctx.fillStyle='#ffd7a8';ctx.fillText(badge,W-44-bw+18,101);
     }

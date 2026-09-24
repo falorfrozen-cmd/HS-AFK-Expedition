@@ -89,13 +89,15 @@ with tempfile.TemporaryDirectory(prefix='afk-panel-qa-') as tmp:
             return live
         def sync_notification(self):
             self.notification={}
-        def worker_pay(self,purpose,amount,extra=None):
-            # The game's purchase path, simulated: the fixture's gold pays, nothing else happens.
-            controls=afk.read_json(control,{});gold=controls.get('gold',0)
-            if gold<amount:raise ValueError(f'The game did not take the gold: not enough gold ({gold:,} of {amount:,}). Nothing was bought.')
-            controls['gold']=gold-amount;afk.write_json(control,controls)
-            self.log(f'Fixture: paid {amount:,} gold ({gold:,} -> {gold-amount:,}).')
-            return 'fixture',dict(ok=True,amount=amount,gold_before=gold,gold_after=gold-amount,at=datetime.now(timezone.utc).isoformat())
+        def send_payment(self,request,amount):
+            # The game's purchase path, simulated: the fixture's gold pays and the receipt is written;
+            # the panel's own payment flow does the rest.
+            controls=afk.read_json(control,{});gold=controls.get('gold',0);ok=gold>=amount
+            if ok:controls['gold']=gold-amount;afk.write_json(control,controls)
+            receipt=dict(request_id=request,ok=ok,amount=amount,gold_before=gold,gold_after=gold-amount if ok else gold,
+                         error='' if ok else f'not enough gold ({gold:,} of {amount:,})',at=datetime.now(timezone.utc).isoformat())
+            afk.write_json(self.data/'models'/f'worker-pay-{request}.json',receipt)
+            return receipt
         def collect_worker(self,worker_id):
             # A delivery the game would make, simulated: the planned haul is "created" as-is.
             state=workers.load(self.data);w=workers.find(state,worker_id);trip=w.get('trip')

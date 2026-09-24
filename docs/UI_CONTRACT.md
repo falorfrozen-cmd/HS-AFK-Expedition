@@ -166,7 +166,10 @@ task, `AFK FARM\Expedition ready`, in step with the armed expedition and the set
 (`tools/notify.py`, record `notify-ready.json`): created with `schtasks /XML` for the
 local end time (StartWhenAvailable, least privilege, interactive token) running
 `conhost --headless powershell.exe -File notify-ready.ps1`, which shows a toast under
-Windows PowerShell's app id and deletes the task. It is deleted when the expedition
+Windows PowerShell's app id and deletes the task. Since 0.7.0 the toast is a reminder:
+it stays on screen until the player closes it (over a full-screen game a plain toast
+was only heard, never seen) and its **Open AFK FARM** button opens the panel's address
+(`-Url`, a local `http://127.0.0.1:<port>/` only). It is deleted when the expedition
 is claimed, cancelled or the setting is off; a refused request is shown and not
 retried for the same expedition. The snapshot's `notification` reports `scheduled`
 and `error`; the page's own "ready" notification is skipped while the task covers
@@ -373,7 +376,9 @@ and set pieces. A delivered claim's record counts when its rarity (itemInfoStruc
   Windows notification (never twice for the same claim).
 - `GET /api/share?id=<claim id>` → one delivered claim: `hero` {`name`,
   `class_name`, `level_before`, `level_now`}, `region`, `room`, `mode`, `siege`
-  (a Siege's `siege_claim`), `hours`, `kills`, `exp`, `gold`, `items`,
+  (a Siege's `siege_claim`), `hours`, `kills`, `exp`, `gold` (everything the claim
+  paid: `gold_drops`, the gold picked up, plus `gold_sales`, what the game paid for
+  the filtered items it sold), `gold_drops`, `gold_sales`, `items`,
   `visible_rarities`, `best` [{`name`, `rarity`, `group`, `icon`, `count`}],
   `partial`, `wishlist_hits`, `new_finds`, `new_finds_total`, `delivered_at`,
   `delivery_seconds`, `version`.
@@ -383,7 +388,9 @@ and set pieces. A delivered claim's record counts when its rarity (itemInfoStruc
 ### Siege
 
 `start` with `mode: "siege"` and `siege_level` (whole number 1-50) arms a Siege from
-a usable profile (same hours limits). The plan keeps `siege` (the whole timeline,
+a usable profile (same hours limits). A Siege lasts whole waves: `hours` is rounded
+down to 5 minutes (0.3 h arms 15 minutes, 3 waves), so offer 5- or 15-minute steps
+and label the Siege by its plan's `hours`. The plan keeps `siege` (the whole timeline,
 drawn once from a stored seed; the UI must not show future waves). Rules:
 `tools/siege.py` module note. Every 5 minutes a wave; level L's first wave demands
 10 × 1.15^(L-1) kills per minute, +3% per wave; the gate (100) loses at most 50 per
@@ -400,11 +407,15 @@ Find per level (up to ×100).
 - A claim delivers the complete waves; its plan's `siege_claim` = `level`,
   `waves_fought`, `waves_held`, `fell`, `hp`, `elite_waves`, `treasure_waves`,
   `boss_waves`, `previous_best`, `record`. Settling it updates the hero's record.
+  `waves_fought` is how many waves the gate faced (the record and "N waves");
+  `waves_held` only counts waves whose demand the hero fully met, and can be 0 in a
+  siege that held to the end.
 - `GET /api/siege-forecast?profile=ID&level=L&hours=H` → `waves_total`,
   `waves_median`, `waves_low`, `waves_high` (10th-90th percentile), `fall_chance`,
   `kill_share` (kills relative to farming), `first_wave_demand`, `pace`,
   `magic_find_bonus`, `elite`/`treasure`/`boss` (whether such waves can come),
-  `suggested_level` (the highest level whose median lasts the time), `best_waves`,
+  `suggested_level` (the highest level whose median lasts the time with a
+  `fall_chance` of at most 25%: the gate usually still stands), `best_waves`,
   `wave_minutes`, `max_level`.
 - `/api/state` → `siege_records` for the focus hero: {room: {level: best wave}}.
 
@@ -449,7 +460,14 @@ Actions (all return errors as `job.error`):
 | `worker_settle_partial` | `worker` | no; closes a haul that stopped part way |
 
 A payment runs through the plugin (`afk worker pay`): the gold must fall by exactly
-the price and the game saves at once; a refused payment hires nobody. A haul is
+the price and the game saves at once; a refused payment hires nobody. Every request
+has one receipt and the game never runs a request twice. `pending_payments` lists
+recent `pending`, `unknown` and `refused` ones: `unknown` means the game did not
+answer within 60 s. It is not a refusal, the game may still take the gold: the panel
+completes the purchase (hire or respec) as soon as the receipt appears, and a new
+payment first finishes the unanswered one under its own request id (charging at most
+once) or is refused while the game stays silent. Show `unknown` as "waiting for the
+game", never as "failed", and do not offer to buy again meanwhile. A haul is
 delivered by the plugin (`afk worker deliver`) into `spool/worker_*.ndjson` and sent
 to the Vault (materials go to AFK Materials) under
 `AFK · Workers · <name> · <date>`; if Item Editor is closed the haul waits for
