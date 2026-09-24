@@ -27,6 +27,7 @@ import camp
 import traits
 import worker_loot
 import worker_jeweler
+import teams
 
 SCHEMA = 2
 MAX_WORKERS = 3                        # the crew at Barracks level 1; the camp raises it
@@ -179,17 +180,22 @@ def xp_factor(worker: dict) -> float:
 
 
 def trip_mods(state: dict, worker: dict, target, hours: float, team=None, at=None) -> dict:
-    """The trip's multipliers from traits, the camp and today's hot spot, frozen when it starts."""
+    """The trip's multipliers from traits, the camp, today's hot spot and a team (synergy,
+    teammates' Team Player auras, team XP), frozen when it starts."""
     eff = camp.effects(state['camp'])
+    crew = teams.CURRENT or {}
+    team = bool(crew) if team is None else team      # a trip is either alone (Lone Wolf) or in a team
+    syn = crew.get('bonus') or {}
     tr = traits.effects(worker.get('traits'), hours=hours, team=team, target=target)
     tool = camp.tool_bonus(worker.get('type', 'miner'), worker.get('tool', 0))
     regional = worker.get('type') in ('adventurer', 'goblin_hunter')   # only their hot spots are recorded regions
     hot = camp.hotspot_bonus(state['camp'], hotspot_targets() if regional else TARGETS, worker.get('type', 'miner'), target, at)
     bonus = eff['all_bonus']
-    return dict(speed=round(1 + tr['speed'] + hot + bonus + (tool if worker.get('type', 'miner') == 'miner' else 0.0), 6),
-                amount=round(max(0.1, 1 + tr['amount'] + bonus), 6),
-                xp=round((1 + tr['xp']) * (1 + eff['xp_bonus']), 6),
-                rare=round(max(0.0, 1 + tr['rare'] + eff['rare_bonus']), 6),
+    return dict(speed=round(1 + tr['speed'] + hot + bonus + (tool if worker.get('type', 'miner') == 'miner' else 0.0)
+                            + syn.get('speed', 0.0) + crew.get('aura', 0.0), 6),
+                amount=round(max(0.1, 1 + tr['amount'] + bonus + syn.get('amount', 0.0)), 6),
+                xp=round((1 + tr['xp']) * (1 + eff['xp_bonus']) * (1 + crew.get('xp', 0.0)), 6),
+                rare=round(max(0.0, 1 + tr['rare'] + eff['rare_bonus'] + syn.get('rare', 0.0)), 6),
                 tool=round(tool, 6), hotspot=round(hot, 6), bonus_find=round(tr['bonus_find'], 6))
 
 
@@ -230,6 +236,8 @@ def load(data, at=None) -> dict:
     value['candidates'] = value.get('candidates') if isinstance(value.get('candidates'), dict) else {}
     value['camp'] = camp.normalize(value.get('camp'))
     camp.settle(value['camp'], at)
+    value['teams'] = value.get('teams') if isinstance(value.get('teams'), dict) else {}
+    teams.tidy(value)
     return value
 
 
@@ -591,6 +599,7 @@ def view(worker: dict, at=None, state: dict | None = None) -> dict:
 
 def overview(state: dict, at=None) -> dict:
     return dict(workers=[view(w, at, state) for w in state['workers']], hire_price=hire_price(state), max_workers=max_workers(state),
+                teams=teams.view(state), team_size=camp.effects(state['camp'])['team_size'], synergies=[dict(s) for s in teams.SYNERGIES],
                 tree=[dict(n) for n in TREE], trees={k: [dict(n) for n in v] for k, v in TREES.items()}, ores=[dict(o) for o in ORES],
                 find_names=FIND_NAMES, types=TYPE_NAMES, camp=camp.view(state['camp'], at),
                 traits=[dict(t) for t in traits.TRAITS], quirks=[dict(q) for q in traits.QUIRKS])

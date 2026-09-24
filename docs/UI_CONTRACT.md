@@ -591,6 +591,21 @@ the hero's own Jewelcrafting level.
   Prospector's own recipe and dice but does not make them; its result says
   `routed: true`, and only such a result fills the stock).
 
+### Team trips
+
+Rules: tools/teams.py module note. `team_start` {`members` [{`worker`, and
+`ore`, `region` or `recipe` as for `worker_start`}], `hours`} sends 2 to
+`team_size` idle workers at once (all start, or none: a refusal gives back the
+keys and materials already taken). Each still works its own target and is
+collected on its own. Every member gets +10% experience; Team Player auras reach
+teammates; a Lone Wolf works 10% slower in a team (and 15% faster alone). Crews
+with a synergy (`synergies`: key, name, types, text, bonus by type): Goblin
+Patrol (miner + goblin hunter), Treasure Trail (adventurer + goblin hunter),
+On-site Cutting (miner + jeweler), Deep Vein (adventurer + miner), Full Caravan
+(all four). `GET /api/workers` adds `teams` (out now: `id`, `members`, `types`,
+`hours`, `started_at`, `synergies`, `synergy_names`, `out`, `names`),
+`team_size` and `synergies`; a member's trip has `team`.
+
 ### Siege and the Walls
 
 Siege plans and `/api/siege-forecast` use the gate the Walls give; the forecast adds

@@ -12,7 +12,7 @@ import loot_filter
 import notify
 import calibration, recovery, validate_farm
 import collection
-import workers, camp, traits, worker_loot, worker_jeweler
+import workers, camp, traits, worker_loot, worker_jeweler, teams
 from product_data import Presentation, SUPPORT, support_warnings
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -779,7 +779,7 @@ class Panel:
             width,height=struct.unpack('>II',raw[16:24]);require(0<width<=4096 and 0<height<=4096,'Portrait dimensions must be 4096 pixels or smaller.')
             path=self.data/'portraits'/(self.portrait_key(c)+'.png');path.parent.mkdir(parents=True,exist_ok=True)
             path.write_bytes(raw);self.log('Character screenshot saved locally. It does not change the game save.');return
-        if name.startswith('worker_') or name=='camp_build':return self.worker_action(name,args)
+        if name.startswith('worker_') or name in ('camp_build','team_start'):return self.worker_action(name,args)
         if name=='verify_special':
             ident=args.get('hash','');require(isinstance(ident,str) and bool(re.fullmatch(r'[a-f0-9]{12,64}',ident)),'Choose a special monster to verify.')
             s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
@@ -1160,6 +1160,19 @@ class Panel:
             w=workers.rename(state,args.get('worker'),args.get('name'));workers.save(self.data,state);self.log(f"Renamed to {w['name']}.");return
         if name=='worker_recipes':
             self.read_jewel_recipes(force=True);return
+        if name=='team_start':
+            rows=args.get('members');require(isinstance(rows,list),'Choose the team members.')
+            members=[]
+            for row in rows:
+                require(isinstance(row,dict),'Choose the team members.')
+                target=row.get('recipe') if row.get('recipe') is not None else (row.get('region') if row.get('region') is not None else row.get('ore'))
+                members.append(dict(worker=row.get('worker'),target=target))
+            recipes=self.read_jewel_recipes() if any(workers.find(state,m['worker']).get('type')=='jeweler' for m in members) else None
+            team=teams.start(state,members,args.get('hours',1),recipes=recipes);workers.save(self.data,state)
+            names=', '.join(workers.find(state,i)['name'] for i in team['members'])
+            found=[s['name'] for s in teams.SYNERGIES if s['key'] in team['synergies']]
+            self.log(f"{names} set out together for {team['hours']:g} h"+(f"; synergy: {', '.join(found)}" if found else '')+'.')
+            threading.Thread(target=self.sync_notification,daemon=True).start();return
         if name=='worker_start':
             target=args.get('ore') if args.get('region') is None else args.get('region')
             recipes=None
