@@ -3216,7 +3216,9 @@ static void RunCommand(const std::string& raw)
             std::string line = "call " + w1 + "(" + std::to_string(args.size()) + " args";
             for (auto& a : args) line += " k" + std::to_string((int)a.m_Kind) + ":" + Stringify(a).substr(0, 20);
             line += "): st=" + std::to_string((int)st) + " -> " + Stringify(res).substr(0, 400);
-            if (IsNumberKind(res) && res.ToDouble() > 100000 && res.ToDouble() < 10000000) line += "  [as handle -> " + ResolveProtected(res) + "]";
+            // Never resolve a result as a protected handle here: a plain number in
+            // the handle range (MEASURED 2026-09-24: GetGoldAmount's 1.48 M gold)
+            // made the anti-cheat module read an invalid handle and crash the game.
             Out(line);
         } catch (...) { Out("call: EXCEPTION"); }
         return;
@@ -3279,7 +3281,7 @@ static void RunCommand(const std::string& raw)
                 label += " (array length " + std::to_string((int)g_Yytk->CallBuiltin("array_length", { v }).ToDouble()) + ")";
             }
             std::string line = label + " = " + Stringify(v).substr(0, 300);
-            if (IsNumberKind(v) && v.ToDouble() > 100000 && v.ToDouble() < 10000000) line += "  [as handle -> " + ResolveProtected(v) + "]";
+            // No automatic handle resolution: an ordinary number in the handle range crashes the game (see `call`).
             Out(line);
         } catch (...) { Out("gvar: EXCEPTION"); }
         return;
@@ -3361,7 +3363,6 @@ static void RunCommand(const std::string& raw)
                 if (!w1.empty()) { std::string lo = name, f = w1; for (auto& c : lo) c = (char)tolower(c); for (auto& c : f) c = (char)tolower(c); if (lo.find(f) == std::string::npos) continue; }
                 RValue v = g_Yytk->CallBuiltin("variable_global_get", { nm });
                 std::string line = "  " + name + " = " + Stringify(v).substr(0, 120);
-                if (IsNumberKind(v) && v.ToDouble() > 100000 && v.ToDouble() < 10000000) line += "  [handle? " + ResolveProtected(v) + "]";
                 Out(line); if (++shown >= 400) { Out("  ..."); break; }
             }
             Out("gvars: " + std::to_string(n) + " globals, " + std::to_string(shown) + " shown");

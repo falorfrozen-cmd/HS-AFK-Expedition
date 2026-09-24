@@ -219,3 +219,14 @@ wins, as the Prospector does). Only mining ores (27-32), jewel materials (0-23),
 Satanic Crystal (58), its fragment (60) and Destiny Shard Fragment (66) may be
 delivered. A haul is planned once from the trip's seed and never re-rolled; a
 delivery that stopped part way is never made again and can be closed as partial.
+
+Live check (2026-09-24, verified build, ForgePact and the Tracker producer loaded):
+`afk worker pay` took 1 gold (the gold fell by exactly 1, the game saved the
+character and account, no anti-cheat report; the same request again was refused);
+`afk worker deliver` made 50 Copper Ore and 3 Satanic Crystal Fragments and turned
+30 Copper Ore through the Prospector's recipe into 12 jewelcrafting materials (40%;
+about 41% expected), 5 stacks recorded in the delivery's spool and nothing given to
+the hero; the same delivery again was refused. Not yet live: gold after a restart,
+the panel's hire/collect with real prices, a roster or Siege claim, a boss verify.
+The research commands `call`/`gvar`/`gvars` no longer resolve numbers as protected
+handles: a gold amount in that range crashed the game in the anti-cheat module.
