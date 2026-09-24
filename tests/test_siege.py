@@ -73,6 +73,17 @@ class WaveTests(Folder):
         self.assertEqual(siege.wave_kind(10, dict(elite=True)), 'elite')
         self.assertEqual(siege.wave_kind(5, {}), 'normal')
 
+    def test_chests_never_join_a_siege_and_every_loot_goblin_counts(self):
+        p = profile(packets=[packet('a', 3, 400), packet('d', 0, 30, key='', kind='break', exp=0.0),
+                             dict(packet('f', 0, 10, key='', kind='break', exp=0.0), object='Abyss_Chest_obj'),
+                             packet('g', 2, 5, key='e_goblinOrb_1'), dict(packet('h', 2, 5, key=''), object='Goblin_Ore_obj')])
+        g = siege.groups(p)
+        self.assertEqual(g['breaks'], ['d' * 64], 'a chest opening is not a breakable')
+        self.assertEqual(sorted(g['goblin']), ['g' * 64, 'h' * 64], 'orb and ore goblins are loot goblins too')
+        self.assertAlmostEqual(siege.ordinary_breaks_per_min(p), 3.0 * 30 / 40)
+        plan = siege.build_plan(p, 5, 1.0, 's', self.mods, seed=3)
+        self.assertNotIn('f' * 64, {q['hash'] for q in plan['packets']})
+
     def test_groups_keep_unverified_bosses_out(self):
         g = siege.groups(profile())
         self.assertEqual(g['boss'], []); self.assertNotIn('e' * 64, g['normal'])

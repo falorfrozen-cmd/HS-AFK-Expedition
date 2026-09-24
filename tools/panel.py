@@ -181,8 +181,9 @@ class Panel:
             key=json.dumps([p.get('profile_id'),p.get('room'),p.get('character'),p.get('built_at')],sort_keys=True)
             if key in seen: continue
             seen.add(key); problems=profile_problems(p,build)
-            special=sum(q.get('count',0) for q in p.get('packets',[]) if not afk.replayable(q,verified))
-            profiles.append(dict(p,id=f.stem,problems=problems,usable=not problems,special_kills=special))
+            special=sum(q.get('count',0) for q in p.get('packets',[]) if not afk.is_chest(q) and not afk.replayable(q,verified))
+            chests=sum(q.get('count',0) for q in p.get('packets',[]) if afk.is_chest(q))
+            profiles.append(dict(p,id=f.stem,problems=problems,usable=not problems,special_kills=special,chest_breaks=chests))
         self.profiles=profiles; self.chars=characters(self.data); self.last_profiles=time.monotonic()
 
     def monitor(self):

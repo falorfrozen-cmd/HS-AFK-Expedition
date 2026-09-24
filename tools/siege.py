@@ -52,7 +52,9 @@ REPAIR = 5.0
 MF_BONUS_PER_LEVEL = 0.02
 ELITE_EVERY, TREASURE_EVERY, BOSS_EVERY = 5, 10, 25
 ORDINARY_RANKS = (1, 2, 3, 4)
-GOBLIN_KEYS = ('treasure_goblin', 'goblinrune', 'goblinshadow')
+# The game's loot goblins (isGoblin = 1): Goblin_{Treasure,Rune,Ore,Orb,Shadow}_obj.
+GOBLIN_KEYS = ('treasure_goblin', 'goblinrune', 'goblinshadow', 'goblinore', 'goblinorb')
+GOBLIN_OBJECTS = ('Goblin_Treasure_obj', 'Goblin_Rune_obj', 'Goblin_Ore_obj', 'Goblin_Orb_obj', 'Goblin_Shadow_obj')
 FALLBACK_SPREAD = 0.10          # no calibration windows: +-10% per wave
 SUGGEST_MAX_FALL = 0.25         # the suggested level holds in at least 3 of 4 simulated sieges
 RECORDS = 'siege-records.json'
@@ -83,13 +85,26 @@ def _round(value: float, rng: random.Random) -> int:
     return int(whole + (1 if rng.random() < value - whole else 0))
 
 
+def is_goblin(packet: dict) -> bool:
+    """One of the game's five loot goblins (treasure, rune, shadow, orb, ore)."""
+    return (str(packet.get('object') or '') in GOBLIN_OBJECTS
+            or any(k in str(packet.get('monster_key', '')).lower() for k in GOBLIN_KEYS))
+
+
+def ordinary_breaks_per_min(profile: dict) -> float:
+    """The calibration's break rate without chest openings (chests never replay)."""
+    total = sum(float(q.get('count') or 0) for q in profile.get('packets', []) if q.get('kind') == 'break')
+    kept = sum(float(q.get('count') or 0) for q in profile.get('packets', []) if q.get('kind') == 'break' and not afk.is_chest(q))
+    return float(profile.get('breaks_per_min') or 0) * (kept / total) if total else 0.0
+
+
 def groups(profile: dict, specials=()) -> dict:
     """Which calibrated packets each kind of wave replays."""
     kills = [q for q in profile.get('packets', []) if q.get('kind') == 'kill' and q.get('rank') in ORDINARY_RANKS]
-    breaks = [q for q in profile.get('packets', []) if q.get('kind') == 'break']
+    breaks = [q for q in profile.get('packets', []) if q.get('kind') == 'break' and not afk.is_chest(q)]
     top = max((q.get('rank') for q in kills), default=None)
     elite = [q for q in kills if q.get('rank') == 4] or [q for q in kills if top is not None and q.get('rank') == top]
-    goblin = [q for q in kills if any(k in str(q.get('monster_key', '')).lower() for k in GOBLIN_KEYS)]
+    goblin = [q for q in kills if is_goblin(q)]
     boss = [q for q in profile.get('packets', []) if q.get('kind') == 'kill' and q.get('hash') in set(specials)]
     pick = lambda group: [q['hash'] for q in group]
     return dict(normal=pick(kills), elite=pick(elite), goblin=pick(goblin), boss=pick(boss), breaks=pick(breaks))
@@ -203,7 +218,7 @@ def build_plan(profile: dict, level, hours, expedition_id: str, modifiers: dict,
     seed = seed if isinstance(seed, int) else random.SystemRandom().randrange(1 << 62)
     factors = pace_factors(profile)
     available = {k: bool(v) for k, v in grouped.items()}
-    waves, fell = timeline(pace, float(profile.get('breaks_per_min') or 0), factors, level, total, seed, available)
+    waves, fell = timeline(pace, ordinary_breaks_per_min(profile), factors, level, total, seed, available)
     siege = dict(version=VERSION, level=level, seed=seed, wave_minutes=WAVE_MINUTES, growth=GROWTH, base_demand=BASE_DEMAND,
                  level_step=LEVEL_STEP, gate_hp=GATE_HP, pace=pace, pace_source='calibration windows' if factors else 'fixed spread',
                  waves=waves, fell_at=fell, groups=grouped, packet_info=info, magic_find_bonus=1 + MF_BONUS_PER_LEVEL * level)

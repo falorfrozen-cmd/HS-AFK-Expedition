@@ -424,6 +424,10 @@ Find per level (up to ×100).
 Kills of special monsters (native rank outside 1-4: bosses, event monsters) no
 longer close a calibration; they are left out of every plan until verified. A
 kill without any rank still closes it. Profiles carry `special_kills`.
+Chest openings (`Chest_Drop_obj`, `Abyss_Chest_obj`, `Dungeon_Chest_obj`, ...) are
+recorded as breaks but never replay in an expedition or a Siege: a golden or crystal
+chest costs a key the replay would not take, and the Abyss chest is a rare map event.
+Profiles carry `chest_breaks` (how many were recorded) so the page can say so.
 
 - `GET /api/specials` → `specials` [{`hash`, `monster_key`, `rank`, `room`,
   `region`, `kills`, `profiles`, `verified`, `verification`}].

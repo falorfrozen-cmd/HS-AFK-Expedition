@@ -256,3 +256,9 @@ What that check and the review of the pull request changed:
 - Ready notifications stay on screen until closed: over a full-screen game a plain
   toast was only heard (Windows had it at 11:24:33; nothing was seen).
 - Claim output prints XP as a whole number.
+- Chest openings no longer scale into plans: calibrations record them as breaks,
+  and a 5.6-minute Act 3-3 calibration with 6 Abyss-chest and 6 world-chest calls
+  made plans open about 11 Abyss chests an hour (a rare map event) and golden and
+  crystal chests without spending keys. Chests are left out of expeditions and
+  Siege waves; the Siege's break rate leaves them out too. Siege treasure waves now
+  also count orb and ore goblins (all five loot goblins).

@@ -626,10 +626,23 @@ def verified_specials() -> dict:
     return packets if isinstance(packets, dict) else {}
 
 
+def is_chest(packet: dict) -> bool:
+    """A chest opening (Chest_Drop_obj, Abyss_Chest_obj, Dungeon_Chest_obj, ...), recorded as a break.
+
+    Chests are not part of a route's pace: a golden or crystal chest costs a key
+    the replay would not take, and an Abyss chest is a rare map event (MEASURED
+    2026-09-24: a 5.6-minute Act 3-3 calibration held 6 Abyss-chest and 6
+    world-chest calls, which a plan scaled to about 11 Abyss chests an hour).
+    Every plan leaves them out; opening chests is the Adventurer worker's job."""
+    return 'Chest' in str(packet.get('object') or '')
+
+
 def replayable(packet: dict, verified: dict | None = None) -> bool:
-    """Ordinary monsters and breakables replay; a special monster only once verified.
-    A kill without a rank (research profiles before ranks were recorded) is not
-    special here; the panel refuses such calibrations outright."""
+    """Ordinary monsters and breakables replay; a special monster only once verified;
+    a chest never. A kill without a rank (research profiles before ranks were
+    recorded) is not special here; the panel refuses such calibrations outright."""
+    if is_chest(packet):
+        return False
     if packet.get("kind") != "kill" or packet.get("rank") in ORDINARY_RANKS or packet.get("rank") is None:
         return True
     return packet.get("hash") in (verified if verified is not None else verified_specials())
@@ -678,9 +691,9 @@ def make_plan(hours: float, zones: list[tuple[str, float]], exp_id: str, per_fra
         # verify`; until then its kills are left out, never swapped for others.
         kill_pk = [q for q in p["packets"] if q["kind"] == "kill" and replayable(q, verified)]
         kills = int(round(sum(q['count'] for q in kill_pk) * minutes * 60 / p['basis_seconds']))
-        breaks = int(round(sum(q['count'] for q in p['packets'] if q['kind'] == 'break') * minutes * 60 / p['basis_seconds']))
+        break_pk = [q for q in p["packets"] if q["kind"] == "break" and replayable(q, verified)]
+        breaks = int(round(sum(q['count'] for q in break_pk) * minutes * 60 / p['basis_seconds']))
         room = p['room']
-        break_pk = [q for q in p["packets"] if q["kind"] == "break"]
         for group, n in ((kill_pk, kills), (break_pk, breaks)):
             counts = largest_remainder(n, [q["weight"] for q in group]) if group else []
             for q, c in zip(group, counts):
