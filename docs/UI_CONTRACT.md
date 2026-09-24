@@ -565,6 +565,32 @@ like a claim; the Vault label `AFK · Workers · <name> · <date>`).
   collect, a delivered one is never replayed. The log reports chests (and locked
   ones), keys found, goblins caught and fled, and the camp's spoils.
 
+### The Jeweler
+
+Rules: tools/worker_jeweler.py module note. The Jeweler works the game's own jewel
+recipes (the craft cube's table, result types 37-41: tier 1-4 jewels and tier 5
+gems) from the camp's material stock; every jewel is made by the game at delivery
+(`worker deliver` with `crafts` [{`recipe`, `count`}]). It does not use or change
+the hero's own Jewelcrafting level.
+
+- The plugin reads the recipes from the running game (`afk worker recipes <id>`):
+  action `worker_recipes` reads them again; a jeweler's `worker_start` reads them
+  when none are kept for this game build. `GET /api/workers` adds `recipes`
+  [{`index`, `result_type`, `name`, `tier`, `level`, `output` {`type` 15, `id`,
+  `amount`}, `inputs` [{`type`, `id`, `amount`}], `affordable` (crafts the stock
+  pays for), `bench_ok`}], `material_names` and `jewel_names`.
+- `worker_start` {`worker`, `recipe` (its `index`), `hours`}: the materials of every
+  planned craft (6 an hour, skills and traits) leave the stock at once; a
+  cancelled session gives them all back, an early collect the unused ones.
+- Tiers: the Jeweler's Bench level and a worker level (1, 8, 16, 24, 32).
+- The trip view has `recipe`, `target_name` (the jewel), `planned`.
+- Collecting needs any offline hero (like a miner); the jewels go to the Vault.
+  The camp gets gem dust (one per material used, five per jewel).
+- Miners: `worker_route` {`worker`, `route`: `stock`} sends their Gem Sense
+  materials to the stock instead of the game (the plugin rolls them with the
+  Prospector's own recipe and dice but does not make them; its result says
+  `routed: true`, and only such a result fills the stock).
+
 ### Siege and the Walls
 
 Siege plans and `/api/siege-forecast` use the gate the Walls give; the forecast adds

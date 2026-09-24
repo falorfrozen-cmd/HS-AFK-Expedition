@@ -47,6 +47,22 @@ int main() {
           "zero, negative, fractional, over-cap and infinite prices are refused");
     check(StackSizes(2000, true) == std::vector<long long>({999, 999, 2}), "a haul leaves in native 999 stacks");
 
+    // The Jeweler (0.8): the game's jewel recipes only, jewels and gems only.
+    JewelRecipe exan; exan.index = 7; exan.resultType = 37; exan.output = {15, 82, 1};
+    exan.inputs = {{14, 3, 3}, {14, 2, 2}};
+    check(UsableJewelRecipe(exan), "a jewel recipe from jewel materials is usable");
+    JewelRecipe gem = exan; gem.resultType = 41; gem.output = {15, 78, 1}; gem.inputs.push_back({14, 44, 1});
+    check(UsableJewelRecipe(gem), "a gem recipe may take the Enchanted Sigil");
+    JewelRecipe other = exan; other.resultType = 36;
+    JewelRecipe armour = exan; armour.output = {6, 82, 1};
+    JewelRecipe dice = exan; dice.inputs = {{14, 43, 1}};
+    JewelRecipe broken = exan; broken.inputs = {{14, 3, 0}};
+    JewelRecipe empty = exan; empty.inputs.clear();
+    check(!UsableJewelRecipe(other) && !UsableJewelRecipe(armour) && !UsableJewelRecipe(dice) && !UsableJewelRecipe(broken) && !UsableJewelRecipe(empty),
+          "other recipe types, gear outputs, dice inputs, zero amounts and recipes without inputs are refused");
+    check(JewelOutput(15, 96) && !JewelOutput(15, 97) && !JewelOutput(15, 77) && JewelInput(14, 23) && !JewelInput(14, 24),
+          "uncut jewels and other socketables are not recipe outputs; only jewel materials and the sigil are inputs");
+
     std::printf("%d checks, %d failures\n", checks, failed);
     return failed ? 1 : 0;
 }

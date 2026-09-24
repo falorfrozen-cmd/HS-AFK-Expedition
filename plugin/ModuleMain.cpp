@@ -2053,6 +2053,74 @@ static bool LoadProspectRecipes(std::vector<AfkExpedition::ProspectRecipe>& out,
     if (out.empty()) { why = ores ? "no Prospector recipe for mining ores was readable" : "no Prospector recipe for Satanic and above items was readable"; return false; }
     return true;
 }
+// The Jeweler's recipes as the game holds them (global.craftComboList /
+// global.craftComboResult, filled by DefineCraftingCombos): result types 37-41
+// make socketable jewels and gems. Amounts are read through the game's own
+// PilipaliDecrypt, as the Prospector's are; a small whole number that does not
+// decrypt is taken as stored plainly (the report says which).
+static long long JewelAmount(const RValue& raw, std::string& note)
+{
+    if (!IsNumberKind(raw) || raw.m_Kind == VALUE_BOOL) { note = "none"; return -1; }
+    RValue plain;
+    try { plain = g_Yytk->CallGameScript(HeroSiege::Scripts::gml_Script_PilipaliDecrypt.data(), { raw, RValue(), RValue() }); } catch (...) {}
+    const double stored = raw.ToDouble();
+    if (IsNumberKind(plain)) {
+        const double v = plain.ToDouble();
+        if (v >= 1 && v <= AfkExpedition::kNativeStackMax && std::floor(v) == v) { note = "decrypted"; return static_cast<long long>(v); }
+    }
+    if (stored >= 1 && stored <= AfkExpedition::kNativeStackMax && std::floor(stored) == stored) { note = "plain"; return static_cast<long long>(stored); }
+    note = "unreadable"; return -1;
+}
+static AfkExpedition::JewelPart ReadJewelPart(const RValue& s, std::string& note)
+{
+    AfkExpedition::JewelPart p;
+    if (s.m_Kind != VALUE_OBJECT) { note = "not a struct"; return p; }
+    RValue type = StructGet(s, "itemType"), id = StructGet(s, "itemId");
+    p.type = IsNumberKind(type) ? static_cast<int>(type.ToDouble()) : -1;
+    p.id = IsNumberKind(id) ? static_cast<int>(id.ToDouble()) : -1;
+    p.amount = JewelAmount(StructGet(s, "amount"), note);
+    return p;
+}
+static bool LoadJewelRecipes(std::vector<AfkExpedition::JewelRecipe>& out, std::string& why, std::vector<std::string>* report = nullptr)
+{
+    out.clear();
+    try {
+        RValue lists = g_Yytk->CallBuiltin("variable_global_get", { RValue("craftComboList") });
+        RValue results = g_Yytk->CallBuiltin("variable_global_get", { RValue("craftComboResult") });
+        if (lists.m_Kind != VALUE_ARRAY || results.m_Kind != VALUE_ARRAY) { why = "the craft recipe table was not found"; return false; }
+        const int n = static_cast<int>(g_Yytk->CallBuiltin("array_length", { lists }).ToDouble());
+        const int m = static_cast<int>(g_Yytk->CallBuiltin("array_length", { results }).ToDouble());
+        for (int i = 0; i < n && i < m; ++i) {
+            RValue res = g_Yytk->CallBuiltin("array_get", { results, RValue(static_cast<double>(i)) });
+            if (res.m_Kind != VALUE_OBJECT) continue;
+            RValue kind = StructGet(res, "resultType");
+            const int resultType = IsNumberKind(kind) ? static_cast<int>(kind.ToDouble()) : -1;
+            if (!AfkExpedition::JewelRecipeType(resultType)) continue;
+            AfkExpedition::JewelRecipe r; r.index = i; r.resultType = resultType;
+            std::string notes, note;
+            r.output = ReadJewelPart(res, note); notes += note;
+            RValue in = g_Yytk->CallBuiltin("array_get", { lists, RValue(static_cast<double>(i)) });
+            if (in.m_Kind == VALUE_OBJECT) { r.inputs.push_back(ReadJewelPart(in, note)); notes += " " + note; }
+            else if (in.m_Kind == VALUE_ARRAY) {
+                const int k = static_cast<int>(g_Yytk->CallBuiltin("array_length", { in }).ToDouble());
+                for (int j = 0; j < k; ++j) {
+                    r.inputs.push_back(ReadJewelPart(g_Yytk->CallBuiltin("array_get", { in, RValue(static_cast<double>(j)) }), note));
+                    notes += " " + note;
+                }
+            }
+            const bool ok = AfkExpedition::UsableJewelRecipe(r);
+            if (report) {
+                std::string line = "recipe " + std::to_string(i) + " type " + std::to_string(resultType) + " -> " + std::to_string(r.output.type) + ":"
+                    + std::to_string(r.output.id) + " x" + std::to_string(r.output.amount) + " from";
+                for (const auto& p : r.inputs) line += " " + std::to_string(p.type) + ":" + std::to_string(p.id) + " x" + std::to_string(p.amount);
+                report->push_back(line + " [" + notes + "]" + (ok ? "" : " (refused)"));
+            }
+            if (ok) out.push_back(r);
+        }
+    } catch (...) { why = "reading the craft recipe table threw"; out.clear(); return false; }
+    if (out.empty()) { why = "no jewel recipe was readable"; return false; }
+    return true;
+}
 static void WriteBackSales(const std::string& why)
 {
     if (g_SpoolActive) for (const auto& line : g_Conv.soldLines) { SpoolWriteLine(SpoolRecord(line)); ++g_SpoolItems; ++g_SpoolFiltered; }
@@ -2578,6 +2646,30 @@ static double GoldNumber(CInstance* player)
     const RValue gold = GoldAmount(player);
     return IsNumberKind(gold) ? gold.ToDouble() : -1;
 }
+// worker recipes <request>: the Jeweler's recipes as the game holds them now,
+// written to models\jewel-recipes-<request>.json for the panel to plan crafts.
+static void CmdWorkerRecipes(const std::string& request)
+{
+    if (!AfkExpedition::SafeIdentifier(request, 8, 64)) { Out("worker recipes: invalid request id"); return; }
+    std::vector<AfkExpedition::JewelRecipe> recipes; std::vector<std::string> report; std::string why;
+    const bool ok = LoadJewelRecipes(recipes, why, &report);
+    std::ostringstream o;
+    o << "{\"schema\":1,\"request_id\":\"" << JsonEscape(request) << "\",\"ok\":" << (ok ? "true" : "false") << ",\"error\":\""
+      << JsonEscape(ok ? "" : why) << "\",\"recipes\":[";
+    for (size_t i = 0; i < recipes.size(); ++i) {
+        const auto& r = recipes[i];
+        o << (i ? "," : "") << "{\"index\":" << r.index << ",\"result_type\":" << r.resultType << ",\"output\":{\"type\":" << r.output.type
+          << ",\"id\":" << r.output.id << ",\"amount\":" << r.output.amount << "},\"inputs\":[";
+        for (size_t j = 0; j < r.inputs.size(); ++j)
+            o << (j ? "," : "") << "{\"type\":" << r.inputs[j].type << ",\"id\":" << r.inputs[j].id << ",\"amount\":" << r.inputs[j].amount << "}";
+        o << "]}";
+    }
+    o << "],\"report\":[";
+    for (size_t i = 0; i < report.size(); ++i) o << (i ? "," : "") << "\"" << JsonEscape(report[i]) << "\"";
+    o << "],\"at\":\"" << NowIso() << "\",\"plugin\":\"" AFK_EXPEDITION_VERSION "\"}";
+    WriteSmallJson(DATA_ROOT + "\\models\\jewel-recipes-" + request + ".json", o.str());
+    Out("worker recipes " + request + ": " + (ok ? std::to_string(recipes.size()) + " jewel recipes" : "failed: " + why));
+}
 static void CmdWorkerPay(const std::string& request, const std::string& amountText)
 {
     if (!AfkExpedition::SafeIdentifier(request, 8, 64)) { Out("worker pay: invalid request id"); return; }
@@ -2660,7 +2752,9 @@ static void CmdWorkerDeliver(const std::string& planPath)
     ReplayEnv env;
     if (!PrepareReplayEnv(env, why)) { Out("worker deliver: " + why); return; }
     if (fs::exists(DATA_ROOT + "\\spool\\" + id + ".ndjson")) { Out("worker deliver: records exist without a result; review needed"); return; }
-    std::map<std::string, long long> make, prospect, outputs, created;
+    std::map<std::string, long long> make, prospect, outputs, created, crafted;
+    std::map<int, long long> craftCounts;
+    bool routeProspect = false;
     auto amountOf = [](const RValue& v) { return IsNumberKind(v) && v.m_Kind != VALUE_BOOL && std::isfinite(v.ToDouble()) && std::floor(v.ToDouble()) == v.ToDouble()
                                               ? static_cast<long long>(v.ToDouble()) : -1LL; };
     try {
@@ -2688,6 +2782,21 @@ static void CmdWorkerDeliver(const std::string& planPath)
                 if (amount) prospect[name.ToString()] = amount;
             }
         }
+        // A Jeweler's crafts: [{recipe, count}] by the game's recipe index.
+        RValue crafts = StructGet(plan, "crafts");
+        if (crafts.m_Kind == VALUE_ARRAY) {
+            const int c = static_cast<int>(g_Yytk->CallBuiltin("array_length", { crafts }).ToDouble());
+            for (int i = 0; i < c; ++i) {
+                RValue row = g_Yytk->CallBuiltin("array_get", { crafts, RValue(static_cast<double>(i)) });
+                const long long recipe = amountOf(StructGet(row, "recipe")), count = amountOf(StructGet(row, "count"));
+                if (recipe < 0 || recipe > 100000 || count < 1 || count > AfkExpedition::kMaxWorkerAmount) { Out("worker deliver: refused craft entry"); return; }
+                craftCounts[static_cast<int>(recipe)] += count;
+            }
+        }
+        // route_prospect: the Gem Sense share is rolled with the game's recipe and
+        // dice as always, but recorded for the Jeweler's stock instead of made.
+        RValue route = StructGet(plan, "route_prospect");
+        routeProspect = route.m_Kind == VALUE_BOOL && route.ToBoolean();
     } catch (...) { Out("worker deliver: reading the plan threw"); return; }
     if (!prospect.empty()) {
         std::vector<AfkExpedition::ProspectRecipe> recipes;
@@ -2704,12 +2813,24 @@ static void CmdWorkerDeliver(const std::string& planPath)
             }
         }
     }
+    if (!craftCounts.empty()) {
+        std::vector<AfkExpedition::JewelRecipe> jewels;
+        if (!LoadJewelRecipes(jewels, why)) { Out("worker deliver: " + why); return; }
+        for (const auto& [index, count] : craftCounts) {
+            auto it = std::find_if(jewels.begin(), jewels.end(), [&](const AfkExpedition::JewelRecipe& r) { return r.index == index; });
+            if (it == jewels.end()) { Out("worker deliver: recipe " + std::to_string(index) + " is not a jewel recipe of this game"); return; }
+            long long& total = crafted[AfkExpedition::OutputKey(it->output.type, it->output.id)];
+            total += it->output.amount * count;
+            if (total > AfkExpedition::kMaxWorkerAmount) { Out("worker deliver: too many jewels in one delivery"); return; }
+        }
+    }
     g_WorkerDelivering = true;
     g_Conv = ConversionState{};
     SpoolBegin(id);
     uint64_t stacks = 0; std::string error;
     std::map<std::string, long long> all = make;
-    for (const auto& [key, amount] : outputs) all[key] += amount;
+    if (!routeProspect) for (const auto& [key, amount] : outputs) all[key] += amount;
+    for (const auto& [key, amount] : crafted) all[key] += amount;
     g_OutputSource = "worker";
     for (const auto& [key, total] : all) {
         int type = -1, item = -1; AfkExpedition::ParseOutputKey(key, type, item);
@@ -2741,6 +2862,7 @@ static void CmdWorkerDeliver(const std::string& planPath)
     };
     o << "{\"schema\":1,\"delivery_id\":\"" << JsonEscape(id) << "\",\"state\":\"" << (error.empty() ? "done" : "error") << "\",\"error\":\"" << JsonEscape(error)
       << "\",\"created\":" << map(created) << ",\"requested\":" << map(make) << ",\"prospected\":" << map(prospect) << ",\"prospect_outputs\":" << map(outputs)
+      << ",\"routed\":" << (routeProspect ? "true" : "false") << ",\"crafted\":" << map(crafted)
       << ",\"stacks\":" << stacks << ",\"items\":" << g_SpoolItems << ",\"spool\":\"" << JsonEscape(DATA_ROOT + "\\spool\\" + id + ".ndjson")
       << "\",\"character\":" << CharacterStampJson() << ",\"room\":\"" << JsonEscape(CurrentRoomName()) << "\",\"at\":\"" << NowIso()
       << "\",\"plugin\":\"" AFK_EXPEDITION_VERSION "\"}";
@@ -3080,7 +3202,8 @@ static void RunCommand(const std::string& raw)
         // worker pay <request-id> <gold> | worker deliver <plan.json> (tools/workers.py)
         if (w1 == "pay") { std::string amount; ss >> amount; CmdWorkerPay(w2, amount); return; }
         if (w1 == "deliver") { std::string rest; std::getline(ss, rest); CmdWorkerDeliver(w2 + rest); return; }
-        Out("worker: usage -> worker pay <request-id> <gold> | worker deliver <plan.json>"); return;
+        if (w1 == "recipes") { CmdWorkerRecipes(w2); return; }
+        Out("worker: usage -> worker pay <request-id> <gold> | worker deliver <plan.json> | worker recipes <request-id>"); return;
     }
     if (w0 == "goto") {
         // goto <RoomName>: travel with the game's own RoomGoto (what a portal

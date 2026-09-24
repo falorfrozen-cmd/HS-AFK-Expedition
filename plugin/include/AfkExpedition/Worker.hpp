@@ -73,4 +73,26 @@ inline bool ValidPayment(double amount)
     return std::isfinite(amount) && amount >= 1 && amount <= kMaxWorkerPayment && std::floor(amount) == amount;
 }
 
+// The Jeweler (0.8): the game's jewelcrafting recipes (the craft cube's table,
+// result types 37-41) make socketables 15:78-96 (jewels, gems) from the jewel
+// materials 14:0-23 and the Enchanted Sigil 14:44. The panel plans crafts from
+// the recipes the plugin read live; the plugin checks every recipe again, reads
+// it from the game once more and creates only its output.
+constexpr int kSocketableType = 15;
+inline bool JewelRecipeType(int resultType) { return resultType >= 37 && resultType <= 41; }
+inline bool JewelOutput(int type, int id) { return type == kSocketableType && id >= 78 && id <= 96; }
+inline bool JewelInput(int type, int id) { return type == kMaterialType && ((id >= 0 && id <= 23) || id == 44); }
+struct JewelPart { int type = -1; int id = -1; long long amount = 0; };
+struct JewelRecipe { int index = -1; int resultType = -1; JewelPart output; std::vector<JewelPart> inputs; };
+// A recipe the Jeweler may use: a jewel result, a socketable output and jewel
+// inputs only, every amount a whole number within a native stack.
+inline bool UsableJewelRecipe(const JewelRecipe& r)
+{
+    if (!JewelRecipeType(r.resultType) || !JewelOutput(r.output.type, r.output.id)) return false;
+    if (r.output.amount < 1 || r.output.amount > kNativeStackMax || r.inputs.empty()) return false;
+    for (const auto& p : r.inputs)
+        if (!JewelInput(p.type, p.id) || p.amount < 1 || p.amount > kNativeStackMax) return false;
+    return true;
+}
+
 }  // namespace AfkExpedition

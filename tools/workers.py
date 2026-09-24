@@ -26,6 +26,7 @@ from pathlib import Path
 import camp
 import traits
 import worker_loot
+import worker_jeweler
 
 SCHEMA = 2
 MAX_WORKERS = 3                        # the crew at Barracks level 1; the camp raises it
@@ -40,7 +41,7 @@ NAME = re.compile(r"[A-Za-z0-9 '\-]{1,24}\Z")
 ID = re.compile(r'w_[a-f0-9]{8}\Z')
 TYPE_NAMES = dict(miner='Miner', adventurer='Adventurer', goblin_hunter='Goblin Hunter', jeweler='Jeweler')
 ROUTES = ('vault', 'stock')             # where a miner's Gem Sense materials go: the Vault, or the Jeweler's stock
-STOCK_ROUTE_READY = False               # the plugin must roll without making (route_prospect) before 'stock' is offered
+STOCK_ROUTE_READY = True                # plugin 0.8: route_prospect rolls without making; the stock only counts a 'routed' result
 
 # Ore tiers in the order the game's mining nodes know them (material bases
 # 27-32, SDK ItemType Material = 14): unlock level, dig speed, ore per dig and
@@ -80,7 +81,7 @@ TREE = (
          text='4% chance per rank per trip hour that an Ore Goblin leaves a bonus haul (ten digs of the trip ore).'),
 )
 NODES = {n['id']: n for n in TREE}
-TREES = {'miner': TREE, **worker_loot.TREES}
+TREES = {'miner': TREE, **worker_loot.TREES, 'jeweler': worker_jeweler.TREE}
 TARGETS = {'miner': [o['key'] for o in ORES]}      # a miner's hot spots are ores; the others' are recorded regions
 NEUTRAL_MODS = dict(speed=1.0, amount=1.0, xp=1.0, rare=1.0, tool=0.0, hotspot=0.0, bonus_find=0.0)
 
@@ -148,6 +149,8 @@ def unlocked(worker: dict) -> list[dict]:
 
 # ------------------------------------------------------------------ effects
 def max_trip_hours(worker: dict) -> float:
+    if worker.get('type') == 'jeweler':
+        return worker_jeweler.max_trip_hours(worker)
     if worker.get('type', 'miner') != 'miner':
         return worker_loot.max_trip_hours(worker)
     return BASE_TRIP_HOURS + ranks(worker, 'long_shift') + traits.effects(worker.get('traits'))['max_hours']
@@ -155,6 +158,8 @@ def max_trip_hours(worker: dict) -> float:
 
 def time_factor(worker: dict) -> float:
     """Real hours per hour of work (Quick Hands, time traits); never below half."""
+    if worker.get('type') == 'jeweler':
+        return worker_jeweler.time_factor(worker)
     if worker.get('type', 'miner') != 'miner':
         return worker_loot.time_factor(worker)
     return max(0.5, (1.0 - 0.04 * ranks(worker, 'quick_hands')) * (1.0 + traits.effects(worker.get('traits'))['time']))
@@ -178,8 +183,8 @@ def trip_mods(state: dict, worker: dict, target, hours: float, team=None, at=Non
     eff = camp.effects(state['camp'])
     tr = traits.effects(worker.get('traits'), hours=hours, team=team, target=target)
     tool = camp.tool_bonus(worker.get('type', 'miner'), worker.get('tool', 0))
-    hot = camp.hotspot_bonus(state['camp'], hotspot_targets() if worker.get('type', 'miner') != 'miner' else TARGETS,
-                             worker.get('type', 'miner'), target, at)
+    regional = worker.get('type') in ('adventurer', 'goblin_hunter')   # only their hot spots are recorded regions
+    hot = camp.hotspot_bonus(state['camp'], hotspot_targets() if regional else TARGETS, worker.get('type', 'miner'), target, at)
     bonus = eff['all_bonus']
     return dict(speed=round(1 + tr['speed'] + hot + bonus + (tool if worker.get('type', 'miner') == 'miner' else 0.0), 6),
                 amount=round(max(0.1, 1 + tr['amount'] + bonus), 6),
@@ -383,11 +388,14 @@ def retrain(state: dict, worker_id, which: str) -> dict:
 
 
 # ------------------------------------------------------------------ trips
-def start_trip(state: dict, worker_id, ore_id, hours, at=None, seed=None, pool: dict | None = None) -> dict:
-    """Send a worker out: a miner to an ore (``ore_id``), an adventurer or goblin hunter to a recorded region."""
+def start_trip(state: dict, worker_id, ore_id, hours, at=None, seed=None, pool: dict | None = None, recipes: dict | None = None) -> dict:
+    """Send a worker out: a miner to an ore (``ore_id``), an adventurer or goblin hunter to a recorded region,
+    a jeweler to one of the game's jewel recipes (its index)."""
     worker = find(state, worker_id)
     if worker.get('trip'):
         raise ValueError(f"{worker['name']} is already on a trip.")
+    if worker.get('type') == 'jeweler':
+        return worker_jeweler.start_trip(state, worker, ore_id, hours, recipes or {}, at, seed)
     if worker.get('type', 'miner') != 'miner':
         return worker_loot.start_trip(state, worker, ore_id, hours, at, seed, pool)
     ore = ORE_BY_ID.get(ore_id) if type(ore_id) is int else None
@@ -418,6 +426,8 @@ def trip_view(worker: dict, at=None) -> dict | None:
                mods=dict(NEUTRAL_MODS, **(trip.get('mods') or {})))
     if 'ore' in trip:
         out.update(ore=trip['ore'], ore_name=ORE_BY_ID[trip['ore']]['name'], target_name=ORE_BY_ID[trip['ore']]['name'], route=trip.get('route', 'vault'))
+    elif 'recipe' in trip:
+        out.update(recipe=trip['recipe'], target_name=trip.get('recipe_name'), planned=trip.get('planned'))
     else:
         out.update(region=trip['region'], target_name=trip['region'], keys=dict(trip.get('keys') or {}))
     return out
@@ -431,6 +441,7 @@ def cancel_trip(state: dict, worker_id) -> None:
     if trip.get('delivery'):
         raise ValueError('This haul is already being delivered; collect it instead.')
     worker_loot.return_keys(state, trip)
+    worker_jeweler.return_stock(state, trip)
     worker['trip'] = None
 
 
@@ -538,7 +549,8 @@ def apply_delivery(state: dict, worker_id, plan: dict, result: dict, at=None) ->
     stats['motherlodes'] = stats.get('motherlodes', 0) + plan.get('motherlodes', 0)
     kept = camp.add(state['camp'], plan.get('resources') or {})
     stats['stone'] = stats.get('stone', 0) + kept.get('stone', 0)
-    stocked = camp.add_stock(state['camp'], outputs) if plan.get('route_prospect') else {}
+    # Only a result that says the materials were rolled but not made fills the stock (an older plugin makes them).
+    stocked = camp.add_stock(state['camp'], outputs) if plan.get('route_prospect') and result.get('routed') is True else {}
     mentor = camp.effects(state['camp'])['mentor']
     taught = {}
     if mentor and plan['xp']:

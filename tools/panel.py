@@ -12,7 +12,7 @@ import loot_filter
 import notify
 import calibration, recovery, validate_farm
 import collection
-import workers, camp, traits, worker_loot
+import workers, camp, traits, worker_loot, worker_jeweler
 from product_data import Presentation, SUPPORT, support_warnings
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -856,6 +856,10 @@ class Panel:
         out['regions']={kind:[dict(room=room,name=names.get(room,room),recorded=found) for room,found in sorted(worker_loot.regions(kind,pool).items())]
                         for kind in ('adventurer','goblin_hunter')}
         out['chests']=[dict(c) for c in worker_loot.CHESTS];out['goblins']=[dict(g) for g in worker_loot.GOBLINS];out['key_names']=worker_loot.KEY_NAMES
+        kept=worker_jeweler.load_recipes(self.data);bench=camp.effects(state['camp'])['recipe_tier']
+        out['recipes']=[dict(worker_jeweler.recipe_view(r),affordable=worker_jeweler.affordable(state['camp']['stock'],r),bench_ok=bench>=worker_jeweler.TIER_BY_TYPE[r['result_type']]['tier'])
+                        for r in kept['recipes']]
+        out['material_names']=worker_jeweler.MATERIAL_NAMES;out['jewel_names']=worker_jeweler.JEWEL_NAMES
         workers.save(self.data,state)   # candidates rolled for the first time are kept
         return out
 
@@ -975,13 +979,15 @@ class Panel:
         """Deliver one worker's haul through the game, then send it to the Vault."""
         state=workers.load(self.data);w=workers.find(state,worker_id);trip=w.get('trip')
         require(trip,f"{w['name']} is not on a trip.")
-        if w.get('type','miner')!='miner':return self.collect_loot(worker_id)
+        if w.get('type','miner') in ('adventurer','goblin_hunter'):return self.collect_loot(worker_id)
+        jeweler=w.get('type')=='jeweler'
         if trip.get('delivery'):
             path=Path(trip['delivery']['plan']);plan=read(path,{}) or {}
             require(plan.get('delivery_id')==trip['delivery']['delivery_id'],'The planned haul is missing; it was not made again.')
         else:
-            view=workers.trip_view(w);plan=workers.delivery_plan(w,trip,view['credited_work_hours'])
-            require(plan['items'] or plan['prospect'],f"{w['name']} has not mined anything yet.")
+            view=workers.trip_view(w)
+            plan=(worker_jeweler.delivery_plan if jeweler else workers.delivery_plan)(w,trip,view['credited_work_hours'])
+            require(plan['items'] or plan['prospect'] or plan.get('crafts') or jeweler,f"{w['name']} has not {'made' if jeweler else 'mined'} anything yet.")
             path=self.data/'plans'/f"{plan['delivery_id']}.json";afk.write_json(path,plan)
             trip['delivery']=dict(delivery_id=plan['delivery_id'],plan=str(path),planned_at=plan['planned_at'])
             workers.save(self.data,state)
@@ -999,6 +1005,14 @@ class Panel:
         require(result.get('state')=='done',f"The haul stopped part way ({result.get('error') or 'no reason given'}). What was made stays in its records; "
                 'nothing is made twice. Close the haul as partial to keep that part.')
         state=workers.load(self.data)
+        if jeweler:
+            applied=worker_jeweler.apply(state,workers.find(state,worker_id),plan,result);workers.save(self.data,state)
+            who=applied['worker'];made=sum(int(n) for n in (result.get('crafted') or {}).values())
+            self.log(f"{who['name']}: +{plan['xp']:,} XP"+(f", now level {who['level']}" if applied['levels'] else '')
+                     +f"; {made:,} jewels made ({plan['craft_count']:,} crafts"+(f", {plan['extra']:,} extra" if plan['extra'] else '')+')'
+                     +f"; +{applied['camp'].get('dust',0):,} gem dust for the camp.")
+            if made:self.transfer_worker_haul(ident,who['name'])
+            return applied
         applied=workers.apply_delivery(state,worker_id,plan,result);workers.save(self.data,state)
         w=applied['worker']
         stone=(applied.get('camp') or {}).get('stone',0)
@@ -1045,6 +1059,17 @@ class Panel:
             if haul['fled']:what+=f", {haul['fled']:,} fled"
         self.log(f"{who['name']}: +{haul['xp']:,} XP"+(f", now level {who['level']}" if applied['levels'] else '')+f"; {what}; +{applied['camp'].get('spoils',0):,} spoils for the camp.")
         return applied
+
+    def read_jewel_recipes(self,force=False):
+        """The game's jewel recipes: kept per game build, read again from the running game when needed."""
+        kept=worker_jeweler.load_recipes(self.data);build=(read(self.data/'build.json',{}) or {}).get('game_build')
+        if kept['recipes'] and kept.get('build')==build and not force:return kept
+        request=uuid.uuid4().hex;reply=afk.Ipc(self.game_bin()).send(f'afk worker recipes {request}',timeout=30)
+        path=self.data/'models'/f'jewel-recipes-{request}.json';answer=read(path,{}) or {}
+        path.unlink(missing_ok=True)
+        require(reply is not None and answer.get('ok') is True,"The game's jewel recipes could not be read: "+(answer.get('error') or 'open the game with an offline hero loaded')+'.')
+        kept=worker_jeweler.keep_recipes(self.data,answer,build)
+        self.log(f"Read {len(kept['recipes'])} jewel recipes from the game.");return kept
 
     def transfer_worker_haul(self,ident,name=None):
         """Send a delivered haul to the Vault (AFK Materials); retry later if the editor is closed."""
@@ -1133,11 +1158,19 @@ class Panel:
             self.log(f"{w['name']} learned {workers.nodes_for(w)[args['skill']]['name']} (rank {workers.ranks(w,args['skill'])}).");return
         if name=='worker_rename':
             w=workers.rename(state,args.get('worker'),args.get('name'));workers.save(self.data,state);self.log(f"Renamed to {w['name']}.");return
+        if name=='worker_recipes':
+            self.read_jewel_recipes(force=True);return
         if name=='worker_start':
             target=args.get('ore') if args.get('region') is None else args.get('region')
-            trip=workers.start_trip(state,args.get('worker'),target,args.get('hours',1));workers.save(self.data,state)
+            recipes=None
+            if workers.find(state,args.get('worker')).get('type')=='jeweler':
+                target=args.get('recipe');recipes=self.read_jewel_recipes()
+            trip=workers.start_trip(state,args.get('worker'),target,args.get('hours',1),recipes=recipes);workers.save(self.data,state)
             w=workers.find(state,args.get('worker'))
-            if 'ore' in trip:
+            if 'recipe' in trip:
+                self.log(f"{w['name']} sat down at the Jeweler's Bench: {trip['planned']:,} x {trip['recipe_name']} in {trip['work_hours']:g} h "
+                         f"(ready in {trip['real_hours']:.2f} h); the materials left the stock.")
+            elif 'ore' in trip:
                 self.log(f"{w['name']} went mining {workers.ORE_BY_ID[trip['ore']]['name']} for {trip['work_hours']:g} h of work (back in {trip['real_hours']:.2f} h).")
             else:
                 keys=', '.join(f"{n} {worker_loot.KEY_NAMES.get(int(k),'key')}" for k,n in (trip.get('keys') or {}).items())
