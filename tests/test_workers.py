@@ -168,7 +168,9 @@ class PanelWorkerTests(unittest.TestCase):
         # would schedule real "haul ready" tasks on this computer).
         patchers = [patch.object(self.app, 'fresh', return_value=self.live), patch.object(self.app, 'cli'),
                     patch.object(self.app, 'sync_notification'), patch.object(panel.notify, 'sync_all', side_effect=AssertionError('Task Scheduler')),
-                    patch.object(panel.notify, 'toast', side_effect=AssertionError('Windows notification'))]
+                    patch.object(panel.notify, 'toast', side_effect=AssertionError('Windows notification')),
+                    # never read the player's recorded packets from a test
+                    patch.object(panel.worker_loot, 'pools', return_value=dict(build='B', chests={}, goblins={}))]
         for p in patchers: p.start(); self.addCleanup(p.stop)
 
     def run_action(self, name, args, game):

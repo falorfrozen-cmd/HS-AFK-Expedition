@@ -15,7 +15,7 @@ os.environ['AFK_NOTIFY_DISABLED']='1'
 with tempfile.TemporaryDirectory(prefix='afk-panel-qa-') as tmp:
     os.environ['LOCALAPPDATA']=tmp
     sys.path.insert(0,str(ROOT/'tools'))
-    import afk,panel,siege,workers
+    import afk,panel,siege,workers,worker_loot
     hero=dict(identity_version=2,slot=2,name='Suh',**{'class':8},class_name='Samurai',level=100)
     other=dict(identity_version=2,slot=5,name='SeraphTest',**{'class':14},class_name='White Mage',level=1)
     panel.characters=lambda data:[hero,other]
@@ -72,6 +72,16 @@ with tempfile.TemporaryDirectory(prefix='afk-panel-qa-') as tmp:
     a['skills']=dict(swift_pick=3,full_cart=3,long_shift=2,keen_eye=2,gem_sense=2,foreman=1)
     workers.start_trip(crew,a['id'],29,6,at=now-timedelta(hours=7),seed=3)
     b=workers.new_worker(crew,'Dulga',worker_traits=[dict(id='quick_learner')]);workers.start_trip(crew,b['id'],27,2,at=now-timedelta(minutes=30),seed=4)
+    # Recorded world chests (Act_01_01) and loot goblins (Act_03_03) of the fixture's build; an adventurer
+    # back from a trip with keys along; Basic and Crystal keys on the rack.
+    afk.write_json(afk.DATA/'build.json',dict(game_build='QA'))
+    for h,obj,room,first,key in (('1','Chest_Drop_obj','Act_01_01',2,''),('2','Chest_Drop_obj','Act_01_01',3,''),('3','Chest_Drop_obj','Act_01_01',4,''),
+                                 ('4','Goblin_Treasure_obj','Act_03_03',5,'treasure_goblin'),('5','Goblin_Rune_obj','Act_03_03',5,'goblinRune')):
+        afk.write_json(afk.PACKETS/(h*64+'.json'),dict(packet_hash=h*64,self_object=obj,room=room,game_build_id='QA',monster_key=key,args=[first,0],protected=dict(dSlots=3)))
+    crew['camp']['keys']={'0':6,'1':2}
+    c=workers.new_worker(crew,'Kara',worker_type='adventurer',worker_traits=[dict(id='lucky')]);c['xp']=sum(workers.xp_to_next(l) for l in range(1,9));c['level']=9
+    c['skills']=dict(lockpicking=2,treasure_sense=3)
+    workers.start_trip(crew,c['id'],'Act_01_01',2,at=now-timedelta(hours=3),seed=6)
     workers.save(afk.DATA,crew)
     control=Path(tmp)/'control.json';stop=Path(tmp)/'stop'
     afk.write_json(control,dict(gold=5000000,live=dict(character=other,room='Act_01_01',capture_on=False,replay_running=False,game_build='QA',farm_context=dict(hash='b'*64))))
@@ -107,6 +117,11 @@ with tempfile.TemporaryDirectory(prefix='afk-panel-qa-') as tmp:
             # A delivery the game would make, simulated: the planned haul is "created" as-is.
             state=workers.load(self.data);w=workers.find(state,worker_id);trip=w.get('trip')
             if not trip:raise ValueError(f"{w['name']} is not on a trip.")
+            if w['type']!='miner':
+                # An adventurer's or goblin hunter's replay, simulated: every planned call "drops" one item.
+                plan=worker_loot.delivery_plan(w,trip,workers.trip_view(w)['credited_work_hours'],self.fresh()['character'],'fixture','keep')
+                applied=worker_loot.apply(state,w,plan,dict(calls_done=plan['preview']['calls'],items=plan['preview']['calls'],gold=0));workers.save(self.data,state)
+                self.log(f"Fixture: {w['name']} brought {plan['preview']['calls']:,} replays (+{plan['haul']['xp']:,} XP, +{applied['camp'].get('spoils',0):,} spoils).");return applied
             plan=workers.delivery_plan(w,trip,workers.trip_view(w)['credited_work_hours'])
             created={f"{i['type']}:{i['id']}":i['amount'] for i in plan['items']}
             outputs={'14:9':max(1,sum(plan['prospect'].values())//3)} if plan['prospect'] else {}
