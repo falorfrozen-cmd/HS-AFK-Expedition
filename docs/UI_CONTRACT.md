@@ -540,6 +540,31 @@ carry `traits`, `tool` and `type_name` too. A trip stores `mods` (its multiplier
 from traits, the camp and the hot spot, frozen at the start): `speed`, `amount`,
 `xp`, `rare`, `tool`, `hotspot`, `bonus_find`; trip views show them.
 
+### Adventurers and goblin hunters
+
+Rules: tools/worker_loot.py module note. They go to a **region** where the plugin
+recorded world chests or loot goblins while the player played; every opened chest
+or caught goblin is one recorded packet of that region replayed through the game's
+drop routine (no experience for the hero; gold picked up; filtered items handled
+like a claim; the Vault label `AFK · Workers · <name> · <date>`).
+
+- `GET /api/workers` adds `regions` {`adventurer`|`goblin_hunter`: [{`room`,
+  `name`, `recorded` {tier or goblin kind: packets}}]} (running game build only),
+  `chests` (tiers: `key`, `name`, `unlock`, `key_id`), `goblins` (kinds: `key`,
+  `name`, `unlock`) and `key_names`. Worker views add `chests` / `goblins` with
+  `unlocked`.
+- `worker_start` {`worker`, `region`, `hours`} sends one (a miner keeps `ore`). An
+  adventurer takes every Basic Key and Crystal Key from the camp's key rack; the
+  keys it did not use come back, and keys it finds go onto the rack. Wooden chests
+  open at level 1, golden (a Basic Key) at 3, crystal (a Crystal Key) at 8;
+  goblins: treasure 1, rune 6, shadow 12, orb 18, ore 24 (once recorded).
+- The trip view has `region`, `target_name`, `keys` instead of the ore fields.
+- `worker_collect` {`worker`} needs an offline hero **standing in the trip's
+  region** (the replay reads the live room); the error says where. It runs
+  `afk.py worker-replay <plan>`; a stopped delivery continues on the next
+  collect, a delivered one is never replayed. The log reports chests (and locked
+  ones), keys found, goblins caught and fled, and the camp's spoils.
+
 ### Siege and the Walls
 
 Siege plans and `/api/siege-forecast` use the gate the Walls give; the forecast adds

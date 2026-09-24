@@ -12,7 +12,7 @@ import loot_filter
 import notify
 import calibration, recovery, validate_farm
 import collection
-import workers, camp, traits
+import workers, camp, traits, worker_loot
 from product_data import Presentation, SUPPORT, support_warnings
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -851,7 +851,11 @@ class Panel:
     def workers_overview(self):
         state=workers.load(self.data);out=workers.overview(state)
         out['candidates']={t:workers.describe_candidates(state,t) for t in camp.effects(state['camp'])['types']}
-        out['hotspots']=camp.hotspots(state['camp'],workers.TARGETS)
+        pool=worker_loot.pools();names=zone_names()
+        out['hotspots']=camp.hotspots(state['camp'],workers.hotspot_targets(pool))
+        out['regions']={kind:[dict(room=room,name=names.get(room,room),recorded=found) for room,found in sorted(worker_loot.regions(kind,pool).items())]
+                        for kind in ('adventurer','goblin_hunter')}
+        out['chests']=[dict(c) for c in worker_loot.CHESTS];out['goblins']=[dict(g) for g in worker_loot.GOBLINS];out['key_names']=worker_loot.KEY_NAMES
         workers.save(self.data,state)   # candidates rolled for the first time are kept
         return out
 
@@ -860,8 +864,12 @@ class Panel:
         for w in workers.load(self.data)['workers']:
             trip=workers.trip_view(w)
             if trip and not trip['ready']:
-                entries.append(notify.entry('worker-'+w['id'],afk.parse_iso(trip['ready_at']),'AFK FARM: haul ready',
-                               f"{w['name']} is back from the mine with {trip['ore_name']}. Open AFK FARM and collect it with any offline hero loaded."))
+                if 'ore' in trip:
+                    text=f"{w['name']} is back from the mine with {trip['ore_name']}. Open AFK FARM and collect it with any offline hero loaded."
+                else:
+                    place=zone_names().get(trip['region'],trip['region'])
+                    text=f"{w['name']} is back from {place}. Open AFK FARM and collect the haul with any offline hero standing in {place}."
+                entries.append(notify.entry('worker-'+w['id'],afk.parse_iso(trip['ready_at']),'AFK FARM: haul ready',text))
         return entries
 
     # A payment request gets exactly one receipt, written by the game when it runs
@@ -967,6 +975,7 @@ class Panel:
         """Deliver one worker's haul through the game, then send it to the Vault."""
         state=workers.load(self.data);w=workers.find(state,worker_id);trip=w.get('trip')
         require(trip,f"{w['name']} is not on a trip.")
+        if w.get('type','miner')!='miner':return self.collect_loot(worker_id)
         if trip.get('delivery'):
             path=Path(trip['delivery']['plan']);plan=read(path,{}) or {}
             require(plan.get('delivery_id')==trip['delivery']['delivery_id'],'The planned haul is missing; it was not made again.')
@@ -996,6 +1005,45 @@ class Panel:
         self.log(f"{w['name']}: +{plan['xp']:,} XP" + (f", now level {w['level']}" if applied['levels'] else '') + f"; {plan['ore_total']:,} ore mined"
                  + (f"; +{stone:,} stone for the camp." if stone else '.'))
         self.transfer_worker_haul(ident,w['name'])
+        return applied
+
+    def collect_loot(self,worker_id):
+        """An adventurer's or goblin hunter's haul: the region's recorded chest or goblin
+        packets replayed through the game (no XP for the hero), then the Vault. The loot
+        replays in the trip's region, so an offline hero must stand there."""
+        state=workers.load(self.data);w=workers.find(state,worker_id);trip=w['trip'];region=trip['region']
+        place=f"{zone_names().get(region,region)} ({region})"
+        s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
+        if trip.get('delivery'):
+            path=Path(trip['delivery']['plan']);plan=read(path,{}) or {}
+            require(plan.get('expedition_id')==trip['delivery']['delivery_id'],'The planned haul is missing; it was not made again.')
+        else:
+            view=workers.trip_view(w);require(view['credited_work_hours']>0,f"{w['name']} has only just left.")
+            prefs=load_preferences(self.data)
+            label='AFK · Workers · '+w['name']+' · '+datetime.now().strftime('%Y-%m-%d')
+            plan=worker_loot.delivery_plan(w,trip,view['credited_work_hours'],s['character'],label,prefs['filtered_items'],prefs['delivery_speed'])
+            path=self.data/'plans'/f"{plan['expedition_id']}.json";afk.write_json(path,plan)
+            trip['delivery']=dict(delivery_id=plan['expedition_id'],plan=str(path),planned_at=plan['planned_at']);workers.save(self.data,state)
+        ident=plan['expedition_id'];result_path=self.data/'sessions'/f'{ident}.result.json'
+        if plan['packets'] and not (read(result_path,{}) or {}).get('rewards_saved'):
+            require(s['room']==region,f"Load any offline hero in {place} to collect {w['name']}'s haul: its loot replays there.")
+            if not (self.data/'sessions'/f'{ident}.progress.json').exists() and not same_character(plan['character'],s['character']):
+                plan['character']=s['character'];afk.write_json(path,plan)   # nothing delivered yet: the hero standing there receives it
+            self.log(f"Delivering {w['name']}'s haul through the game in {place}...")
+            self.cli('worker-replay',path)
+        result=read(result_path,{}) or {}
+        require(not plan['packets'] or result.get('rewards_saved'),'The haul was not delivered completely; collect again to continue where it stopped.')
+        state=workers.load(self.data)
+        applied=worker_loot.apply(state,workers.find(state,worker_id),plan,result);workers.save(self.data,state)
+        haul=plan['haul'];who=applied['worker']
+        if who['type']=='adventurer':
+            what=f"{sum(haul['opened'].values()):,} chests opened ("+', '.join(f"{n} {t}" for t,n in haul['opened'].items() if n)+')'
+            if haul['locked']:what+=f", {haul['locked']:,} left locked without a key"
+            if haul['keys_found']:what+='; keys found: '+', '.join(f"{n} {worker_loot.KEY_NAMES.get(int(k),'key')}" for k,n in haul['keys_found'].items())
+        else:
+            what=f"{sum(haul['caught'].values()):,} goblins caught"+(' ('+', '.join(f"{n} {k}" for k,n in haul['caught'].items())+')' if haul['caught'] else '')
+            if haul['fled']:what+=f", {haul['fled']:,} fled"
+        self.log(f"{who['name']}: +{haul['xp']:,} XP"+(f", now level {who['level']}" if applied['levels'] else '')+f"; {what}; +{applied['camp'].get('spoils',0):,} spoils for the camp.")
         return applied
 
     def transfer_worker_haul(self,ident,name=None):
@@ -1086,9 +1134,15 @@ class Panel:
         if name=='worker_rename':
             w=workers.rename(state,args.get('worker'),args.get('name'));workers.save(self.data,state);self.log(f"Renamed to {w['name']}.");return
         if name=='worker_start':
-            trip=workers.start_trip(state,args.get('worker'),args.get('ore'),args.get('hours',1));workers.save(self.data,state)
+            target=args.get('ore') if args.get('region') is None else args.get('region')
+            trip=workers.start_trip(state,args.get('worker'),target,args.get('hours',1));workers.save(self.data,state)
             w=workers.find(state,args.get('worker'))
-            self.log(f"{w['name']} went mining {workers.ORE_BY_ID[trip['ore']]['name']} for {trip['work_hours']:g} h of work (back in {trip['real_hours']:.2f} h).")
+            if 'ore' in trip:
+                self.log(f"{w['name']} went mining {workers.ORE_BY_ID[trip['ore']]['name']} for {trip['work_hours']:g} h of work (back in {trip['real_hours']:.2f} h).")
+            else:
+                keys=', '.join(f"{n} {worker_loot.KEY_NAMES.get(int(k),'key')}" for k,n in (trip.get('keys') or {}).items())
+                self.log(f"{w['name']} set out for {zone_names().get(trip['region'],trip['region'])} for {trip['work_hours']:g} h (back in {trip['real_hours']:.2f} h)"
+                         +(f", taking {keys} from the key rack." if keys else '.'))
             threading.Thread(target=self.sync_notification,daemon=True).start();return
         if name=='worker_cancel':
             workers.cancel_trip(state,args.get('worker'));workers.save(self.data,state);self.log('Trip cancelled; nothing was mined.')

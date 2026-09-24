@@ -1224,6 +1224,43 @@ def cmd_claim(args) -> None:
         sys.exit(1)
 
 
+@serialized_rewards
+def cmd_worker_replay(args) -> None:
+    """Deliver an adventurer's or goblin hunter's haul (tools/worker_loot.py).
+
+    The plan's recorded chest or goblin packets replay through the game's drop
+    routine like an expedition's kills, with no experience for the hero, then go
+    to the Vault under the worker's label. The hero loaded (any offline hero)
+    must stand in the plan's region. A paused delivery continues where it stopped;
+    a finished one is never replayed again.
+    """
+    plan_path = Path(args.plan)
+    plan = read_json(plan_path)
+    if not isinstance(plan, dict) or not str(plan.get('expedition_id', '')).startswith('worker_') or plan.get('exp') is not False:
+        sys.exit('not a worker haul plan')
+    ident = plan['expedition_id']
+    done = read_json(SESSIONS / f"{ident}.result.json") or {}
+    if done.get('rewards_saved'):
+        print(f"{ident}: already delivered; nothing is replayed twice")
+        return
+    print_preview(plan)
+    pr = run_plan(plan_path, plan, game_bin(args), ingest=not args.no_ingest, forgepact_ignore=True)
+    if pr and pr.get('paused'):
+        if not pr.get('resumable'):
+            sys.exit(1)
+        print("the haul stays planned; collect again to continue from the saved position")
+        sys.exit(3)
+    conversion = (pr or {}).get('conversion') or {}
+    if conversion.get('enabled'):
+        fragments = sum((conversion.get('created') or {}).values())
+        print(f"filtered items: sold {conversion.get('sold_items', 0):,} for {conversion.get('sell_gold', 0):,.0f} gold, "
+              f"broke {conversion.get('prospected_items', 0):,} down into {fragments:,} fragments ({conversion.get('output_stacks', 0)} stacks)")
+    if not run_succeeded(pr):
+        print("the delivery did not finish; the haul stays planned and resumes where it stopped")
+        sys.exit(1)
+    print(f"{ident}: delivered")
+
+
 def cmd_pause(args) -> None:
     """Stop reward delivery at a saved position that a later claim continues.
 
@@ -1539,6 +1576,8 @@ def main(argv=None) -> None:
                    help="items the game's loot filter hides, for a new claim: sell below Satanic and break Satanic and above down like the Prospector, or keep them")
     p.add_argument("--anywhere", action="store_true", help="replay even when not standing in a calibrated zone")
     p.add_argument("--forgepact-ignore", action="store_true", help="replay even if rate-affecting ForgePact settings changed"); p.set_defaults(fn=cmd_claim)
+    p = sub.add_parser("worker-replay", help="deliver an adventurer's or goblin hunter's haul (a worker_*.json replay plan)")
+    p.add_argument("plan"); p.add_argument("--no-ingest", action="store_true"); p.set_defaults(fn=cmd_worker_replay)
     p = sub.add_parser("run"); p.add_argument("plan"); p.add_argument("--no-ingest", action="store_true")
     p.add_argument("--anywhere", action="store_true", help="replay even when not standing in a calibrated zone")
     p.add_argument("--forgepact-ignore", action="store_true", help="replay even if rate-affecting ForgePact settings changed"); p.set_defaults(fn=cmd_run)

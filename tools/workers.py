@@ -25,6 +25,7 @@ from pathlib import Path
 
 import camp
 import traits
+import worker_loot
 
 SCHEMA = 2
 MAX_WORKERS = 3                        # the crew at Barracks level 1; the camp raises it
@@ -79,8 +80,8 @@ TREE = (
          text='4% chance per rank per trip hour that an Ore Goblin leaves a bonus haul (ten digs of the trip ore).'),
 )
 NODES = {n['id']: n for n in TREE}
-TREES = {'miner': TREE}
-TARGETS = {'miner': [o['key'] for o in ORES]}      # what hot spots may point at, per worker type
+TREES = {'miner': TREE, **worker_loot.TREES}
+TARGETS = {'miner': [o['key'] for o in ORES]}      # a miner's hot spots are ores; the others' are recorded regions
 NEUTRAL_MODS = dict(speed=1.0, amount=1.0, xp=1.0, rare=1.0, tool=0.0, hotspot=0.0, bonus_find=0.0)
 
 
@@ -147,11 +148,15 @@ def unlocked(worker: dict) -> list[dict]:
 
 # ------------------------------------------------------------------ effects
 def max_trip_hours(worker: dict) -> float:
+    if worker.get('type', 'miner') != 'miner':
+        return worker_loot.max_trip_hours(worker)
     return BASE_TRIP_HOURS + ranks(worker, 'long_shift') + traits.effects(worker.get('traits'))['max_hours']
 
 
 def time_factor(worker: dict) -> float:
     """Real hours per hour of work (Quick Hands, time traits); never below half."""
+    if worker.get('type', 'miner') != 'miner':
+        return worker_loot.time_factor(worker)
     return max(0.5, (1.0 - 0.04 * ranks(worker, 'quick_hands')) * (1.0 + traits.effects(worker.get('traits'))['time']))
 
 
@@ -173,13 +178,20 @@ def trip_mods(state: dict, worker: dict, target, hours: float, team=None, at=Non
     eff = camp.effects(state['camp'])
     tr = traits.effects(worker.get('traits'), hours=hours, team=team, target=target)
     tool = camp.tool_bonus(worker.get('type', 'miner'), worker.get('tool', 0))
-    hot = camp.hotspot_bonus(state['camp'], TARGETS, worker.get('type', 'miner'), target, at)
+    hot = camp.hotspot_bonus(state['camp'], hotspot_targets() if worker.get('type', 'miner') != 'miner' else TARGETS,
+                             worker.get('type', 'miner'), target, at)
     bonus = eff['all_bonus']
     return dict(speed=round(1 + tr['speed'] + hot + bonus + (tool if worker.get('type', 'miner') == 'miner' else 0.0), 6),
                 amount=round(max(0.1, 1 + tr['amount'] + bonus), 6),
                 xp=round((1 + tr['xp']) * (1 + eff['xp_bonus']), 6),
                 rare=round(max(0.0, 1 + tr['rare'] + eff['rare_bonus']), 6),
                 tool=round(tool, 6), hotspot=round(hot, 6), bonus_find=round(tr['bonus_find'], 6))
+
+
+def hotspot_targets(pool: dict | None = None) -> dict:
+    """What hot spots may point at: ores for miners, recorded regions for adventurers and goblin hunters."""
+    pool = pool or worker_loot.pools()
+    return dict(TARGETS, adventurer=sorted(worker_loot.regions('adventurer', pool)), goblin_hunter=sorted(worker_loot.regions('goblin_hunter', pool)))
 
 
 # ------------------------------------------------------------------ state
@@ -371,12 +383,13 @@ def retrain(state: dict, worker_id, which: str) -> dict:
 
 
 # ------------------------------------------------------------------ trips
-def start_trip(state: dict, worker_id, ore_id, hours, at=None, seed=None) -> dict:
+def start_trip(state: dict, worker_id, ore_id, hours, at=None, seed=None, pool: dict | None = None) -> dict:
+    """Send a worker out: a miner to an ore (``ore_id``), an adventurer or goblin hunter to a recorded region."""
     worker = find(state, worker_id)
     if worker.get('trip'):
         raise ValueError(f"{worker['name']} is already on a trip.")
     if worker.get('type', 'miner') != 'miner':
-        raise ValueError(f"{worker['name']} does not mine.")
+        return worker_loot.start_trip(state, worker, ore_id, hours, at, seed, pool)
     ore = ORE_BY_ID.get(ore_id) if type(ore_id) is int else None
     if not ore:
         raise ValueError('Choose an ore.')
@@ -399,10 +412,15 @@ def trip_view(worker: dict, at=None) -> dict | None:
     started = parse_iso(trip['started_at'])
     elapsed = max(0.0, ((at or now_utc()) - started).total_seconds() / 3600)
     done = min(1.0, elapsed / trip['real_hours']) if trip['real_hours'] > 0 else 1.0
-    return dict(ore=trip['ore'], ore_name=ORE_BY_ID[trip['ore']]['name'], work_hours=trip['work_hours'], real_hours=trip['real_hours'],
-                started_at=trip['started_at'], ready_at=iso(started + timedelta(hours=trip['real_hours'])), progress=round(done, 4),
-                ready=done >= 1.0, credited_work_hours=round(trip['work_hours'] * done, 6), planned=bool(trip.get('delivery')),
-                mods=dict(NEUTRAL_MODS, **(trip.get('mods') or {})), route=trip.get('route', 'vault'))
+    out = dict(work_hours=trip['work_hours'], real_hours=trip['real_hours'],
+               started_at=trip['started_at'], ready_at=iso(started + timedelta(hours=trip['real_hours'])), progress=round(done, 4),
+               ready=done >= 1.0, credited_work_hours=round(trip['work_hours'] * done, 6), planned=bool(trip.get('delivery')),
+               mods=dict(NEUTRAL_MODS, **(trip.get('mods') or {})))
+    if 'ore' in trip:
+        out.update(ore=trip['ore'], ore_name=ORE_BY_ID[trip['ore']]['name'], target_name=ORE_BY_ID[trip['ore']]['name'], route=trip.get('route', 'vault'))
+    else:
+        out.update(region=trip['region'], target_name=trip['region'], keys=dict(trip.get('keys') or {}))
+    return out
 
 
 def cancel_trip(state: dict, worker_id) -> None:
@@ -412,6 +430,7 @@ def cancel_trip(state: dict, worker_id) -> None:
         raise ValueError(f"{worker['name']} is not on a trip.")
     if trip.get('delivery'):
         raise ValueError('This haul is already being delivered; collect it instead.')
+    worker_loot.return_keys(state, trip)
     worker['trip'] = None
 
 
@@ -549,7 +568,11 @@ def view(worker: dict, at=None, state: dict | None = None) -> dict:
                 max_trip_hours=max_trip_hours(worker), time_factor=time_factor(worker),
                 respec_price=respec_price(worker, state), retrain_price=retrain_price(worker),
                 ores=[dict(id=o['id'], name=o['name'], unlock=o['unlock'], unlocked=level >= o['unlock'],
-                           digs_per_hour=round(digs_per_hour(worker, o, BASE_TRIP_HOURS), 2)) for o in ORES],
+                           digs_per_hour=round(digs_per_hour(worker, o, BASE_TRIP_HOURS), 2)) for o in ORES] if worker.get('type', 'miner') == 'miner' else [],
+                chests=[dict(key=c['key'], name=c['name'], unlock=c['unlock'], unlocked=level >= c['unlock'], key_name=worker_loot.KEY_NAMES.get(c['key_id']))
+                        for c in worker_loot.CHESTS] if worker.get('type') == 'adventurer' else [],
+                goblins=[dict(key=g['key'], name=g['name'], unlock=g['unlock'], unlocked=level >= g['unlock'])
+                         for g in worker_loot.GOBLINS] if worker.get('type') == 'goblin_hunter' else [],
                 trip=trip_view(worker, at), stats=worker.get('stats') or {}, history=(worker.get('history') or [])[:5],
                 hired_at=worker.get('hired_at'))
 
