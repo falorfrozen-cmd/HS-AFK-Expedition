@@ -832,7 +832,8 @@ The fight (`battle.py`, one-second steps):
   `rank_names`, `tiers`, `events`, `affixes` {id: {`name`, effects}}, `towers`.
 
 A siege view:
-- identity and clock: `id`, `room`, `region`, `level`, `started_at`, `ends_at`,
+- identity and clock: `id`, `room`, `region`, `level`, `started_at`, `ends_at`
+  (the planned end, or the retreat, until the siege is over; then the real end),
   `waves_total`, `waves_done`, `wave` (the one coming), `next_wave_at`, `over`,
   `outcome`;
 - defences: `walls` {side: {`hp`, `max`}}, `keep`, `stone_left`, `stone_budget`;
@@ -985,11 +986,22 @@ founding time and the watch, so every page agrees.
 | `coffer_deposit` | `amount` | an offline hero loaded (purchase path, receipt) |
 | `coffer_collect` | `amount` (up to the coffer, at most 500,000,000) | an offline hero loaded (`afk worker credit`, receipt) |
 | `stock_send` | `items` {"type:id": n} | an offline hero loaded |
+| `stock_close_partial` | – | an offline hero loaded; only a stopped shipment |
 
 For `stock_send`, the game makes each stack with its ground-drop routine (a
-`worker_town_` delivery), then the Vault takes them. A shipment that made nothing
-gives the goods back. One that stopped part way keeps what it made, for review,
-and is never made twice.
+`worker_town_` delivery), then the Vault takes them. What can happen:
+- **The game refused the plan.** Nothing was made, and the goods go back into
+  the stock.
+- **The game did not answer in time.** The shipment stays planned (`town.sending`)
+  and is never given back while the game may still make it. The next
+  `stock_send` finishes it first; the goods asked for then are not taken.
+- **It stopped part way.** `stock_close_partial` sends what was made to the Vault
+  and puts the rest back into the stock.
+
+Nothing is ever made twice.
+
+A payout the game answered without writing a receipt is kept as `review`, like
+one refused after the gold rose.
 
 ### Files (0.9)
 
