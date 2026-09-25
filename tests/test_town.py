@@ -128,6 +128,16 @@ class TownFolder(unittest.TestCase):
     def edit(self, fn):
         st = self.state(); fn(st); self.app.town_save(st)
 
+    def age(self, minutes):
+        """Move the siege's clock back, as if ``minutes`` passed."""
+        st = self.state()
+        path = Path(st['town']['siege']['path'])
+        record = json.loads(path.read_text(encoding='utf-8'))
+        started = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=minutes)
+        record['started_at'] = afk.iso(started)
+        afk.write_json(path, record)
+        return record
+
     def fund(self, gold=0, stone=0, **levels):
         def change(st):
             st['trade']['coffer'] = gold
@@ -230,16 +240,6 @@ class SiegeTests(TownFolder):
         self.fund(gold=0, stone=1_000, **dict(dict(walls=2, hq=2, workshop=1), **levels))
         self.edit(lambda st: st['town']['towers'].update(t1=dict(id='t1', kind='ballista', level=3, place='keep', priority=None, perk=None)))
         return self.act('defense_start', room=ROOM, level=level, hours=hours, heroes=list(heroes), stone=stone)
-
-    def age(self, minutes):
-        """Move the siege's clock back, as if ``minutes`` passed."""
-        st = self.state()
-        path = Path(st['town']['siege']['path'])
-        record = json.loads(path.read_text(encoding='utf-8'))
-        started = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=minutes)
-        record['started_at'] = afk.iso(started)
-        afk.write_json(path, record)
-        return record
 
     def test_a_towers_only_siege_runs_on_the_clock_and_settles_once(self):
         self.start()
@@ -376,6 +376,71 @@ class SiegeTests(TownFolder):
             self.act('defense_start', room=ROOM, level=1, hours=1, heroes=[dict(slot=1)], stone=0)
         with self.assertRaisesRegex(ValueError, 'only 0 stone'):
             self.act('defense_start', room=ROOM, level=1, hours=1, heroes=[], stone=10)
+
+
+class WatchTests(TownFolder):
+    def watch(self, **args):
+        self.fund(gold=0, stone=1_000, walls=2, hq=2, workshop=1)
+        self.edit(lambda st: st['town']['towers'].update(t1=dict(id='t1', kind='ballista', level=3, place='keep', priority=None, perk=None)))
+        return self.act('defense_watch', **dict(dict(room=ROOM, level=2, hours=0.25, stone=0), **args))
+
+    def test_the_watch_keeps_sieges_coming_back_to_back_and_catches_up(self):
+        self.watch()
+        first = self.state()['town']['siege']
+        self.assertTrue(first['watch'])
+        self.age(40)                                  # three 5-minute waves each: two sieges ended meanwhile
+        self.app.settle_town_late()
+        st = self.state()
+        ended = [h for h in st['town']['history']]
+        self.assertEqual(len(ended), 2)
+        self.assertTrue(all(h['watch'] for h in ended))
+        self.assertEqual(ended[1]['id'], first['id'])
+        self.assertEqual(st['town']['siege']['started_at'], ended[0]['ended_at'], 'the next siege starts where the last ended')
+        self.assertFalse(st['town']['siege']['settled'])
+        self.assertEqual(st['town']['watch']['started'], 3)
+        with self.assertRaisesRegex(ValueError, "already under siege \\(the watch's\\)"):
+            self.act('defense_start', room=ROOM, level=1, hours=0.25, heroes=[], stone=0)
+        self.act('defense_watch', off=True)
+        self.assertIsNone(self.state()['town']['watch'])
+        self.assertFalse(self.state()['town']['siege']['settled'], 'the siege under way runs to its end')
+
+    def test_the_watch_pauses_while_town_shares_wait_and_needs_towers(self):
+        with self.assertRaisesRegex(ValueError, 'The watch needs towers'):
+            self.fund(stone=0, walls=1); self.act('defense_watch', room=ROOM, level=1, hours=0.25, stone=0)
+        self.watch()
+        def waiting(st):
+            st['town']['siege']['settled'] = True
+            st['town']['history'] = [dict(id=f'old{i}', path='x', room=ROOM, region=ROOM, level=1, outcome='held', waves=3, waves_total=3,
+                                          kills=1, spoils=0, stone_back=0, ended_at='2026-09-25T00:00:00Z', record={}, town_collected=False)
+                                     for i in range(8)]
+        self.edit(waiting)
+        self.app.settle_town_late()
+        self.assertEqual(self.state()['town']['watch']['paused'], '8 town shares wait to be collected')
+        self.assertEqual(len(self.app.defense_view()['waiting']), 8)
+
+    def test_a_waiting_town_share_is_never_dropped_from_the_history(self):
+        rows = [dict(id=f's{i}', town_collected=i != 25) for i in range(30)]
+        kept = town.keep_history(rows, dict(id='new', town_collected=False))
+        self.assertEqual(len(kept), 21)
+        self.assertEqual(kept[0]['id'], 'new'); self.assertEqual(kept[-1]['id'], 's25')
+
+    def test_every_waiting_share_of_the_region_is_collected_oldest_first(self):
+        self.watch()
+        self.age(40)
+        self.app.settle_town_late()
+        collected = []
+        def replay(*args):
+            plan = json.loads(Path(args[1]).read_text(encoding='utf-8'))
+            collected.append(plan['defense_id'])
+            afk.write_json(self.d / 'sessions' / f"{plan['expedition_id']}.result.json", dict(rewards_saved=True))
+        self.app.cli.side_effect = replay
+        self.act('defense_watch', off=True)
+        self.act('defense_collect', all=True)
+        history = self.state()['town']['history']
+        self.assertTrue(all(h['town_collected'] for h in history))
+        self.assertEqual(collected, [h['id'] for h in reversed(history)])
+        with self.assertRaisesRegex(ValueError, 'No town share waits'):
+            self.act('defense_collect', all=True)
 
 
 class TradeTests(TownFolder):

@@ -450,6 +450,12 @@ and orbs.
 The Watchtower scouts the next wave. Use **Suggest level** to see how high your
 town usually holds.
 
+**Keep watch** to let the town defend itself while you play or sleep. Your
+towers take on one siege after another at the level you choose, and if AFK FARM
+was closed, it catches up on the missed sieges when you open it again. The
+watch pauses when eight town shares wait: collect them all at once with any
+hero standing in that region.
+
 ### Merchants
 
 The Market Square draws a travelling merchant now and then. Each stays a few hours

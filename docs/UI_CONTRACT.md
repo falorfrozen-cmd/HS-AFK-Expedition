@@ -864,7 +864,24 @@ Simulated; it takes a few seconds, so ask for it on demand, never on a timer.
 | `defense_start` | `room`, `level` (1-60), `hours` (0.25-8), `heroes` [{`slot`, `stance` (`roam` or a side)}], `stone` (the budget, 0 or more) | no; each hero needs a usable calibration in that region and must be free |
 | `defense_repair` | `stone` | no; between waves, from the camp's stone; re-draws only the waves still to come |
 | `defense_retreat` | – | no; ends the siege after the waves fought |
-| `defense_collect` | `siege` (optional id) | any offline hero standing in the siege's region |
+| `defense_collect` | `siege` (optional id), or `all: true` (every waiting share of the region the hero stands in, oldest first) | any offline hero standing in the siege's region |
+| `defense_watch` | `room`, `level`, `hours`, `stone` (per siege); or `off: true` | no; needs towers |
+
+**The watch** keeps the town under siege with its towers alone, one siege after
+another:
+- **Catching up.** Each siege starts where the last one ended. While the panel
+  was closed that can be up to a day back, so the watch catches up when the panel
+  runs again, up to 4 sieges at a time. Each is settled at once if it is already
+  over.
+- **Pausing.** It pauses (`watch.paused` holds the reason) while 8 town shares
+  wait to be collected, when the town has no towers, or when a siege cannot start.
+- **Stopping.** `off` stands it down; a siege under way runs to its end.
+- **Starting by hand.** It is refused while a watch siege runs.
+
+`/api/defense` adds:
+- `watch` {`room`, `level`, `hours`, `stone`, `since`, `started`, `paused`}, or null;
+- `waiting` [{`id`, `room`, `region`, `level`, `outcome`, `kills`, `ended_at`}]:
+  the finished sieges whose town share waits. The history never drops them.
 
 **Stationed heroes.** Each one is armed as an expedition with `mode: 'defense'` in
 `state.json`, one per hero. The roster row gets `defense` {`id`, `region`,

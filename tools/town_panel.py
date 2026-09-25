@@ -51,8 +51,15 @@ import worker_loot
 
 MAX_COFFER_MOVE = 500_000_000          # the game's gold cap
 MAX_STONE_BUDGET = 1_000_000
+# The watch keeps the town under siege, towers only, one siege after another. A siege it
+# starts while the panel is closed begins where the last one ended (at most a day back),
+# so it catches up when the panel opens again, a few sieges at a time; it pauses while
+# WATCH_WAITING town shares wait to be collected, so no loot piles up out of reach.
+WATCH_CATCH_UP = 4
+WATCH_LOOKBACK_HOURS = 24
+WATCH_WAITING = 8
 TOWN_LOCAL = ('fort_build', 'fort_upgrade', 'fort_plating', 'fort_arrange', 'wall_repair', 'defense_start', 'defense_repair',
-              'defense_retreat', 'trade_send', 'trade_unload', 'market_buy', 'market_sell')
+              'defense_retreat', 'defense_watch', 'trade_send', 'trade_unload', 'market_buy', 'market_sell')
 TOWN_GAME = ('coffer_deposit', 'coffer_collect', 'defense_collect', 'stock_send')
 TOWN_ACTIONS = TOWN_LOCAL + TOWN_GAME
 
@@ -83,6 +90,8 @@ class TownPanel:
         changed |= bool(trade.settle(state['trade'], at))
         changed |= merchants.tidy(state['market'], state['camp'], at)
         changed |= self.defense_settle(state, at, persist)
+        if persist:
+            changed |= self.defense_watch_step(state, at)
         if persist and changed:
             self.town_save(state)
         return state
@@ -136,7 +145,10 @@ class TownPanel:
             regions.append(dict(r, name=names.get(r['room'], r['room']), goblins=goblins,
                                 calibrated=[dict(slot=p['character'].get('slot'), name=p['character'].get('name'), profile=p['id'])
                                             for p in self.profiles if p.get('usable') and p.get('room') == r['room']]))
-        return dict(siege=defense.view(record, at, watch) if record else None, history=state['town']['history'][:10],
+        return dict(siege=defense.view(record, at, watch) if record else None, watch=state['town'].get('watch'),
+                    waiting=[dict((k, h[k]) for k in ('id', 'room', 'region', 'level', 'outcome', 'kills', 'ended_at'))
+                             for h in state['town']['history'] if not h.get('town_collected')],
+                    history=state['town']['history'][:10],
                     records=defense.load_records(self.data)['regions'], regions=regions, limits=town.limits(state['camp']),
                     levels=dict(max=defense.MAX_LEVEL, min_hours=defense.MIN_HOURS, max_hours=defense.MAX_HOURS, wave_minutes=defense.WAVE_MINUTES),
                     rank_names=bestiary.RANK_NAMES, tiers=[dict(t) for t in defense.TIERS], events=[dict(e) for e in defense.EVENTS],
@@ -221,7 +233,7 @@ class TownPanel:
         if name == 'coffer_collect':
             return self.coffer_collect(_whole(args.get('amount'), 1, MAX_COFFER_MOVE, 'The amount'))
         if name == 'defense_collect':
-            return self.defense_collect(args.get('siege'))
+            return self.defense_collect(args.get('siege'), every=args.get('all') is True)
         if name == 'stock_send':
             return self.stock_send(args.get('items'))
         state = self.town_load(at)
@@ -259,6 +271,8 @@ class TownPanel:
             return done
         if name == 'defense_start':
             return self.defense_start(state, args, at)
+        if name == 'defense_watch':
+            return self.defense_watch(state, args, at)
         if name in ('defense_repair', 'defense_retreat'):
             siege = t.get('siege')
             _require(siege and not siege.get('settled'), 'The town is not under siege.')
@@ -532,13 +546,12 @@ class TownPanel:
         import panel
         return panel.CLASSES.get((character or {}).get('class'))
 
-    def defense_start(self, state, args, at):
-        t, c = state['town'], state['camp']
-        _require(not (t.get('siege') and not t['siege'].get('settled')), 'The town is already under siege.')
+    def defense_settings(self, state, args) -> tuple:
+        """A siege's region, level, hours and stone budget, checked."""
+        c = state['camp']
         room = args.get('room')
         _require(isinstance(room, str) and room.startswith('Act_'), 'Choose a region of the acts.')
-        entries = bestiary.region(room)
-        _require(entries, 'The bestiary knows no monster of that region yet: record a calibration there first.')
+        _require(bestiary.region(room), 'The bestiary knows no monster of that region yet: record a calibration there first.')
         level, hours = args.get('level'), args.get('hours')
         _require(type(level) is int and 1 <= level <= defense.MAX_LEVEL, f'Choose a siege level from 1 to {defense.MAX_LEVEL}.')
         _require(isinstance(hours, (int, float)) and not isinstance(hours, bool) and math.isfinite(hours)
@@ -546,8 +559,82 @@ class TownPanel:
         stone = args.get('stone', 0)
         _whole(stone, 0, MAX_STONE_BUDGET, 'The stone budget')
         _require(c['resources'].get('stone', 0) >= stone, f"The camp has only {c['resources'].get('stone', 0):,} stone.")
+        return room, level, float(hours), stone
+
+    def defense_start(self, state, args, at):
+        t = state['town']
+        running = t.get('siege') if t.get('siege') and not t['siege'].get('settled') else None
+        _require(not running, 'The town is already under siege' + (" (the watch's): stop the watch or let that siege end."
+                                                                   if running and running.get('watch') else '.'))
+        room, level, hours, stone = self.defense_settings(state, args)
         self.refresh_profiles()
         heroes = self.defense_heroes(state, room, args.get('heroes') or [])
+        siege = self.defense_begin(state, room, level, hours, heroes, stone, at)
+        self.town_save(state)
+        self.log(f"The siege begins: level {level}, {siege['waves_total']} waves from {siege['region']}"
+                 + (f", with {', '.join(h['character']['name'] for h in heroes)} on the walls" if heroes else ', towers only') + '.')
+        return siege
+
+    def defense_watch(self, state, args, at):
+        """Keep the town under siege (towers only), one siege after another, or stop."""
+        t = state['town']
+        if args.get('off') is True:
+            _require(t.get('watch'), 'The town keeps no watch.')
+            t['watch'] = None
+            self.town_save(state)
+            self.log('The watch stands down. A siege under way still runs to its end.')
+            return None
+        room, level, hours, stone = self.defense_settings(state, args)
+        _require(t['towers'], 'The watch needs towers: heroes are stationed only in a siege you start yourself.')
+        t['watch'] = dict(room=room, level=level, hours=hours, stone=stone, since=afk.iso(at), started=0, paused=None)
+        self.defense_watch_step(state, at)
+        self.town_save(state)
+        self.log(f"The town keeps watch: level {level} sieges of {defense.duration_text(hours)} from "
+                 f"{self.zone_names_map().get(room, room)}, one after another, towers only.")
+        return t['watch']
+
+    def defense_watch_step(self, state, at) -> bool:
+        """Start the watch's next sieges: back to back from where the last one ended (at most
+        a day back), up to WATCH_CATCH_UP at once, each settled at once when already over.
+        Pauses (with the reason) instead of failing. True when anything changed."""
+        t = state['town']
+        watch = t.get('watch')
+        if not watch or watch.get('paused'):
+            return False
+        changed = False
+        for _ in range(WATCH_CATCH_UP):
+            siege = t.get('siege')
+            if siege and not siege.get('settled'):
+                break
+            waiting = sum(1 for h in t['history'] if not h.get('town_collected'))
+            if waiting >= WATCH_WAITING:
+                watch['paused'] = f'{waiting} town shares wait to be collected'
+                return True
+            start = at
+            last = t['history'][0] if t['history'] else None
+            if siege and siege.get('watch') and last and last.get('id') == siege['id']:
+                start = max(afk.parse_iso(last['ended_at']), at - timedelta(hours=WATCH_LOOKBACK_HOURS))
+            if not t['towers']:
+                watch['paused'] = 'the town has no towers'
+                return True
+            stone = min(watch['stone'], state['camp']['resources'].get('stone', 0))
+            try:
+                self.defense_begin(state, watch['room'], watch['level'], watch['hours'], [], stone, start, watch=True)
+            except (ValueError, SystemExit) as error:
+                watch['paused'] = str(error)
+                return True
+            watch['started'] += 1
+            changed = True
+            if not self.defense_settle(state, at, True):
+                break
+        return changed
+
+    def defense_begin(self, state, room, level, hours, heroes, stone, at, watch=False) -> dict:
+        """Draw a siege, write its record (and its heroes' plans and state.json entries in one
+        write), take its stone and point the town at it. Nothing is saved to workers.json here."""
+        t, c = state['town'], state['camp']
+        entries = bestiary.region(room)
+        _require(entries, 'The bestiary knows no monster of that region yet: record a calibration there first.')
         ident = 'defense_' + at.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:6]
         for h in heroes:
             h['expedition_id'] = f"{ident}_h{h['slot']}"
@@ -557,6 +644,7 @@ class TownPanel:
                                     keep_now=town.keep_now(t, c, at), heroes=heroes, entries=entries,
                                     goblins=(worker_loot.pools().get('goblins', {}).get(room) or {}), stone_budget=stone,
                                     build=bestiary.current_build(), at=at, region_name=self.zone_names_map().get(room, room))
+        record['watch'] = bool(watch)
         path = self.data / 'plans' / f'{ident}.json'
         plans = [self.defense_hero_plan(record, path, h) for h in heroes]
         with recovery.data_lock(self.data):
@@ -573,11 +661,8 @@ class TownPanel:
             afk.save_state(st, self.data / 'state.json')
         c['resources']['stone'] -= stone
         t['siege'] = dict(id=ident, path=str(path), room=room, level=level, started_at=record['started_at'], hours=record['hours'],
-                          heroes=[h['slot'] for h in heroes], settled=False)
-        self.town_save(state)
-        self.log(f"The siege begins: level {level}, {record['waves_total']} waves from {record['region']}"
-                 + (f", with {', '.join(h['character']['name'] for h in heroes)} on the walls" if heroes else ', towers only') + '.')
-        return t['siege']
+                          heroes=[h['slot'] for h in heroes], settled=False, watch=bool(watch))
+        return dict(t['siege'], waves_total=record['waves_total'], region=record['region'])
 
     def defense_hero_plan(self, record, record_path, hero) -> dict:
         """A stationed hero's expedition plan: its claim is its share of the siege, built when the siege ends."""
@@ -636,16 +721,25 @@ class TownPanel:
                      outcome=outcome, waves=last, waves_total=record['waves_total'], kills=sum(r['kills'] for r in rows),
                      spoils=kept.get('spoils', 0), stone_back=stone_back, ended_at=afk.iso(defense.ends_at(record)), record=new,
                      town_collected=False)
-        state['town']['history'] = ([entry] + state['town']['history'])[:town.HISTORY]
+        entry['watch'] = bool(record.get('watch'))
+        state['town']['history'] = town.keep_history(state['town']['history'], entry)
         siege['settled'] = True
         if persist:
             self.note(f"The siege of level {record['level']} {'held' if outcome == 'held' else 'fell' if outcome == 'fell' else 'ended in a retreat'} "
                       f"after {last} waves: {entry['kills']:,} monsters slain, +{entry['spoils']:,} spoils.")
         return True
 
-    def defense_collect(self, ident=None):
+    def defense_collect(self, ident=None, every=False):
         """The town's share of a finished siege: its monsters' packets replayed through the game
-        in the siege's region by any offline hero standing there, no experience; then the Vault."""
+        in the siege's region by any offline hero standing there, no experience; then the Vault.
+        ``every``: every waiting share of the region the hero stands in, one after another."""
+        if every:
+            s = self.fresh()
+            waiting = [h['id'] for h in self.town_load()['town']['history'] if not h.get('town_collected') and h['room'] == s['room']]
+            _require(waiting, 'No town share waits in the region your hero stands in.')
+            for ident in reversed(waiting):      # the oldest first
+                self.defense_collect(ident)
+            return len(waiting)
         state = self.town_load()
         entry = next((h for h in state['town']['history'] if (ident is None or h['id'] == ident) and not h.get('town_collected')), None)
         _require(entry, 'No finished siege is waiting for its town share.')

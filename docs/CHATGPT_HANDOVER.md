@@ -83,6 +83,9 @@ What to build (English UI only, no new dependencies, no API changes):
      buttons.
    - Never show waves after the clock. When it is over: the outcome, "Collect the
      town's share", and each hero's claim on the roster.
+   - The watch: a "Keep watch" toggle with its level, hours and stone. Show the
+     paused reason, the waiting shares and "Collect all here" (`defense_collect`
+     with `all: true`).
 4. **Bestiary** per region (`/api/bestiary`): monsters by rank, with speed, range,
    immunities, flying, affixes seen and slain counts.
 5. **Trade map.** The ten towns with distance, development, standing, tariff, news

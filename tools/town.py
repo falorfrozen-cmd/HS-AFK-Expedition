@@ -5,7 +5,8 @@
 - each side's ore plating;
 - the walls' and keep's health, healing by the hour;
 - the fortification queue;
-- the siege under way, if any, and the last sieges;
+- the siege under way, if any, the watch (sieges started one after another,
+  towers only) and the last sieges;
 - how many monsters of each kind the town has slain.
 The camp's buildings set the limits:
 - Walls: wall health, armor and tower slots;
@@ -55,7 +56,7 @@ PLATING_MATERIAL = ('14:27', '14:28', '14:29', '14:31', '14:32')
 def new() -> dict:
     return dict(schema=SCHEMA, towers={}, next_tower=1, plating={s: 0 for s in battle.SIDES},
                 walls={s: dict(hp=None, at=None) for s in battle.SIDES}, keep=dict(hp=None, at=None),
-                queue=[], siege=None, history=[], slain={}, sending=None)
+                queue=[], siege=None, watch=None, history=[], slain={}, sending=None)
 
 
 def _int(value, low=0, high=None) -> int:
@@ -87,10 +88,31 @@ def normalize(town) -> dict:
     out['queue'] = [q for q in out['queue'] if isinstance(q, dict) and q.get('target')] if isinstance(out['queue'], list) else []
     out['siege'] = out['siege'] if isinstance(out['siege'], dict) and out['siege'].get('id') else None
     out['sending'] = out['sending'] if isinstance(out['sending'], dict) and out['sending'].get('delivery_id') else None
+    out['watch'] = normalize_watch(out['watch'])
     out['history'] = [h for h in out['history'] if isinstance(h, dict)][:HISTORY] if isinstance(out['history'], list) else []
     slain = out['slain'] if isinstance(out['slain'], dict) else {}
     out['slain'] = {str(k): v for k, v in slain.items() if type(v) is int and v > 0}
     out['schema'] = SCHEMA
+    return out
+
+
+def normalize_watch(value) -> dict | None:
+    """The watch's settings, or None: a region, a level, hours and a stone budget per siege."""
+    if not isinstance(value, dict) or not isinstance(value.get('room'), str):
+        return None
+    level, hours, stone = value.get('level'), value.get('hours'), value.get('stone', 0)
+    if type(level) is not int or type(stone) is not int or isinstance(hours, bool) or not isinstance(hours, (int, float)):
+        return None
+    return dict(room=value['room'], level=level, hours=float(hours), stone=max(0, stone), since=value.get('since'),
+                started=_int(value.get('started')), paused=value.get('paused') if isinstance(value.get('paused'), str) else None)
+
+
+def keep_history(history: list, entry: dict) -> list:
+    """The newest sieges first, HISTORY of them; a siege whose town share still waits is never dropped."""
+    out = []
+    for i, h in enumerate([entry] + list(history)):
+        if i < HISTORY or not h.get('town_collected'):
+            out.append(h)
     return out
 
 

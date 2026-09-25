@@ -383,6 +383,14 @@ ranks it killed there.
 - **When the siege ends:** its spoils (1 per 20 kills) and the unused stone come
   back once, and so does the walls' damage.
 
+**The watch** (`defense_watch`) chains sieges of the towers alone.
+- Each siege starts where the last one ended, at most a day back, and up to 4
+  are drawn and settled in one catch-up.
+- Watch sieges are drawn only when the town persists its state: in actions and
+  in the monitor, never in a page.
+- It pauses while 8 town shares wait (the history keeps every waiting one), so
+  loot never piles up beyond reach.
+
 **Balance** (measured with `suggest_level` on the recorded Act 2-5, 3-3 and 6-1
 bestiaries). The level a town usually holds for 12 waves:
 

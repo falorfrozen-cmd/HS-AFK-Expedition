@@ -182,6 +182,11 @@ def wave_count(hours: float) -> int:
     return max(0, int(math.floor(float(hours) * 60.0 / WAVE_MINUTES + 1e-9)))
 
 
+def duration_text(hours: float) -> str:
+    minutes = int(round(float(hours) * 60))
+    return f'{minutes} minutes' if minutes < 60 else f'{minutes / 60:g} hours'
+
+
 def budget(level: int, wave: int) -> float:
     return BASE_BUDGET * LEVEL_STEP ** (level - 1) * GROWTH ** (wave - 1)
 
