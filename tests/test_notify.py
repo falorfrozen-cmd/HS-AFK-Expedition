@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+import os
+os.environ['AFK_NOTIFY_DISABLED'] = '1'   # tests never schedule real Windows tasks or toasts
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import notify, panel
 
@@ -41,10 +43,22 @@ class ReadyNotificationTests(unittest.TestCase):
         self.assertIn('<Command>conhost.exe</Command>', run.xml)
         self.assertIn('--headless powershell.exe', run.xml)
         self.assertIn('Suh&apos;s expedition in The Glacial Trail is ready' if '&apos;' in run.xml else "Suh's expedition in The Glacial Trail is ready", run.xml)
-        self.assertIn('&quot;AFK FARM\\Expedition ready&quot;', run.xml)
+        self.assertIn('&quot;AFK FARM\\Ready exp-farm_x&quot;', run.xml, 'each expedition has its own self-deleting task')
         self.assertFalse((self.d / 'notify-ready.xml').exists(), 'the request file is removed')
         script = (self.d / notify.SCRIPT).read_text(encoding='utf-8-sig')
         self.assertIn(notify.POWERSHELL_APP_ID, script); self.assertIn('/Delete /TN $Task /F', script)
+        # It stays on screen until closed (a plain toast vanished behind a full-screen
+        # game, MEASURED 2026-09-24) and opens the panel.
+        self.assertIn("<toast scenario='reminder'", script)
+        self.assertIn("<action content='Open AFK FARM' activationType='protocol' arguments='$url'/>", script)
+        self.assertIn("activationType='system' arguments='dismiss'", script, 'a reminder needs a button to stay')
+        self.assertIn('-Url &quot;http://127.0.0.1:8787/&quot;', run.xml)
+
+    def test_the_toast_button_opens_only_the_local_panel(self):
+        self.assertEqual(notify.panel_url('http://127.0.0.1:8790/'), 'http://127.0.0.1:8790/')
+        for bad in ('https://example.com/', 'http://127.0.0.1:8787/x', 'file:///c:/x', 'http://127.0.0.1:8787/" -Task "x', None):
+            with self.subTest(bad=bad):
+                self.assertEqual(notify.panel_url(bad), notify.PANEL_URL if bad is None else 'http://127.0.0.1:8787/')
 
     def test_unchanged_state_does_nothing_and_a_claim_or_the_setting_removes_it(self):
         run = FakeScheduler()
@@ -72,6 +86,30 @@ class ReadyNotificationTests(unittest.TestCase):
         for bad in (dict(ARMED, started_at='yesterday'), dict(ARMED, started_at='2026-09-23T09:30:00'), dict(ARMED, hours=None)):
             with self.subTest(bad=bad):
                 self.assertIsNone(notify.sync(self.d, bad, True, PLAN, now=NOW, run=FakeScheduler())['scheduled'])
+
+    def test_every_hero_of_the_roster_gets_its_own_task(self):
+        run = FakeScheduler()
+        a = notify.expedition_entry(ARMED, PLAN)
+        b = notify.expedition_entry(dict(ARMED, expedition_id='farm_y', hours=3.0), dict(PLAN, label_hero='Sgham'))
+        record = notify.sync_all(self.d, [a, b], True, now=NOW, run=run)
+        self.assertEqual(run.calls, ['/Create', '/Create'])
+        self.assertEqual(set(record['tasks']), {'exp-farm_x', 'exp-farm_y'})
+        notify.sync_all(self.d, [b], True, now=NOW, run=run)
+        self.assertEqual(run.calls[-1], '/Delete', 'a claimed hero loses only its own task')
+        self.assertEqual(set(notify._read(self.d / notify.RECORD)['tasks']), {'exp-farm_y'})
+        notify.sync_all(self.d, [b], True, now=NOW, run=run)
+        self.assertEqual(len(run.calls), 3, 'an unchanged roster changes nothing')
+
+    def test_a_0_6_record_loses_its_single_task_once(self):
+        run = FakeScheduler()
+        (self.d / notify.RECORD).write_text(json.dumps(dict(schema=1, scheduled=dict(expedition_id='old', at='x'))), encoding='utf-8')
+        notify.sync_all(self.d, [], True, now=NOW, run=run)
+        notify.sync_all(self.d, [], True, now=NOW, run=run)
+        self.assertEqual(run.calls, ['/Delete'])
+
+    def test_a_siege_names_its_report(self):
+        title, message = notify.texts(dict(PLAN, mode='siege'))
+        self.assertIn('siege', title); self.assertIn('siege of The Glacial Trail is over', message)
 
     def test_texts_fall_back_and_never_break_the_command_line(self):
         self.assertEqual(notify.texts({})[1], "Your hero's expedition in its region is ready. Open AFK FARM and claim with Your hero in its region.")

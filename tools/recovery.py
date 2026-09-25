@@ -206,6 +206,15 @@ def inspect(data, ident):
     return result
 
 
+def armed_claim(data, ident):
+    """(state, armed record) of an armed expedition whose claim is ``ident``."""
+    from afk import load_state
+    state=load_state(data/'state.json')
+    armed=state['expeditions'].get(ident.removesuffix('_claim')) if ident.endswith('_claim') else None
+    if not armed: raise ValueError('This is not the claim of an armed expedition.')
+    return state,armed
+
+
 def accept_position(data, ident):
     """The player accepts an interrupted delivery's recorded position.
 
@@ -216,9 +225,7 @@ def accept_position(data, ident):
     from afk import write_json, iso, now_utc
     review=inspect(data,ident)
     if review['status']!='needs_review':raise ValueError('Only a claim that needs review can continue from its recorded position.')
-    state=read(data/'state.json') or {}
-    armed=state.get('armed')
-    if not armed or armed.get('expedition_id')+'_claim'!=ident: raise ValueError('This is not the currently armed claim.')
+    armed_claim(data,ident)
     path=data/'sessions'/f'{ident}.progress.json'
     if path.stat().st_mtime>time.time()-30:
         raise ValueError('Delivery still looks active. Close the game or wait a moment, then try again.')
@@ -253,13 +260,11 @@ def settle_partial(data, ident):
     armed clock is freed, and the checkpoint, spool and plan stay untouched for the
     recovery report. Whether the game saved the delivered XP is not confirmed.
     """
-    from afk import write_json, iso, now_utc
+    from afk import write_json, iso, now_utc, save_state, settle_in_state
     review=inspect(data,ident)
     if review['status']!='needs_review' and not (review['status']=='paused' and review.get('accepted')):
         raise ValueError('Only a claim that needs review can be closed as partial.')
-    state=read(data/'state.json') or {}
-    armed=state.get('armed')
-    if not armed or armed.get('expedition_id')+'_claim'!=ident: raise ValueError('This is not the currently armed claim.')
+    state,armed=armed_claim(data,ident)
     p=read(data/'sessions'/f'{ident}.progress.json') or {}
     if p.get('state') in ('running','paused') and (data/'sessions'/f'{ident}.progress.json').stat().st_mtime>time.time()-30:
         raise ValueError('Delivery still looks active. Pause it or close the game, then try again.')
@@ -271,20 +276,17 @@ def settle_partial(data, ident):
     write_json(data/'sessions'/f'{ident}.result.json',result)
     plan=read(data/'plans'/f'{ident}.json') or {}
     fraction=done/total if total else 0
-    state['last_claim']=dict(expedition_id=ident,credited_hours=float(plan.get('hours',0))*float(plan.get('scale',1))*fraction,
-                             at=iso(now_utc()),result=result,partial=True)
-    state.pop('armed')
-    write_json(data/'state.json',state)
+    settle_in_state(state,ident,dict(expedition_id=ident,credited_hours=float(plan.get('hours',0))*float(plan.get('scale',1))*fraction,
+                                     at=iso(now_utc()),result=result,partial=True))
+    save_state(state,data/'state.json')
     return result
 
 
 def settle(data, ident):
-    from afk import write_json, iso, now_utc
+    from afk import write_json, iso, now_utc, save_state, settle_in_state
     review=inspect(data,ident)
     if not review['recoverable']: raise ValueError('Recovery refused: '+' '.join(review['reasons']))
-    state=read(data/'state.json') or {}
-    armed=state.get('armed')
-    if not armed or armed.get('expedition_id')+'_claim'!=ident: raise ValueError('This is not the currently armed claim.')
+    state,armed=armed_claim(data,ident)
     p=read(data/'sessions'/f'{ident}.progress.json')
     previous=read(data/'sessions'/f'{ident}.result.json') or {}
     ingest='done' if previous.get('stages',{}).get('ingest')=='done' else 'pending'
@@ -293,7 +295,10 @@ def settle(data, ident):
     # Persist the result first. An interruption before settlement is safe to retry.
     write_json(data/'sessions'/f'{ident}.result.json',result)
     plan=read(data/'plans'/f'{ident}.json')
-    state['last_claim']=dict(expedition_id=ident,credited_hours=float(plan.get('hours',0))*float(plan.get('scale',1)),at=iso(now_utc()),result=result)
-    state.pop('armed')
-    write_json(data/'state.json',state)
+    settle_in_state(state,ident,dict(expedition_id=ident,credited_hours=float(plan.get('hours',0))*float(plan.get('scale',1)),at=iso(now_utc()),result=result))
+    save_state(state,data/'state.json')
+    if plan.get('siege_claim'):
+        import siege
+        from afk import hero_key
+        siege.record_claim(data,hero_key(plan.get('character')) or '?',plan['zones'][0]['room'],plan['siege_claim'])
     return result

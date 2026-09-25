@@ -57,6 +57,11 @@ LOOT_FILTER_FILE = DATA / "loot-filter.json"
 DELIVERY_WAIT_HOURS = 12
 
 
+def max_hours(armed: dict | None = None) -> float:
+    """The longest an armed expedition's clock credits."""
+    return MAX_HOURS
+
+
 def delivery_speed(plan: dict) -> str:
     """The named speed of a plan; older plans without one are Normal."""
     name = plan.get("delivery_speed")
@@ -108,6 +113,93 @@ def character_key(stamp) -> tuple:
     return stamp['slot'], stamp['name'], stamp['class']
 
 
+def hero_key(stamp) -> str | None:
+    """A version-2 identity as text (slot:class:name); None for legacy stamps."""
+    try:
+        slot, name, cls = character_key(stamp)
+    except SystemExit:
+        return None
+    return f"{slot}:{cls}:{name}"
+
+
+# ------------------------------------------------------------------ roster state
+# state.json schema 2 keeps every armed expedition under `expeditions`, keyed by
+# its id, one per hero (the hero roster, 0.7.0). Schema 1 kept a single one
+# under `armed`; such a file reads as a one-entry roster and is rewritten in the
+# new form by the next change. `last_claims` remembers each hero's last settled
+# claim for "Farm again"; `last_claim` stays the newest one overall.
+STATE_SCHEMA = 2
+
+
+def load_state(path: Path | None = None) -> dict:
+    st = read_json(path or STATE, {}) or {}
+    st = dict(st) if isinstance(st, dict) else {}
+    expeditions = st.get("expeditions") if isinstance(st.get("expeditions"), dict) else {}
+    expeditions = {k: dict(v) for k, v in expeditions.items() if isinstance(v, dict) and v.get("expedition_id") == k}
+    old = st.pop("armed", None)
+    if isinstance(old, dict) and isinstance(old.get("expedition_id"), str) and old["expedition_id"] not in expeditions:
+        expeditions[old["expedition_id"]] = dict(old)
+    st["expeditions"] = expeditions
+    st["last_claims"] = dict(st["last_claims"]) if isinstance(st.get("last_claims"), dict) else {}
+    return st
+
+
+def save_state(st: dict, path: Path | None = None) -> None:
+    out = {k: v for k, v in st.items() if k != "armed"}
+    out["schema"] = STATE_SCHEMA
+    write_json(path or STATE, out)
+
+
+def armed_hero(armed: dict) -> str | None:
+    """The hero an armed expedition belongs to (older records: from its plan)."""
+    if isinstance(armed.get("hero"), str) and armed["hero"]:
+        return armed["hero"]
+    plan = read_json(Path(armed["plan"])) if armed.get("plan") else None
+    return hero_key((plan or {}).get("character"))
+
+
+def armed_list(st: dict) -> list[dict]:
+    return sorted(st.get("expeditions", {}).values(), key=lambda a: (str(a.get("started_at") or ""), a["expedition_id"]))
+
+
+def armed_for_hero(st: dict, stamp) -> dict | None:
+    key = hero_key(stamp)
+    if key is None:
+        return None
+    return next((a for a in armed_list(st) if armed_hero(a) == key), None)
+
+
+def select_armed(st: dict, expedition_id: str | None = None, stamp=None) -> dict:
+    """The expedition an action is meant for: by id, else the hero's, else the only one."""
+    roster = armed_list(st)
+    if expedition_id:
+        found = st.get("expeditions", {}).get(expedition_id)
+        if not found:
+            sys.exit(f"no active expedition {expedition_id}")
+        return found
+    if stamp is not None:
+        found = armed_for_hero(st, stamp)
+        if not found:
+            sys.exit("this hero has no active expedition")
+        return found
+    if not roster:
+        sys.exit("nothing armed: afk.py start <plan> first")
+    if len(roster) > 1:
+        sys.exit("several expeditions are active; choose one with --expedition "
+                 + ", ".join(a["expedition_id"] for a in roster))
+    return roster[0]
+
+
+def settle_in_state(st: dict, claim_id: str, record: dict) -> None:
+    """Free the claim's hero and remember the claim (last_claim / last_claims)."""
+    ident = claim_id.removesuffix("_claim")
+    armed = st.get("expeditions", {}).pop(ident, None)
+    hero = armed_hero(armed) if armed else None
+    st["last_claim"] = record
+    if hero:
+        st.setdefault("last_claims", {})[hero] = record
+
+
 def profile_key(profile) -> str:
     context = [profile['room'], character_key(profile.get('character')),
                profile.get('game_build'), profile.get('forgepact'), profile.get('rate_basis'), (profile.get('farm_context') or {}).get('hash')]
@@ -150,6 +242,14 @@ def write_json(path: Path, obj) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(tmp, path)
+
+
+def whole(value) -> str:
+    """A count for people: 16,111,941, never 16,111,940.635554502 (XP multipliers make fractional sums)."""
+    try:
+        return f"{int(round(float(value or 0))):,}"
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
 
 
 def serialized_rewards(function):
@@ -516,6 +616,38 @@ def rebuild_preview(plan: dict) -> None:
         seconds_to_replay=round(estimate_delivery_seconds(calls, delivery_speed(plan)), 1))
 
 
+ORDINARY_RANKS = (1, 2, 3, 4)
+
+
+def verified_specials() -> dict:
+    """Special monster packets (bosses, event monsters) that passed `afk special verify`."""
+    value = read_json(DATA / "special-packets.json", {}) or {}
+    packets = value.get("packets") if isinstance(value, dict) else None
+    return packets if isinstance(packets, dict) else {}
+
+
+def is_chest(packet: dict) -> bool:
+    """A chest opening (Chest_Drop_obj, Abyss_Chest_obj, Dungeon_Chest_obj, ...), recorded as a break.
+
+    Chests are not part of a route's pace: a golden or crystal chest costs a key
+    the replay would not take, and an Abyss chest is a rare map event (MEASURED
+    2026-09-24: a 5.6-minute Act 3-3 calibration held 6 Abyss-chest and 6
+    world-chest calls, which a plan scaled to about 11 Abyss chests an hour).
+    Every plan leaves them out; opening chests is the Adventurer worker's job."""
+    return 'Chest' in str(packet.get('object') or '')
+
+
+def replayable(packet: dict, verified: dict | None = None) -> bool:
+    """Ordinary monsters and breakables replay; a special monster only once verified;
+    a chest never. A kill without a rank (research profiles before ranks were
+    recorded) is not special here; the panel refuses such calibrations outright."""
+    if is_chest(packet):
+        return False
+    if packet.get("kind") != "kill" or packet.get("rank") in ORDINARY_RANKS or packet.get("rank") is None:
+        return True
+    return packet.get("hash") in (verified if verified is not None else verified_specials())
+
+
 def make_plan(hours: float, zones: list[tuple[str, float]], exp_id: str, per_frame: int, gold: str,
               extras: list[tuple[str, float]] | None = None, *, profile_overrides: dict | None = None) -> dict:
     """extras: (packet hash prefix, kills per hour) added on top of the zone
@@ -551,14 +683,17 @@ def make_plan(hours: float, zones: list[tuple[str, float]], exp_id: str, per_fra
     rates = learned_rates(first)
     plan_zones, packets, preview_exp, preview_items = [], [], 0.0, 0.0
     total_kills = total_breaks = 0
+    verified = verified_specials()
     for room, w in zones:
         p = profs[room]
         minutes = hours * 60.0 * w / wsum
-        kills = int(round(sum(q['count'] for q in p['packets'] if q['kind'] == 'kill') * minutes * 60 / p['basis_seconds']))
-        breaks = int(round(sum(q['count'] for q in p['packets'] if q['kind'] == 'break') * minutes * 60 / p['basis_seconds']))
+        # A special monster (boss, event monster) replays only after `afk special
+        # verify`; until then its kills are left out, never swapped for others.
+        kill_pk = [q for q in p["packets"] if q["kind"] == "kill" and replayable(q, verified)]
+        kills = int(round(sum(q['count'] for q in kill_pk) * minutes * 60 / p['basis_seconds']))
+        break_pk = [q for q in p["packets"] if q["kind"] == "break" and replayable(q, verified)]
+        breaks = int(round(sum(q['count'] for q in break_pk) * minutes * 60 / p['basis_seconds']))
         room = p['room']
-        kill_pk = [q for q in p["packets"] if q["kind"] == "kill"]
-        break_pk = [q for q in p["packets"] if q["kind"] == "break"]
         for group, n in ((kill_pk, kills), (break_pk, breaks)):
             counts = largest_remainder(n, [q["weight"] for q in group]) if group else []
             for q, c in zip(group, counts):
@@ -637,6 +772,26 @@ def scale_plan(plan: dict, factor: float, new_id: str) -> dict:
     return out
 
 
+def claim_plan_for(plan: dict, credited_h: float, claim_id: str) -> dict:
+    """What a claim delivers: a Siege the waves held by now, other expeditions
+    the plan scaled to the credited time."""
+    if plan.get("mode") == "siege":
+        import siege
+        return siege.claim_plan(plan, credited_h, claim_id)
+    factor = credited_h / float(plan["hours"]) if plan.get("hours") else 0.0
+    return scale_plan(plan, factor, claim_id)
+
+
+def record_siege(claim_plan: dict) -> None:
+    """A settled Siege claim updates the hero's best wave at that level and region."""
+    claim = claim_plan.get("siege_claim") if isinstance(claim_plan, dict) else None
+    if not claim:
+        return
+    import siege
+    siege.record_claim(DATA, hero_key(claim_plan.get("character")) or "?", claim_plan["zones"][0]["room"], claim)
+    print(f"siege L{claim['level']}: {claim['waves_fought']} waves" + (" - a new record for this hero and region" if claim.get("record") else ""))
+
+
 def print_preview(plan: dict) -> None:
     pv = plan["preview"]
     print(f"expedition {plan['expedition_id']}: {plan['hours']:.2f} h" + (f" (scaled x{plan['scale']:.3f})" if "scale" in plan else ""))
@@ -650,7 +805,7 @@ def print_preview(plan: dict) -> None:
         print(f"  {z['room']:14s} {z['minutes']:6.1f} min  kills {z['kills']:6d}  breaks {z['breaks']:5d}")
     for e in plan.get("extras", []):
         print(f"  extra {e['monster_key'] or e['packet'][:12]:22s} {e['per_hour']:.1f}/h -> {e['count']} kills")
-    print(f"  total: {pv['kills']} kills, {pv['breaks']} breaks, {pv['calls']} drop calls, exp {pv['exp']:,}"
+    print(f"  total: {pv['kills']} kills, {pv['breaks']} breaks, {pv['calls']} drop calls, exp {whole(pv['exp'])}"
           + (f", ~{pv['items_estimate']} items" if pv.get("items_estimate") is not None else ", items: no rate learned yet")
           + (f", ~{pv['gold_estimate']} gold" if pv.get("gold_estimate") is not None else ", gold: no rate learned yet")
           + "; delivery time depends on game performance and reward-call cost")
@@ -869,7 +1024,7 @@ def run_plan(plan_path: Path, plan: dict, bin_dir: Path, ingest: bool, anywhere:
         state = pr.get("state")
         if time.time() - last_print > 5:
             print(f"  {state}: {pr.get('calls_done', 0)}/{pr.get('calls_total', 0)} calls, items {pr.get('items', 0)}, "
-                  f"gold {pr.get('gold', 0)}, exp {pr.get('exp', 0):,}" + (f" [{pr.get('pause')}]" if pr.get("pause") else ""))
+                  f"gold {pr.get('gold', 0)}, exp {whole(pr.get('exp', 0))}" + (f" [{pr.get('pause')}]" if pr.get("pause") else ""))
             last_print = time.time()
         if state in ("done", "error", "aborted"):
             break
@@ -894,7 +1049,7 @@ def run_plan(plan_path: Path, plan: dict, bin_dir: Path, ingest: bool, anywhere:
     saved = ipc.send("afk save") or []
     print("  " + " ".join(l for l in saved if l.startswith("save:")))
     print(f"expedition {plan['expedition_id']}: {pr.get('state')} - {pr.get('calls_done', 0)}/{pr.get('calls_total', 0)} calls, "
-          f"{pr.get('items', 0)} items, {pr.get('gold', 0)} gold, {pr.get('exp', 0):,} exp"
+          f"{pr.get('items', 0)} items, {pr.get('gold', 0)} gold, {whole(pr.get('exp', 0))} exp"
           + (f", failed {pr.get('failed')}" if pr.get("failed") else "") + (f" - {pr.get('error')}" if pr.get("error") else ""))
     expected_calls = sum(q['count'] for q in plan.get('packets', []))
     replay_ok = (pr.get('state') == 'done' and expected_calls > 0
@@ -959,35 +1114,39 @@ def cmd_start(args) -> None:
     character_key(plan.get('character'))
     if len(plan.get('zones', [])) != 1:
         sys.exit('create a new single-zone plan before starting the clock')
-    st = read_json(STATE, {}) or {}
-    if st.get("armed"):
-        sys.exit(f"an expedition is already armed ({st['armed']['expedition_id']} since {st['armed']['started_at']}); claim or cancel it first")
-    st["armed"] = {"expedition_id": plan["expedition_id"], "plan": str(plan_path), "started_at": iso(now_utc()), "hours": plan["hours"]}
-    write_json(STATE, st)
+    st = load_state()
+    busy = armed_for_hero(st, plan['character'])
+    if busy:
+        sys.exit(f"this hero's expedition is already active ({busy['expedition_id']} since {busy.get('started_at')}); claim or cancel it first")
+    if plan["expedition_id"] in st["expeditions"]:
+        sys.exit(f"expedition {plan['expedition_id']} is already armed")
+    armed = {"expedition_id": plan["expedition_id"], "plan": str(plan_path), "started_at": iso(now_utc()), "hours": plan["hours"],
+             "hero": hero_key(plan["character"]), "mode": plan.get("mode", "farm")}
+    st["expeditions"][armed["expedition_id"]] = armed
+    save_state(st)
     print_preview(plan)
-    print(f"armed at {st['armed']['started_at']} for up to {plan['hours']:.2f} h. Quit the game if you like; come back and run `afk.py claim`.")
+    print(f"armed at {armed['started_at']} for up to {plan['hours']:.2f} h. Quit the game if you like; come back and run `afk.py claim`.")
 
 
 @serialized_rewards
 def cmd_cancel(args) -> None:
-    st = read_json(STATE, {}) or {}
-    if not st.get("armed"):
+    st = load_state()
+    if not st["expeditions"]:
         print("nothing armed")
         return
-    ident=st['armed']['expedition_id']+'_claim'
+    armed = select_armed(st, getattr(args, "expedition", None))
+    ident=armed['expedition_id']+'_claim'
     if any((folder/f'{ident}{suffix}').exists() for folder,suffix in ((SESSIONS,'.progress.json'),(SESSIONS,'.failure.json'),(SPOOL,'.ndjson'))):
         sys.exit('delivery has started; inspect recovery instead of cancelling the clock')
-    st["cancelled"] = st.pop("armed")
-    write_json(STATE, st)
-    print("cancelled")
+    st["cancelled"] = st["expeditions"].pop(armed["expedition_id"])
+    save_state(st)
+    print(f"cancelled {armed['expedition_id']}")
 
 
 @serialized_rewards
 def cmd_claim(args) -> None:
-    st = read_json(STATE, {}) or {}
-    armed = st.get("armed")
-    if not armed:
-        sys.exit("nothing armed: afk.py start <plan> first")
+    st = load_state()
+    armed = select_armed(st, getattr(args, "expedition", None))
     plan = read_json(Path(armed["plan"]))
     if not plan:
         sys.exit("the armed plan file is gone")
@@ -1013,10 +1172,18 @@ def cmd_claim(args) -> None:
         print(f"a claim for this expedition is already {pr_old['state']} "
               f"({pr_old.get('calls_done', 0)}/{pr_old.get('calls_total', 0)} calls); following it")
     else:
-        scaled = scale_plan(plan, factor, claim_id)
+        scaled = claim_plan_for(plan, credited_h, claim_id)
+        if scaled.get('siege_claim'):
+            import siege
+            claim = scaled['siege_claim']
+            claim['previous_best'] = siege.best(DATA, hero_key(plan['character']) or '?', plan['zones'][0]['room'], claim['level'])
+            claim['record'] = claim['waves_fought'] > claim['previous_best']
+            credited_h = scaled['scale'] * float(plan['hours'])
         if plan.get('label_region'):
             # An early claim delivers less than planned: name it by what it credits.
             scaled['label'] = expedition_label(plan.get('label_hero'), plan['label_region'], credited_h)
+            if scaled.get('siege_claim'):
+                scaled['label'] = f"Siege L{scaled['siege_claim']['level']} · " + scaled['label']
         apply_delivery_speed(scaled, getattr(args, 'speed', None) or 'normal')
         # Items the game's loot filter hides: sold / broken down by the plugin
         # during delivery ("convert"), or kept in the spool ("keep").
@@ -1047,9 +1214,10 @@ def cmd_claim(args) -> None:
               + (f" | {conversion['note']}" if conversion.get('note') else ''))
     if run_succeeded(pr):
         credited_h = float(scaled.get("hours", 0)) * float(scaled.get("scale", 1.0)) if reuse else credited_h
-        st["last_claim"] = {"expedition_id": claim_id, "credited_hours": credited_h, "at": iso(now_utc()), "result": pr}
-        st.pop("armed", None)
-        write_json(STATE, st)
+        st = load_state()   # another hero may have started meanwhile: settle on fresh state
+        settle_in_state(st, claim_id, {"expedition_id": claim_id, "credited_hours": credited_h, "at": iso(now_utc()), "result": pr})
+        save_state(st)
+        record_siege(scaled)
         print("claimed. The clock is free again.")
     else:
         print("the run did not finish; the clock stays armed so you can claim again (it resumes where it stopped)")
@@ -1081,21 +1249,21 @@ def cmd_run(args) -> None:
 
 
 def cmd_status(args) -> None:
-    st = read_json(STATE, {}) or {}
+    st = load_state()
     print(f"ForgePact now: {forgepact_text(forgepact_current())}")
-    armed = st.get("armed")
-    if armed:
+    roster = armed_list(st)
+    for armed in roster:
         started = parse_iso(armed["started_at"])
         elapsed_h = (now_utc() - started).total_seconds() / 3600.0
-        credited = min(elapsed_h, float(armed["hours"]), MAX_HOURS)
-        print(f"armed: {armed['expedition_id']} since {armed['started_at']} - elapsed {elapsed_h:.2f} h, credited so far {credited:.2f} h "
-              f"(cap {min(float(armed['hours']), MAX_HOURS):.2f} h)")
-    else:
+        credited = min(elapsed_h, float(armed["hours"]), max_hours(armed))
+        print(f"armed: {armed['expedition_id']} ({armed_hero(armed) or 'unknown hero'}, {armed.get('mode', 'farm')}) since {armed['started_at']} - "
+              f"elapsed {elapsed_h:.2f} h, credited so far {credited:.2f} h (cap {min(float(armed['hours']), max_hours(armed)):.2f} h)")
+    if not roster:
         print("no expedition armed")
     lc = st.get("last_claim")
     if lc:
         r = lc.get("result", {})
-        print(f"last claim: {lc['expedition_id']} at {lc['at']} - {lc['credited_hours']:.2f} h, {r.get('items', 0)} items, {r.get('gold', 0)} gold, {r.get('exp', 0):,} exp")
+        print(f"last claim: {lc['expedition_id']} at {lc['at']} - {lc['credited_hours']:.2f} h, {r.get('items', 0)} items, {r.get('gold', 0)} gold, {whole(r.get('exp', 0))} exp")
     for f in sorted(SESSIONS.glob("*.progress.json")):
         pr = read_json(f) or {}
         if pr.get("state") in ("running", "paused", "error", "aborted"):
@@ -1127,6 +1295,72 @@ def cmd_packets(args) -> None:
     for r in sorted(rows, key=lambda r: (-r[5], r[1])):
         print(f"  {r[0]}  {r[1]:28s} rank {str(r[2]):4s} {str(r[3]):14s} exp {str(r[4]):8s} seen {r[5]:5d} {r[6]}")
     print(f"{len(rows)} packets")
+
+
+def cmd_special(args) -> None:
+    """Special monsters (bosses, event monsters) captured in calibrations.
+
+    `special list` shows them; `special verify PREFIX` replays one RUNS times
+    through the game with experience and gold off and its items kept out of the
+    Vault (a statistics run, like `verify`). A packet that replays without a
+    failed call is recorded in special-packets.json and may then replay in
+    expeditions and Siege boss waves. Stand in the packet's region with any
+    offline hero (or pass --anywhere to test elsewhere; the drops then see
+    that map).
+    """
+    pidx = packet_index()
+    verified = verified_specials()
+    specials = {h: m for h, m in pidx.items() if m.get("monster_key") and m.get("rank") not in ORDINARY_RANKS}
+    if args.action == "list":
+        seen = Counter()
+        for f in SESSIONS.glob("capture_*.ndjson"):
+            for r in read_ndjson(f):
+                if r.get("kind") == "kill" and r.get("packet") in specials:
+                    seen[r["packet"]] += 1
+        for h, m in sorted(specials.items(), key=lambda kv: (kv[1].get("room") or "", kv[1].get("monster_key"))):
+            state = "VERIFIED" if h in verified else ("incomplete" if not (m.get("deep") and m.get("complete")) else "not verified")
+            print(f"  {h[:12]}  {m.get('monster_key'):28s} rank {str(m.get('rank')):4s} {str(m.get('room')):14s} seen {seen[h]:4d}  {state}")
+        print(f"{len(specials)} special monster packet(s), {sum(1 for h in specials if h in verified)} verified")
+        return
+    matches = [h for h in specials if h.startswith(args.packet or "")]
+    if len(matches) != 1:
+        sys.exit(f"special verify {args.packet}: {'no' if not matches else 'several'} special packet(s) match; see `afk.py special list`")
+    h = matches[0]
+    meta = specials[h]
+    if not meta.get("deep") or not meta.get("complete"):
+        sys.exit("that packet is incomplete or old; capture the monster again")
+    runs = int(args.runs)
+    if not 1 <= runs <= 50:
+        sys.exit("--runs must be between 1 and 50")
+    bin_dir = game_bin(args)
+    ipc = Ipc(bin_dir)
+    who = ipc.send("afk who") or []
+    stamp = next((json.loads(l[5:]) for l in who if l.startswith("who: ")), None)
+    character_key(stamp)
+    ident = f"special_{h[:12]}_{now_utc().strftime('%Y%m%d_%H%M%S')}"
+    plan = {"expedition_id": ident, "created": iso(now_utc()), "hours": 0.0, "extras": [], "rate_source": "special-verify",
+            "zones": [{"room": meta.get("room"), "weight": 1, "minutes": 0, "kills": runs, "breaks": 0}],
+            "character": stamp, "forgepact": forgepact_current(), "game_build": meta.get("build"), "coverage": 1.0,
+            "estimate_rates": {"items_per_call": {}, "gold_per_call": None}, "farm_context": None, "stats_only": True,
+            "packets": [{"hash": h, "count": runs, "monster_key": meta.get("monster_key"), "room": meta.get("room"), "kind": "kill", "exp": 0.0}],
+            "exp": False, "gold": "none", "per_frame": 1, "frame_budget_ms": 10, "preview": {}}
+    rebuild_preview(plan)
+    path = PLANS / f"{ident}.json"
+    write_json(path, plan)
+    print(f"verifying {meta.get('monster_key')} ({h[:12]}, rank {meta.get('rank')}, {meta.get('room')}): {runs} statistics runs, no XP, no gold, nothing to the Vault")
+    with recovery.data_lock(DATA):
+        pr = run_plan(path, plan, bin_dir, ingest=False, anywhere=args.anywhere, forgepact_ignore=True)
+    if not run_succeeded(pr):
+        sys.exit("verification failed: the replay did not finish cleanly; the packet stays blocked")
+    items = sum(1 for r in read_ndjson(SPOOL / f"{ident}.ndjson") if r.get("kind") == "item")
+    value = read_json(DATA / "special-packets.json", {}) or {}
+    packets = value.get("packets") if isinstance(value, dict) and isinstance(value.get("packets"), dict) else {}
+    packets[h] = {"verified_at": iso(now_utc()), "runs": runs, "calls": pr.get("calls_done"), "items": items,
+                  "monster_key": meta.get("monster_key"), "rank": meta.get("rank"), "room": meta.get("room"), "build": meta.get("build"),
+                  "anywhere": bool(args.anywhere), "plan": ident}
+    write_json(DATA / "special-packets.json", {"schema": 1, "packets": packets})
+    print(f"verified: {runs} replays, {items} item(s) built by the game (kept out of the Vault). "
+          f"{meta.get('monster_key')} now replays in expeditions of {meta.get('room')} and in Siege boss waves there.")
 
 
 def cmd_events(args) -> None:
@@ -1288,12 +1522,18 @@ def main(argv=None) -> None:
     p.set_defaults(fn=cmd_plan)
     p = sub.add_parser("packets"); p.add_argument("--room"); p.add_argument("--find", help="substring of the monster key or object")
     p.set_defaults(fn=cmd_packets)
+    p = sub.add_parser("special", help="special monsters (bosses): list, or verify one before it may replay")
+    p.add_argument("action", choices=["list", "verify"]); p.add_argument("packet", nargs="?", help="packet hash prefix (verify)")
+    p.add_argument("--runs", type=int, default=3); p.add_argument("--anywhere", action="store_true", help="replay even outside the packet's region")
+    p.set_defaults(fn=cmd_special)
 
     p = sub.add_parser("preview"); p.add_argument("plan"); p.set_defaults(fn=cmd_preview)
     p = sub.add_parser("start"); p.add_argument("plan"); p.set_defaults(fn=cmd_start)
-    p = sub.add_parser("cancel"); p.set_defaults(fn=cmd_cancel)
+    p = sub.add_parser("cancel"); p.add_argument("--expedition", help="which armed expedition (needed when several heroes have one)")
+    p.set_defaults(fn=cmd_cancel)
     p = sub.add_parser("pause"); p.set_defaults(fn=cmd_pause)
     p = sub.add_parser("claim"); p.add_argument("--dry-run", action="store_true"); p.add_argument("--no-ingest", action="store_true")
+    p.add_argument("--expedition", help="which armed expedition (needed when several heroes have one)")
     p.add_argument("--speed", choices=sorted(DELIVERY_SPEEDS), default="normal", help="delivery speed for a new claim (a paused claim keeps its own)")
     p.add_argument("--filtered", choices=["convert", "keep"], default="keep",
                    help="items the game's loot filter hides, for a new claim: sell below Satanic and break Satanic and above down like the Prospector, or keep them")

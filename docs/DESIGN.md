@@ -1,4 +1,4 @@
-# AFK FARM 0.6.5 — measured-kill product
+# AFK FARM 0.7.0 — measured-kill product
 
 The earlier combat-reconstruction project is archived outside the active tree.
 The product uses empirical kills per region-second and native reward replay.
@@ -176,3 +176,89 @@ the real 2 h claim's records: of 64,123 hidden items, 61,733 were below Satanic
 (3,544,084 gold at their sale value) and 2,390 were Satanic C/B/A tier
 (38,154 Satanic Crystal Fragments). The live credit, the recipe read and one
 created stack still need a game session (`afk convert probe`).
+
+## 0.7.0: roster, collection, Siege, special monsters and workers
+
+**Hero roster.** `state.json` schema 2 keeps one armed expedition per hero under
+`expeditions`; claims, cancels and recoveries name the expedition (`--expedition`)
+or find it through the hero. The clock, plan, checkpoint and spool of every
+expedition were already keyed by its id, so nothing else changed: delivery is still
+one claim at a time, for the hero loaded in the game.
+
+**Collection and wishlist.** Read-only over delivered spools: a Set-or-better record
+whose native display name is a collectible's (web/collection.json, built from the
+Item Editor catalog; names are unique there) counts. Per-spool results are cached by
+size and time. A claim's wishlist drops show one Windows toast. The share card is
+drawn in the browser from `/api/share`; nothing is uploaded.
+
+**Siege.** A challenge layer over the measured pace (tools/siege.py): waves demand
+a growing kill rate; the hero's rate is its calibrated pace times the mean of five
+one-minute factors of its own calibration, damped by the calibration's length (full
+weight from 30 minutes). Waves it cannot keep up with damage a gate. Kills equal
+farming while the gate holds; special waves replay the calibration's own elite,
+goblin or verified boss packets; the level adds Magic Find. The timeline is drawn
+once from a stored seed, so claiming early or late never re-rolls it. It is not a
+combat model: say so wherever it is presented.
+
+**Special monsters.** Packets whose native rank is outside 1-4 no longer close a
+calibration; `afk.replayable` leaves them out of every plan until `afk special
+verify` replayed one cleanly in statistics runs (XP and gold off, items kept out of
+the Vault). Verified packets replay at their measured rate and in boss waves.
+
+**Workers.** A designed game layer (tools/workers.py), not a measurement: levels,
+skills and haul sizes are its own rules. What the game does: the plugin
+(`afk worker pay`) takes a hire or reset price from the loaded offline hero through
+the purchase path the game's merchant uses (`PickUpGoldCheck` with a fresh
+`GetCounterHash` and a negative amount), requires the gold to fall by exactly the
+price with no anti-cheat report and no server link, saves at once and gives the gold
+back if the save fails; one receipt per request. `afk worker deliver` creates every
+stack of a planned haul with `LootGroundCreate` (the call a mining node uses) into
+the delivery's own spool, and rolls the Gem Sense share per unit with the
+Prospector's ore recipe and the game's `irandom` (one roll per output, first hit
+wins, as the Prospector does). Only mining ores (27-32), jewel materials (0-23),
+Satanic Crystal (58), its fragment (60) and Destiny Shard Fragment (66) may be
+delivered. A haul is planned once from the trip's seed and never re-rolled; a
+delivery that stopped part way is never made again and can be closed as partial.
+
+Live check (2026-09-24, verified build, ForgePact and the Tracker producer loaded):
+`afk worker pay` took 1 gold (the gold fell by exactly 1, the game saved the
+character and account, no anti-cheat report; the same request again was refused);
+`afk worker deliver` made 50 Copper Ore and 3 Satanic Crystal Fragments and turned
+30 Copper Ore through the Prospector's recipe into 12 jewelcrafting materials (40%;
+about 41% expected), 5 stacks recorded in the delivery's spool and nothing given to
+the hero; the same delivery again was refused. The research commands
+`call`/`gvar`/`gvars` no longer resolve numbers as protected handles: a gold amount
+in that range crashed the game in the anti-cheat module.
+
+Panel check (2026-09-24, same build, two heroes): the 1-gold payment above was still
+missing after a game restart; Suh's 30-minute Siege (Act 2-5, level 34) and Sgham's
+15-minute expedition (Act 4-3) ran at the same time; a claim of Suh's Siege with
+Sgham loaded was refused; each claim delivered with its own hero (the Siege: 6 waves,
+gate at 20 of 100, a new record, 3,864 items, 808,164 gold plus 1,911,459 from sold
+items - the in-game gold matched to the unit - a wishlist drop and 31 new collection
+entries); hiring the first miner took exactly 250,000 gold and saved; its 1-hour
+Copper trip was collected right after a claim (179 ore to the Vault, level 3).
+Not yet live: a boss verify (no boss packet captured).
+
+What that check and the review of the pull request changed:
+- A payment whose reply timed out was recorded as refused although the game could
+  still run it; a retry under a new request could then pay twice. It is now
+  `unknown` until its receipt appears; the purchase is completed then, once, and a
+  new payment first finishes the unanswered one under its own request id.
+- The suggested Siege level must also keep the gate standing (fall chance at most
+  25%): level 35 lasted the 6 waves but fell on the last one in every run.
+- A Siege lasts whole waves (the duration rounds down to 5 minutes); a duration
+  between two waves left the last planned wave out of reach.
+- The collection cache is shared by the panel's request threads; it is now written
+  under one lock with a temporary file per writer.
+- The share card counted waves fully held ("0 WAVES" after 6) and only the dropped
+  gold; it shows the waves fought and all the gold the claim paid.
+- Ready notifications stay on screen until closed: over a full-screen game a plain
+  toast was only heard (Windows had it at 11:24:33; nothing was seen).
+- Claim output prints XP as a whole number.
+- Chest openings no longer scale into plans: calibrations record them as breaks,
+  and a 5.6-minute Act 3-3 calibration with 6 Abyss-chest and 6 world-chest calls
+  made plans open about 11 Abyss chests an hour (a rare map event) and golden and
+  crystal chests without spending keys. Chests are left out of expeditions and
+  Siege waves; the Siege's break rate leaves them out too. Siege treasure waves now
+  also count orb and ore goblins (all five loot goblins).

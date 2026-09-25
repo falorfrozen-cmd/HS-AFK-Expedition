@@ -400,7 +400,7 @@ async function poll(){
   clearTimeout(pollTimer);
   pollPromise=(async()=>{
     try{
-      const response=await fetch('/api/state');if(!response.ok)throw Error('Connection to the panel was lost.');data=await response.json();
+      const response=await fetch('/api/state?slot='+encodeURIComponent(selected));if(!response.ok)throw Error('Connection to the panel was lost.');data=await response.json();
       if(data.job?.state==='done'&&lastJob!==data.job.id){lastJob=data.job.id;toast(completedActionMessage());}
       const c=data.calibration;
       const next=JSON.stringify([view,selected,room,world,data.characters,data.profiles.map(p=>[p.id,p.usable,p.built_at,p.problems]),data.armed,data.plan?.character,data.rewards.map(r=>[r.id,r.stages]),data.job?.state,data.job?.id,data.job?.error,data.live?.plugin,data.live?.room,data.live?.character,data.live?.farm_context?.hash,data.live?.capture_on,data.live?.replay_running,data.game_running,data.editor,data.installation,c?.session,c?.character,c?.room,c?.running,c?.invalid,c?.outcome?.status,c?.outcome?.profile_id,c?.save_error,data.progress.state,data.progress.pause,data.progress.reconciliation_required,data.recovery?.status,data.validations,data.portraits,data.reward_modifiers,data.claim_context_matches,data.progress.resumable,data.loot_filter,data.loot_filter_error,data.preferences,data.repeat,data.profile_live_matches,data.background,data.rewards.map(r=>[r.level_now,r.stages?.ingest])]);

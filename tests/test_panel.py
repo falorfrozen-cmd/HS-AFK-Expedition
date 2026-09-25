@@ -2,6 +2,8 @@ import io,json,sys,tempfile,threading,time,unittest,urllib.request,urllib.error
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
+import os
+os.environ['AFK_NOTIFY_DISABLED'] = '1'   # tests never schedule real Windows tasks or toasts
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
 import panel,afk
 
@@ -21,9 +23,12 @@ class PanelTests(unittest.TestCase):
             with self.subTest(key=key):self.assertTrue(panel.profile_problems(p,'B'))
     def test_same_name_different_save_slots_are_distinct(self):
         c=self.good()['character'];self.assertFalse(panel.same_character(c,dict(c,slot=0)))
-    def test_unsupported_activity_and_boss_packets_are_closed(self):
-        for changes in [dict(room='Unstable_Rift_03_03'),dict(packets=[dict(kind='kill',rank=5)])]:
+    def test_unsupported_activity_and_unranked_packets_are_closed_but_a_boss_kill_is_not(self):
+        for changes in [dict(room='Unstable_Rift_03_03'),dict(packets=[dict(kind='kill')])]:
             p=self.good();p.update(changes);self.assertTrue(panel.profile_problems(p))
+        # 0.7.0: an unverified boss is left out of the plan (afk.replayable), not the whole calibration.
+        p=self.good();p['packets']=[dict(kind='kill',rank=1),dict(kind='kill',rank=5)];self.assertEqual(panel.profile_problems(p,'B'),[])
+        self.assertFalse(afk.replayable(dict(kind='kill',rank=5,hash='x'),{}));self.assertTrue(afk.replayable(dict(kind='kill',rank=5,hash='x'),{'x':{}}))
     def test_failure_overrides_done_progress(self):
         afk.write_json(self.root/'sessions/x.progress.json',dict(state='done',calls_done=100,calls_total=100))
         afk.write_json(self.root/'sessions/x.failure.json',dict(state='error',calls_done=30,calls_total=100,error='write failed'))
@@ -125,7 +130,7 @@ class PanelTests(unittest.TestCase):
                 afk.cmd_start(SimpleNamespace(plan=args[1]))
             with patch.object(app,'cli',side_effect=cli),patch.object(app,'fresh',side_effect=AssertionError('Offline start contacted the game')),patch.object(afk,'Ipc',side_effect=AssertionError('Offline start sent IPC')):
                 app.action('start',dict(slot=1,profile='example',hours=.25))
-            state=afk.read_json(self.root/'state.json');plan=afk.read_json(Path(state['armed']['plan']))
+            state=afk.load_state(self.root/'state.json');plan=afk.read_json(Path(afk.armed_list(state)[0]['plan']))
             self.assertEqual(plan['character'],p['character']);self.assertEqual(plan['farm_context'],p['farm_context'])
             self.assertEqual(plan['preview']['kills'],188)
             before=(self.root/'state.json').read_bytes()

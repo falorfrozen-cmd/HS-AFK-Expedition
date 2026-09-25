@@ -26,6 +26,7 @@
 #include <AfkExpedition/Packet.hpp>
 #include <AfkExpedition/RuntimeState.hpp>
 #include <AfkExpedition/Conversion.hpp>
+#include <AfkExpedition/Worker.hpp>
 #include <iomanip>
 #include <limits>
 #include <stdexcept>
@@ -769,6 +770,7 @@ struct ConversionState {
 static ConversionState g_Conv;
 static AfkExpedition::ItemFacts g_PendingFacts;   // facts of the item in g_PendingSpoolItem
 static bool g_CreatingOutput = false;             // one of our fragment stacks is being built
+static std::string g_OutputSource = "prospect";  // what the stacks being built are: prospect | worker
 static std::string ConversionJson();
 static std::ofstream g_SpoolStream;
 static void SpoolWriteLine(const std::string& line)
@@ -952,7 +954,7 @@ static RValue& Hook_LootGroundCreate(CInstance* S, CInstance* O, RValue& R, int 
                           + ",\"filter_highlight\":" + (((hi.m_Kind == VALUE_BOOL || IsNumberKind(hi)) && hi.ToBoolean()) ? "true" : "false");
                 } catch (...) { extra = ",\"placed\":true"; }
                 // Fragments the player chose are never filtered away again.
-                if (g_CreatingOutput) extra += ",\"source\":\"prospect\"";
+                if (g_CreatingOutput) extra += ",\"source\":\"" + g_OutputSource + "\"";
                 if (!(hidden && ConvertPendingItem(extra))) {
                     if (hidden) ++g_SpoolFiltered;
                     FlushPendingSpoolItem(extra);
@@ -1982,7 +1984,9 @@ static void InstallCloseGuard();
 // global.prospectResult, filled by DefineProspectCombos). Only recipes that
 // take Satanic and above ("unique") matter here; a single-id amount is stored
 // protected and read through the game's own PilipaliDecrypt, as the game does.
-static bool LoadProspectRecipes(std::vector<AfkExpedition::ProspectRecipe>& out, std::string& why, std::vector<std::string>* report = nullptr)
+// ores = false: the recipes for Satanic and above equipment (break-down);
+// ores = true: the recipes that take a mining ore (a worker's Gem Sense).
+static bool LoadProspectRecipes(std::vector<AfkExpedition::ProspectRecipe>& out, std::string& why, std::vector<std::string>* report = nullptr, bool ores = false)
 {
     out.clear();
     try {
@@ -2043,10 +2047,10 @@ static bool LoadProspectRecipes(std::vector<AfkExpedition::ProspectRecipe>& out,
                 if (out.type >= 0 && !out.ids.empty()) r.outputs.push_back(out);
             }
             if (report) report->push_back(line);
-            if (r.unique && !r.types.empty() && !r.outputs.empty()) out.push_back(r);
+            if (!r.types.empty() && !r.outputs.empty() && (ores ? !r.unique && AfkExpedition::WorkerOre(r.baseId) : r.unique)) out.push_back(r);
         }
     } catch (...) { why = "reading the Prospector recipe table threw"; out.clear(); return false; }
-    if (out.empty()) { why = "no Prospector recipe for Satanic and above items was readable"; return false; }
+    if (out.empty()) { why = ores ? "no Prospector recipe for mining ores was readable" : "no Prospector recipe for Satanic and above items was readable"; return false; }
     return true;
 }
 static void WriteBackSales(const std::string& why)
@@ -2541,6 +2545,209 @@ static void CmdExpeditionAbort()
     ExpeditionFinish("aborted");
 }
 
+// ------------------------------------------------------------------ workers
+// Workers (0.7.0, tools/workers.py): a hire or a skill reset costs the loaded
+// hero's gold, taken the way a merchant purchase takes it (STATIC 2026-09-23:
+// PickUpGoldCheck(hash, -price) with a GetCounterHash taken right before). Only
+// while no report could leave the game (SalesSafe) and with ReportClient
+// watched; the gold must fall by exactly the price, the game saves at once and
+// a failed save gives the gold back. One receipt per request id: a request
+// never pays twice.
+static void WriteSmallJson(const std::string& path, const std::string& json)
+{
+    std::error_code ec; fs::create_directories(fs::path(path).parent_path(), ec);
+    const std::string tmp = path + ".tmp";
+    { std::ofstream f(tmp, std::ios::binary | std::ios::trunc); f << json << "\n"; }
+    MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+}
+// amount < 0 spends like a purchase (two arguments, the purchase's mode);
+// amount > 0 gives back like a sale (mode 1).
+static bool GoldChange(CInstance* player, double amount, std::string& why)
+{
+    RValue hash, result;
+    AurieStatus st = g_Yytk->CallGameScriptEx(hash, HeroSiege::Scripts::gml_Script_GetCounterHash.data(), player, player, {});
+    if (!AurieSuccess(st) || hash.m_Kind != VALUE_STRING) { why = "GetCounterHash returned no hash"; return false; }
+    std::vector<RValue> args = { hash, RValue(amount) };
+    if (amount > 0) { args.push_back(RValue(1.0)); args.push_back(RValue()); args.push_back(RValue()); args.push_back(RValue()); }
+    st = g_Yytk->CallGameScriptEx(result, HeroSiege::Scripts::gml_Script_PickUpGoldCheck.data(), player, player, args);
+    if (!AurieSuccess(st) || (result.m_Kind == VALUE_BOOL && !result.ToBoolean())) { why = "PickUpGoldCheck refused"; return false; }
+    return true;
+}
+static double GoldNumber(CInstance* player)
+{
+    const RValue gold = GoldAmount(player);
+    return IsNumberKind(gold) ? gold.ToDouble() : -1;
+}
+static void CmdWorkerPay(const std::string& request, const std::string& amountText)
+{
+    if (!AfkExpedition::SafeIdentifier(request, 8, 64)) { Out("worker pay: invalid request id"); return; }
+    const std::string path = DATA_ROOT + "\\models\\worker-pay-" + request + ".json";
+    if (fs::exists(path)) { Out("worker pay " + request + ": already processed; see the receipt"); return; }
+    char* end = nullptr;
+    const double amount = std::strtod(amountText.c_str(), &end);
+    auto receipt = [&](bool ok, const std::string& why, double before, double after, const std::string& saved) {
+        std::ostringstream o;
+        o << std::setprecision(17) << "{\"schema\":1,\"request_id\":\"" << JsonEscape(request) << "\",\"ok\":" << (ok ? "true" : "false")
+          << ",\"amount\":" << (std::isfinite(amount) ? amount : -1) << ",\"gold_before\":" << before << ",\"gold_after\":" << after
+          << ",\"saved\":\"" << JsonEscape(saved) << "\",\"error\":\"" << JsonEscape(why) << "\",\"character\":" << CharacterStampJson()
+          << ",\"at\":\"" << NowIso() << "\",\"plugin\":\"" AFK_EXPEDITION_VERSION "\"}";
+        WriteSmallJson(path, o.str());
+        Out("worker pay " + request + ": " + (ok ? "paid " : "refused ") + std::to_string(static_cast<long long>(std::isfinite(amount) ? amount : 0))
+            + " gold" + (why.empty() ? "" : " | " + why));
+    };
+    if (!end || *end || !AfkExpedition::ValidPayment(amount)) { receipt(false, "invalid amount", -1, -1, ""); return; }
+    if (g_Exp.running) { receipt(false, "a reward delivery is running", -1, -1, ""); return; }
+    std::string why;
+    if (!SalesSafe(why)) { receipt(false, why, -1, -1, ""); return; }
+    if (!InstallReportWatch()) { receipt(false, "anti-cheat reports cannot be watched", -1, -1, ""); return; }
+    ReplayEnv env;
+    if (!PrepareReplayEnv(env, why)) { receipt(false, why, -1, -1, ""); return; }
+    if (CurrentIdentityKey().empty()) { receipt(false, "no offline hero is loaded", -1, -1, ""); return; }
+    try {
+        const double had = GoldNumber(env.pi);
+        if (had < 0) { receipt(false, "the gold amount could not be read", -1, -1, ""); return; }
+        if (had < amount) { receipt(false, "not enough gold", had, had, ""); return; }
+        const uint64_t reports = g_ReportClientCalls.load();
+        const bool called = GoldChange(env.pi, -amount, why);
+        const double now = GoldNumber(env.pi);
+        if (g_ReportClientCalls.load() != reports) why = "the game raised an anti-cheat report";
+        const bool taken = now >= 0 && std::fabs(had - now - amount) <= 0.5;
+        if (!called || !taken || !why.empty()) {
+            // The purchase did not run, or did something else: give back what
+            // it took, then refuse.
+            if (taken) { std::string ignored; GoldChange(env.pi, amount, ignored); }
+            receipt(false, why.empty() ? "the gold did not fall by the price" : why, had, GoldNumber(env.pi), "");
+            return;
+        }
+        const std::string saved = PersistRewards();
+        if (saved.rfind("saved (", 0) != 0) {
+            std::string refundWhy;
+            const bool refunded = GoldChange(env.pi, amount, refundWhy);
+            receipt(false, "the game did not save (" + saved + "); " + (refunded ? "the gold was given back" : "giving the gold back failed: " + refundWhy),
+                    had, GoldNumber(env.pi), saved);
+            return;
+        }
+        receipt(true, "", had, now, saved);
+    } catch (...) { receipt(false, "the purchase threw", -1, -1, ""); }
+}
+
+// A worker's haul: every stack is made by the game's own ground-drop routine
+// (the call a mining node uses) and goes to its own spool, like the fragments
+// of a break-down; the Gem Sense share is rolled unit by unit with the
+// Prospector's ore recipe and the game's dice. One result file per delivery:
+// a delivery that finished is never made again, one that stopped half way
+// needs review.
+static bool g_WorkerDelivering = false;
+static void CmdWorkerDeliver(const std::string& planPath)
+{
+    const std::string text = ReadFileText(planPath);
+    if (text.empty()) { Out("worker deliver: cannot read " + planPath); return; }
+    RValue plan;
+    try { plan = g_Yytk->CallBuiltin("json_parse", { RValue(text) }); } catch (...) { Out("worker deliver: plan json_parse threw"); return; }
+    RValue idValue = StructGet(plan, "delivery_id");
+    const std::string id = idValue.m_Kind == VALUE_STRING ? idValue.ToString() : "";
+    if (!AfkExpedition::SafeIdentifier(id) || id.rfind("worker_", 0) != 0) { Out("worker deliver: invalid delivery id"); return; }
+    const std::string resultPath = DATA_ROOT + "\\sessions\\" + id + ".result.json";
+    if (fs::exists(resultPath)) {
+        const std::string previous = ReadFileText(resultPath);
+        Out("worker deliver " + id + (previous.find("\"state\":\"done\"") != std::string::npos ? ": already done" : ": a previous attempt stopped; review needed"));
+        return;
+    }
+    if (g_Exp.running || g_WorkerDelivering) { Out("worker deliver: a delivery is running; try again when it is done"); return; }
+    if (!InstallDropItemHook()) { Out("worker deliver: required native hooks not installed"); return; }
+    std::string why;
+    if (!SalesSafe(why)) { Out("worker deliver: " + why); return; }
+    ReplayEnv env;
+    if (!PrepareReplayEnv(env, why)) { Out("worker deliver: " + why); return; }
+    if (fs::exists(DATA_ROOT + "\\spool\\" + id + ".ndjson")) { Out("worker deliver: records exist without a result; review needed"); return; }
+    std::map<std::string, long long> make, prospect, outputs, created;
+    auto amountOf = [](const RValue& v) { return IsNumberKind(v) && v.m_Kind != VALUE_BOOL && std::isfinite(v.ToDouble()) && std::floor(v.ToDouble()) == v.ToDouble()
+                                              ? static_cast<long long>(v.ToDouble()) : -1LL; };
+    try {
+        RValue items = StructGet(plan, "items");
+        const int n = items.m_Kind == VALUE_ARRAY ? static_cast<int>(g_Yytk->CallBuiltin("array_length", { items }).ToDouble()) : -1;
+        if (n < 0) { Out("worker deliver: plan lacks items[]"); return; }
+        for (int i = 0; i < n; ++i) {
+            RValue it = g_Yytk->CallBuiltin("array_get", { items, RValue(static_cast<double>(i)) });
+            const long long type = amountOf(StructGet(it, "type")), item = amountOf(StructGet(it, "id")), amount = amountOf(StructGet(it, "amount"));
+            if (!AfkExpedition::WorkerMaterial(static_cast<int>(type), static_cast<int>(item)) || amount < 1) { Out("worker deliver: refused item " + std::to_string(type) + ":" + std::to_string(item)); return; }
+            long long& total = make[AfkExpedition::OutputKey(static_cast<int>(type), static_cast<int>(item))];
+            total += amount;
+            if (total > AfkExpedition::kMaxWorkerAmount) { Out("worker deliver: amount too large"); return; }
+        }
+        RValue units = StructGet(plan, "prospect");
+        if (units.m_Kind == VALUE_OBJECT) {
+            RValue names = g_Yytk->CallBuiltin("variable_struct_get_names", { units });
+            const int k = names.m_Kind == VALUE_ARRAY ? static_cast<int>(g_Yytk->CallBuiltin("array_length", { names }).ToDouble()) : 0;
+            for (int i = 0; i < k; ++i) {
+                RValue name = g_Yytk->CallBuiltin("array_get", { names, RValue(static_cast<double>(i)) });
+                int type = -1, ore = -1;
+                const long long amount = amountOf(StructGet(units, name.ToString().c_str()));
+                if (name.m_Kind != VALUE_STRING || !AfkExpedition::ParseOutputKey(name.ToString(), type, ore) || type != AfkExpedition::kMaterialType
+                    || !AfkExpedition::WorkerOre(ore) || amount < 0 || amount > AfkExpedition::kMaxWorkerAmount) { Out("worker deliver: refused prospect entry"); return; }
+                if (amount) prospect[name.ToString()] = amount;
+            }
+        }
+    } catch (...) { Out("worker deliver: reading the plan threw"); return; }
+    if (!prospect.empty()) {
+        std::vector<AfkExpedition::ProspectRecipe> recipes;
+        if (!LoadProspectRecipes(recipes, why, nullptr, true)) { Out("worker deliver: " + why); return; }
+        for (const auto& [key, units] : prospect) {
+            int type = -1, ore = -1; AfkExpedition::ParseOutputKey(key, type, ore);
+            const AfkExpedition::ProspectRecipe* recipe = AfkExpedition::FindOreRecipe(ore, recipes);
+            if (!recipe) { Out("worker deliver: the Prospector has no recipe for ore " + key); return; }
+            for (long long u = 0; u < units; ++u) {
+                int outType = -1, outId = -1; long long amount = 0;
+                if (AfkExpedition::ProspectYieldEach(*recipe, [] { return GameRandom(99); }, [](int count) { return GameRandom(count - 1); }, outType, outId, amount)
+                    && AfkExpedition::WorkerMaterial(outType, outId))
+                    outputs[AfkExpedition::OutputKey(outType, outId)] += amount;
+            }
+        }
+    }
+    g_WorkerDelivering = true;
+    g_Conv = ConversionState{};
+    SpoolBegin(id);
+    uint64_t stacks = 0; std::string error;
+    std::map<std::string, long long> all = make;
+    for (const auto& [key, amount] : outputs) all[key] += amount;
+    g_OutputSource = "worker";
+    for (const auto& [key, total] : all) {
+        int type = -1, item = -1; AfkExpedition::ParseOutputKey(key, type, item);
+        for (long long n : AfkExpedition::StackSizes(total, true)) {
+            const uint64_t before = g_SpoolItems;
+            bool called = false;
+            try {
+                RValue def = g_Yytk->CallBuiltin("json_parse", { RValue("{\"o\":" + std::to_string(n) + ",\"b\":" + std::to_string(item) + ",\"j\":0,\"c\":0}") });
+                g_CreatingOutput = true; g_ReplayActive = true; g_CtxKind = "replay"; g_CtxPacket = "worker";
+                RValue result;
+                called = AurieSuccess(g_Yytk->CallGameScriptEx(result, HeroSiege::Scripts::gml_Script_LootGroundCreate.data(), env.pi, env.pi,
+                    { RValue(env.px + 96.0), RValue(env.py), RValue(static_cast<double>(type)), def, RValue(), RValue() }));
+            } catch (...) { called = false; }
+            if (!g_PendingSpoolItem.empty()) FlushPendingSpoolItem(",\"placed\":false,\"source\":\"worker\"");
+            g_CreatingOutput = false; g_ReplayActive = false; g_CtxKind = "none"; g_CtxPacket.clear();
+            if (!called || g_SpoolItems != before + 1) { error = "a stack of " + key + " could not be created"; break; }
+            created[key] += n; ++stacks;
+        }
+        if (!error.empty()) break;
+    }
+    g_OutputSource = "prospect";
+    SpoolEnd(static_cast<long long>(stacks), error.empty() ? "summary" : "partial");
+    g_WorkerDelivering = false;
+    std::ostringstream o;
+    auto map = [&](const std::map<std::string, long long>& m) {
+        std::string s = "{"; bool first = true;
+        for (const auto& [k, v] : m) { s += std::string(first ? "" : ",") + "\"" + k + "\":" + std::to_string(v); first = false; }
+        return s + "}";
+    };
+    o << "{\"schema\":1,\"delivery_id\":\"" << JsonEscape(id) << "\",\"state\":\"" << (error.empty() ? "done" : "error") << "\",\"error\":\"" << JsonEscape(error)
+      << "\",\"created\":" << map(created) << ",\"requested\":" << map(make) << ",\"prospected\":" << map(prospect) << ",\"prospect_outputs\":" << map(outputs)
+      << ",\"stacks\":" << stacks << ",\"items\":" << g_SpoolItems << ",\"spool\":\"" << JsonEscape(DATA_ROOT + "\\spool\\" + id + ".ndjson")
+      << "\",\"character\":" << CharacterStampJson() << ",\"room\":\"" << JsonEscape(CurrentRoomName()) << "\",\"at\":\"" << NowIso()
+      << "\",\"plugin\":\"" AFK_EXPEDITION_VERSION "\"}";
+    WriteSmallJson(resultPath, o.str());
+    Out("worker deliver " + id + ": " + (error.empty() ? "done" : "error: " + error) + ", " + std::to_string(stacks) + " stacks");
+}
+
 // ------------------------------------------------ closing the game window
 // Closing the window during delivery used to leave a "running" checkpoint
 // that needs manual review (MEASURED 2026-09-23: a 2 h claim stopped at 78.6%
@@ -2869,6 +3076,12 @@ static void RunCommand(const std::string& raw)
         Out("expedition: usage -> expedition start <plan.json> | status | abort"); return;
     }
     if (w0 == "save") { Out("save: " + PersistRewards()); return; }
+    if (w0 == "worker") {
+        // worker pay <request-id> <gold> | worker deliver <plan.json> (tools/workers.py)
+        if (w1 == "pay") { std::string amount; ss >> amount; CmdWorkerPay(w2, amount); return; }
+        if (w1 == "deliver") { std::string rest; std::getline(ss, rest); CmdWorkerDeliver(w2 + rest); return; }
+        Out("worker: usage -> worker pay <request-id> <gold> | worker deliver <plan.json>"); return;
+    }
     if (w0 == "goto") {
         // goto <RoomName>: travel with the game's own RoomGoto (what a portal
         // uses), self = the controller. Research / automation.
@@ -3003,7 +3216,9 @@ static void RunCommand(const std::string& raw)
             std::string line = "call " + w1 + "(" + std::to_string(args.size()) + " args";
             for (auto& a : args) line += " k" + std::to_string((int)a.m_Kind) + ":" + Stringify(a).substr(0, 20);
             line += "): st=" + std::to_string((int)st) + " -> " + Stringify(res).substr(0, 400);
-            if (IsNumberKind(res) && res.ToDouble() > 100000 && res.ToDouble() < 10000000) line += "  [as handle -> " + ResolveProtected(res) + "]";
+            // Never resolve a result as a protected handle here: a plain number in
+            // the handle range (MEASURED 2026-09-24: GetGoldAmount's 1.48 M gold)
+            // made the anti-cheat module read an invalid handle and crash the game.
             Out(line);
         } catch (...) { Out("call: EXCEPTION"); }
         return;
@@ -3066,7 +3281,7 @@ static void RunCommand(const std::string& raw)
                 label += " (array length " + std::to_string((int)g_Yytk->CallBuiltin("array_length", { v }).ToDouble()) + ")";
             }
             std::string line = label + " = " + Stringify(v).substr(0, 300);
-            if (IsNumberKind(v) && v.ToDouble() > 100000 && v.ToDouble() < 10000000) line += "  [as handle -> " + ResolveProtected(v) + "]";
+            // No automatic handle resolution: an ordinary number in the handle range crashes the game (see `call`).
             Out(line);
         } catch (...) { Out("gvar: EXCEPTION"); }
         return;
@@ -3148,7 +3363,6 @@ static void RunCommand(const std::string& raw)
                 if (!w1.empty()) { std::string lo = name, f = w1; for (auto& c : lo) c = (char)tolower(c); for (auto& c : f) c = (char)tolower(c); if (lo.find(f) == std::string::npos) continue; }
                 RValue v = g_Yytk->CallBuiltin("variable_global_get", { nm });
                 std::string line = "  " + name + " = " + Stringify(v).substr(0, 120);
-                if (IsNumberKind(v) && v.ToDouble() > 100000 && v.ToDouble() < 10000000) line += "  [handle? " + ResolveProtected(v) + "]";
                 Out(line); if (++shown >= 400) { Out("  ..."); break; }
             }
             Out("gvars: " + std::to_string(n) + " globals, " + std::to_string(shown) + " shown");

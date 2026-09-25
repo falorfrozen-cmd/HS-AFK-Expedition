@@ -7,6 +7,8 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+import os
+os.environ['AFK_NOTIFY_DISABLED'] = '1'   # tests never schedule real Windows tasks or toasts
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
 import afk,ingest_spool,loot_filter,panel,product_data,recovery
 
@@ -113,7 +115,7 @@ class PauseAndResumeTests(unittest.TestCase):
         app=panel.Panel(self.d)
         with patch.object(app,'fresh',return_value=live),patch.object(app,'cli') as cli:
             app.action('claim',dict(speed='fast'))
-            self.assertEqual(cli.call_args.args,('claim','--speed','fast','--filtered','convert'))
+            self.assertEqual(cli.call_args.args,('claim','--expedition','e','--speed','fast','--filtered','convert'))
             self.write(state='paused',save_committed=False,saved='');cli.reset_mock()
             with self.assertRaises(ValueError):app.action('claim',{})
             cli.assert_not_called()
@@ -335,7 +337,7 @@ class FilteredItemsTests(unittest.TestCase):
         afk.write_json(self.d/'preferences.json',dict(filtered_items='keep'))
         with patch.object(app,'cli') as cli:
             app.claim(dict(expedition_id='e',plan=str(self.d/'missing.json')),'normal')
-        self.assertEqual(cli.call_args.args,('claim','--speed','normal','--filtered','keep'))
+        self.assertEqual(cli.call_args.args,('claim','--expedition','e','--speed','normal','--filtered','keep'))
 
 
 class DeliverySpeedTests(unittest.TestCase):
