@@ -48,3 +48,53 @@ collecting are simulated). Never run tools/panel.py against real data for UI wor
 
 Keep keyboard/focus/narrow-screen behaviour of 0.6.5. Extend
 tests/test_panel_ui.cjs for the new views. Report in docs/UI_REFRESH_VERIFICATION.md.
+
+# 0.9 addendum — the town UI
+
+The engine of the town is done and tested: `docs/UI_CONTRACT.md`, section "0.9: the
+town". The fixture seeds all of it:
+- towers, plated walls, a coffer and a stocked camp;
+- a siege under way (Act 3-3, level 6) and a finished one whose town share waits;
+- a bestiary of recorded monsters;
+- a wagon on the road and one home;
+- two merchants in town.
+Payouts, shipments and the town-share delivery are simulated.
+
+What to build (English UI only, no new dependencies, no API changes):
+1. **Town page.** A top-down sketch of the town: the keep in the middle, four walls
+   with health bars, armor and plating, tower slots per wall and at the keep.
+   - Each tower shows its level, kind, target priority and specialisation.
+   - Build, upgrade, plate and move with their *plans*: cost, time, materials and
+     blockers.
+   - The fortification queue, with countdowns.
+   - The coffer (Deposit / Collect gold) and the stock (goods by category, with
+     "Send to Vault" and "Take from Vault").
+2. **Siege planner.**
+   - Region picker from `/api/defense` `regions`, showing its bestiary size,
+     ranks, special content, goblins and the heroes who can be stationed.
+   - Level with **Suggest** (`/api/defense-forecast`, on demand only), hours, hero
+     posts with a stance, and the stone budget. Records per region.
+3. **Siege live view.**
+   - The clock: current and next wave, and the time to it.
+   - Walls, keep and the stone left.
+   - Each finished wave's groups with rank, tier and affix chips, kills and
+     leaks, plus the highlights.
+   - Who killed what, the Watchtower's scouting, and the Repair and Retreat
+     buttons.
+   - Never show waves after the clock. When it is over: the outcome, "Collect the
+     town's share", and each hero's claim on the roster.
+   - The watch: a "Keep watch" toggle with its level, hours and stone. Show the
+     paused reason, the waiting shares and "Collect all here" (`defense_collect`
+     with `all: true`).
+4. **Bestiary** per region (`/api/bestiary`): monsters by rank, with speed, range,
+   immunities, flying, affixes seen and slain counts.
+5. **Trade map.** The ten towns with distance, development, standing, tariff, news
+   and their market (ask/bid, stock). A wagon planner (cargo from stock, orders,
+   purse), wagons on the road with countdowns, "Unload" when home, and history.
+6. **Market Square.** Merchants in town with their time left, what they sell and
+   buy (next unit price, units left), buy and sell with a count, and the history.
+
+Show `job.error` texts as they come. A `pending_credits` entry needs care:
+- `unknown` means waiting for the game;
+- `review` means the game refused a payout although the hero's gold rose. Tell
+  the player to check the hero's gold. It is never paid twice.

@@ -45,6 +45,8 @@ connection to the Hero Siege servers. Choose it on the Loot page.
 
 0.8 (in progress): a **camp** you build up for your workers (nine buildings, camp resources, the Siege gate's Walls), **traits**, **adventurers** (world chests with the game's keys), **goblin hunters**, a **jeweler** working the game's own jewel recipes, and **team trips** with synergies; the key rack and the jeweler's stock are filled from the Vault's AFK Materials (Item Editor 2.16.1 or newer), never twice; every item still comes from the game's own routines.
 
+0.9 turns the camp into a **town**: walls and eight kinds of towers, **sieges** that bring the monsters you recorded (with their real affixes, plus the Abyss, Unholy Siege and Chaos Pillar packs) against it with stationed heroes, travelling **merchants** selling what the game's vendors never do, and **trade wagons** to ten towns. The town keeps its own coffer; every item it earns is still made by the game.
+
 0.7.0: **several heroes at once** (one expedition per hero), **Siege** (hold a
 calibrated region against growing waves: elite, treasure-goblin and boss waves, a
 Magic Find bonus per level, records), a **collection** of all 916 uniques and set

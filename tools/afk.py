@@ -311,33 +311,38 @@ def packet_index(hashes=None) -> dict[str, dict]:
         if not isinstance(d, dict):
             continue
         h = d.get("packet_hash") or f.stem
-        prot = d.get("protected") if isinstance(d.get("protected"), dict) else {}
-        # The death event hands the monster's protected `killExperience` to the
-        # experience routine (STATIC + MEASURED 2026-09-17); the packet's
-        # exp_reward is the base `experience` and is up to 3x smaller.
-        exp = prot.get("killExperience")
-        if not isinstance(exp, (int, float)):
-            exp = (d.get("exp_reward") or {}).get("resolved")
-        # A monster packet must carry the protected values the drop routine
-        # reads (MEASURED 2026-09-18: 20 of 317 packets lacked them because the
-        # capture's handle window was too narrow; replaying such a packet hands
-        # the ghost raw handle ids, which read as some other value or throw).
-        # Breakables too: a chest's snapshot carried `dSlots` as a raw handle
-        # id and one replay of it produced 4, then 0, then 6 650 items as the
-        # id drifted onto other counters (MEASURED 2026-09-18). Any drop
-        # variable that looks like a handle in the snapshot must be resolved.
-        needed = ("dSlots", "dCommonChance", "dCommonDropMult", "dSatanicDropMult", "killExperience", "extraMagicFind", "lootAmount")
-        snap = d.get("self_snapshot") if isinstance(d.get("self_snapshot"), dict) else {}
-        def looks_like_handle(v):
-            return isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 1000 and float(v).is_integer()
-        complete = all((k in prot) or not looks_like_handle(snap.get(k)) for k in needed)
-        if d.get("monster_key"):
-            complete = complete and all(k in prot for k in needed if k != "lootAmount")
-        idx[h] = {"monster_key": d.get("monster_key") or "", "self_object": d.get("self_object") or "",
-                  "rank": d.get("rank"), "room": d.get("room"), "exp": exp if isinstance(exp, (int, float)) else None,
-                  # breakables (chests, barrels) legitimately have no protected values: {} is still the deep format
-                  "deep": isinstance(d.get("protected"), dict), "complete": complete, "build": d.get("game_build_id")}
+        idx[h] = packet_entry(d)
     return idx
+
+
+def packet_entry(d: dict) -> dict:
+    """One packet file's index entry (see packet_index)."""
+    prot = d.get("protected") if isinstance(d.get("protected"), dict) else {}
+    # The death event hands the monster's protected `killExperience` to the
+    # experience routine (STATIC + MEASURED 2026-09-17); the packet's
+    # exp_reward is the base `experience` and is up to 3x smaller.
+    exp = prot.get("killExperience")
+    if not isinstance(exp, (int, float)):
+        exp = (d.get("exp_reward") or {}).get("resolved")
+    # A monster packet must carry the protected values the drop routine
+    # reads (MEASURED 2026-09-18: 20 of 317 packets lacked them because the
+    # capture's handle window was too narrow; replaying such a packet hands
+    # the ghost raw handle ids, which read as some other value or throw).
+    # Breakables too: a chest's snapshot carried `dSlots` as a raw handle
+    # id and one replay of it produced 4, then 0, then 6 650 items as the
+    # id drifted onto other counters (MEASURED 2026-09-18). Any drop
+    # variable that looks like a handle in the snapshot must be resolved.
+    needed = ("dSlots", "dCommonChance", "dCommonDropMult", "dSatanicDropMult", "killExperience", "extraMagicFind", "lootAmount")
+    snap = d.get("self_snapshot") if isinstance(d.get("self_snapshot"), dict) else {}
+    def looks_like_handle(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 1000 and float(v).is_integer()
+    complete = all((k in prot) or not looks_like_handle(snap.get(k)) for k in needed)
+    if d.get("monster_key"):
+        complete = complete and all(k in prot for k in needed if k != "lootAmount")
+    return {"monster_key": d.get("monster_key") or "", "self_object": d.get("self_object") or "",
+            "rank": d.get("rank"), "room": d.get("room"), "exp": exp if isinstance(exp, (int, float)) else None,
+            # breakables (chests, barrels) legitimately have no protected values: {} is still the deep format
+            "deep": isinstance(d.get("protected"), dict), "complete": complete, "build": d.get("game_build_id")}
 
 
 def latest_session_with_kills() -> Path | None:
@@ -778,6 +783,9 @@ def claim_plan_for(plan: dict, credited_h: float, claim_id: str) -> dict:
     if plan.get("mode") == "siege":
         import siege
         return siege.claim_plan(plan, credited_h, claim_id)
+    if plan.get("mode") == "defense":
+        import defense
+        return defense.claim_from_plan(plan, claim_id)
     factor = credited_h / float(plan["hours"]) if plan.get("hours") else 0.0
     return scale_plan(plan, factor, claim_id)
 
@@ -1173,6 +1181,8 @@ def cmd_claim(args) -> None:
               f"({pr_old.get('calls_done', 0)}/{pr_old.get('calls_total', 0)} calls); following it")
     else:
         scaled = claim_plan_for(plan, credited_h, claim_id)
+        if scaled.get('defense_claim'):
+            credited_h = scaled['scale'] * float(plan['hours'])
         if scaled.get('siege_claim'):
             import siege
             claim = scaled['siege_claim']
@@ -1184,6 +1194,8 @@ def cmd_claim(args) -> None:
             scaled['label'] = expedition_label(plan.get('label_hero'), plan['label_region'], credited_h)
             if scaled.get('siege_claim'):
                 scaled['label'] = f"Siege L{scaled['siege_claim']['level']} · " + scaled['label']
+            if scaled.get('defense_claim'):
+                scaled['label'] = f"Defense L{scaled['defense_claim']['level']} · " + scaled['label']
         apply_delivery_speed(scaled, getattr(args, 'speed', None) or 'normal')
         # Items the game's loot filter hides: sold / broken down by the plugin
         # during delivery ("convert"), or kept in the spool ("keep").
@@ -1196,6 +1208,13 @@ def cmd_claim(args) -> None:
         print("(dry run: nothing replayed, the clock stays armed)")
         return
     if scaled["preview"]["calls"] <= 0:
+        if scaled.get('defense_claim') and not reuse:
+            # a stationed hero that slew nothing (or only monsters of the town's share) goes home empty-handed
+            st = load_state()
+            settle_in_state(st, claim_id, {"expedition_id": claim_id, "credited_hours": credited_h, "at": iso(now_utc()), "result": None})
+            save_state(st)
+            print("the siege is over and this hero has nothing to claim; the hero is free again")
+            return
         print("nothing to credit yet")
         return
     if not reuse:

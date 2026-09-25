@@ -1,4 +1,4 @@
-# AFK FARM panel contract — 0.7.0
+# AFK FARM panel contract — 0.9.0
 
 The product interface is English only, including accessibility labels, server
 messages and launcher dialogs. Number formatting uses en-US. Player names, game
@@ -534,7 +534,8 @@ refuses it; an `unknown` payment keeps them until its receipt decides.
 **Keys and materials from the Vault.** The key rack (Basic Key `12:0`, Crystal Key
 `12:1`) and the Jeweler's stock (jewel recipe materials `14:0`-`14:23`, `14:44`)
 are filled from the Item Editor's Vault, category AFK Materials, through the
-editor's `POST /api/vault/afk-take` (Item Editor 2.16.1 or newer). The key rack
+editor's `POST /api/vault/afk-take` (Item Editor 2.16.1 or newer). From 0.9 the
+stock takes every town good (see 0.9 below). The key rack
 holds 25/60/120/250/500 keys by Storehouse level; the stock 500 to 25,000.
 
 - `GET /api/camp/vault` asks the running editor: `editor` (bool), `stock`
@@ -634,3 +635,385 @@ On-site Cutting (miner + jeweler), Deep Vein (adventurer + miner), Full Caravan
 Siege plans and `/api/siege-forecast` use the gate the Walls give; the forecast adds
 `gate_hp`, and the plan's `siege` carries `gate_hp` and `gate` {`hp`, `repair`,
 `max_damage`}.
+
+## 0.9: the town (engine; UI to be designed)
+
+Rules and numbers are in the module notes of:
+- `tools/town_panel.py` (the panel side);
+- `defense.py`, `battle.py`, `bestiary.py` and `fortifications.py` (sieges);
+- `town.py` (fortifications in workers.json);
+- `trade.py` (towns and wagons), `merchants.py` and `economy.py` (prices);
+- `goods.py` (the goods list).
+
+All of it is AFK FARM's own layer, except where it touches the game:
+- **Items.** Every item is still made by the game. A siege's kills are replays of
+  recorded kill packets in the siege's region, and goods leave for the Vault as
+  stacks the plugin makes with the game's ground-drop routine.
+- **Gold.** Gold enters and leaves the town's coffer only through receipts.
+
+Product text stays English. Numbers are whole gold, whole units, UTC ISO times.
+
+### The coffer, the stock and the town's goods
+
+The town keeps its own gold, the **coffer**. Fortifications, merchants and wagons pay
+from it and earn into it, so the town runs while the game is closed. Moving gold
+between the coffer and the game takes an offline hero in the game:
+- **Deposit.** The hero's gold goes into the coffer through the purchase path,
+  as payment purpose `deposit`, with the same receipts as every camp payment.
+- **Payout.** Coffer gold goes to the hero through `afk worker credit`, plugin
+  0.9.0-town. Receipt: `models/worker-credit-<request>.json`. The records are in
+  workers.json `credits`, with `state` `pending`, `unknown`, `paid`, `refused` or
+  `review`.
+  - The amount leaves the coffer when the payout is asked for.
+  - A refusal puts it back.
+  - An `unknown` payout is settled when its receipt arrives, never paid twice.
+  - `review`: the game refused the payout, yet the hero's gold rose (a take-back
+    that failed). The amount stays out of the coffer; tell the player to check the
+    hero's gold.
+
+The camp's **stock** (`camp.stock`, "type:id" → units, capped by the Storehouse) now
+holds every town good, not only the Jeweler's materials. Basic and Crystal Keys stay
+on the **key rack** (`camp.keys`). The goods list (`goods.py`, 226 kinds) covers:
+ores, jewelcrafting materials, dusts, rare consumables (Satanic Crystal, Destiny
+Shard, dice, Prophet's Wisdom…), keys (Angelic, Ruby, Chaos, Bifröst, dungeon keys),
+fragments and shards, tarot cards, runes, gems, jewels and orbs. Each good has an
+AFK FARM value in gold: the anchor its prices move around.
+- **In from the Vault:** `camp_take` takes any town good from the Vault's AFK
+  Materials (Item Editor 2.16.1). Up to 32 kinds per take.
+- **Out to the Vault:** `stock_send` sends goods to the Vault, made by the game.
+
+`GET /api/town`:
+- `limits`: `walls`, `hq`, `workshop`, `watchtower`, `tower_slots`, `tower_max`,
+  `hero_posts`, `sites`.
+- `walls` {side: {`hp`, `max`, `armor`, `plating`, `next_plating` (see *plan*)}}.
+  The sides are `north`, `east`, `south` and `west`.
+- `keep` {`hp`, `max`, `dps`}.
+- `towers` [{`id`, `kind`, `name`, `text`, `level`, `place`, `priority`, `perk`,
+  `perks` (level 5+), `dps`, `dtype`, `reach`, `targets`, `air`, `ground`,
+  `next` (*plan*)}].
+- `tower_kinds` [{`key`, `name`, `text`, `dtype`, `reach`, `targets`, `air`,
+  `ground`, `dps`, `perks`, `build` (*plan* of a new one at the keep)}].
+- `queue` [{`target`, `to`, `started_at`, `ready_at`, `done_in_seconds`}].
+- `siege` (the pointer: `id`, `room`, `level`, `started_at`, `hours`, `heroes`,
+  `settled`) and `history` (the last 10 sieges, see below).
+- `slain` (monsters the town ever killed), `coffer`, `stone`, `key_rack`.
+- `stock` [{`key`, `name`, `category`, `count`, `value`}].
+- `pending_credits`, `goods` (the whole list: `key`, `name`, `category`, `value`)
+  and `category_names`.
+
+A *plan* is {`to`, `cost` {`gold`, `stone`, `spoils`, `dust`}, `hours`,
+`materials` [{`key`, `name`, `count`}], `blockers` [text]}. `to` is null at the
+highest level. It can start when `blockers` is empty.
+
+`/api/state` → `town` {`coffer`, `siege` (null or {`id`, `region`, `level`,
+`waves_done`, `waves_total`, `wave`, `next_wave_at`, `over`, `outcome`, `walls`,
+`keep`}), `town_shares` (finished sieges whose town share waits), `wagons_home`,
+`merchants`, `building`}.
+
+**Pages never write.** A page sees the town settled in memory: finished builds,
+wagons that reached their town, a siege that ended. Actions and the monitor
+(between actions) persist it.
+
+### Fortifications
+
+The **walls** are the camp's Walls building, level 0-5. It sets:
+- each side's health (1,000 to 40,000) and armor (5-25% of wall damage blocked);
+- the masons, who mend 2-6% of each wall between siege waves;
+- the tower slots: 1, 2, 4, 6, 8 or 10.
+
+Each side can be **plated** up to the Walls level, with Copper, Iron, Gold, Jade
+and then Tarethium Ore. Each plating level gives that side +10% health and +2%
+armor. Out of a siege a wall heals 5% an hour, or at once for stone
+(10 health per stone).
+
+The **keep** is set by Headquarters:
+- health 2,000 to 78,000;
+- guns of 2 to 21 health per second against whatever gets inside;
+- hero posts: 0, 1, 1, 2, 3.
+
+**Towers** stand at a side's wall, or at the keep (every side, but 25 farther
+back). The **Siege Workshop** allows two tower levels per workshop level and a
+second build site at level 4. The eight kinds:
+
+| Kind | Damage | Role |
+| --- | --- | --- |
+| Ballista | physical, 1 target, reach 60, hits flyers | the toughest monster in reach |
+| Mortar | physical, 6 targets, reach 15-75, ground only | packs far out; nothing close to the wall |
+| Fire Brazier | fire, 5 targets, reach 25 | packs at the wall; stops regeneration |
+| Frost Spire | cold, 3 targets, reach 40, slows 30% | buys time for the others |
+| Storm Coil | lightning, 4 targets, reach 45, hits flyers | packs and flyers |
+| Plague Totem | poison, 4 targets, reach 35 | stops regeneration |
+| Sky Harpoon | physical, flyers only, reach 60 | flyers |
+| Arcane Obelisk | holy (no monster resists it), strips shields 3× as fast | the rarest monster in reach |
+
+How levels work:
+- Levels 1-10 each multiply damage by 1.75.
+- At level 5 a tower chooses one of two specialisations (`perks`), once.
+- Costs: gold 100k × 1.8^(level-1), plus stone, spoils and dust. Materials come
+  from the stock, by tier band (levels 1-3, 4-6, 7-8, 9-10): ore and
+  jewelcrafting materials of the tower's element, then Satanic Crystals and
+  Destiny Shard Fragments.
+
+Health and damage use the siege region's unit, the health of one of its Common
+monsters.
+
+| Action | Arguments | Notes |
+| --- | --- | --- |
+| `fort_build` | `kind`, `place` (a side or `keep`) | a new tower from the coffer, camp resources and stock; real time |
+| `fort_upgrade` | `tower` | the tower's next level |
+| `fort_plating` | `side` | that wall's next plating |
+| `fort_arrange` | `tower`, and any of `place`, `priority` (`first`, `strongest`, `weakest`, `flying`, `elite`), `perk` | moving is refused during a siege; a perk only at level 5+, once |
+| `wall_repair` | `stone` | out of a siege, most hurt wall first |
+
+All of these are local actions and need no game.
+
+### Sieges
+
+A siege brings the monsters of a region on the town. The region is any Act room
+the **bestiary** knows: a monster the player killed there while AFK FARM recorded,
+in the running game build.
+- **Waves.** A wave comes every 5 minutes, from 1 side (levels 1-7), 2 (8-19),
+  3 (20-34) or 4 (35+). Special waves:
+  - every 5th: elite (Ancient and Legion only);
+  - every 7th: special. These are the region's own special-content monsters, if
+    it recorded any: *Abyssal Incursion* (the Abyss chest's pack), *Unholy Siege*
+    (the Summoning Portal's), *Chaos Pillars*.
+  - every 10th: loot goblins that try to slip past and escape;
+  - every 25th and the last one: a Warlord with its host, from all four sides.
+- **Events.** Some normal waves bring one: Blood Moon (monsters faster and
+  harder), Thick Fog (towers reach less), Rally (heroes 25% harder), Supply Cart
+  (masons mend double), Bounty (destroy a marked group for 40 spoils).
+- **Ranks.** The game's own ranks are Common, Champion, Ancient and Legion. Above
+  Legion come AFK FARM's tiers: Ascended (from level 15, 2 drops), Primordial
+  (from level 30, 3 drops) and the Warlord (5 drops). Each drop replays the
+  Legion's own packet again.
+- **Monsters and affixes.** Each group is one recorded monster with its real
+  name, rank, speed, range, immunities and elite affixes (the game's affix names).
+  The town's model gives each affix an effect, for example Stoneskin resists
+  physical, Fire Enchanted explodes at the wall, Vampiric heals while hitting,
+  Extra Fast runs. A Fallen Angel Legion is the very Fallen Angel packet, so its
+  replays can drop Angelic Keys.
+- **Flyers.** Wasps, imps, spirits and other floating monsters fly over the walls
+  (by name, AFK FARM's layer).
+
+The fight (`battle.py`, one-second steps):
+- Towers and heroes shoot; walls absorb; a wall at zero is breached; the keep's
+  fall ends the siege.
+- Masons and the siege's stone budget mend the walls between waves.
+- A stationed **hero** fights with its measured pace from its own calibration in
+  that region (health cleared per second = kills per minute × each rank's
+  health), with a class role (damage type, reach, targets, hitting flyers, how
+  much wall damage a melee hero blocks). A roaming hero goes where the pressure
+  is.
+
+**Rewards:**
+- **A hero's kills** are that hero's claim: items, XP and gold, like an
+  expedition, claimed as that hero standing in the region after the siege ends.
+  They replay packets of its own calibration; a monster it met under another
+  packet maps onto its own packets of that monster and rank.
+- **Everything else** is the town's share, collected by any offline hero standing
+  in the region, with no XP (`defense_collect`).
+- **Magic Find:** +2% per level on the heroes' claims.
+- **Spoils:** 1 per 20 kills (plus bounties) go to the camp when the siege ends.
+  So do the stone budget left over and the walls' damage.
+
+`GET /api/defense`:
+- `siege`: the running or last siege (see below), or null.
+- `history` [{`id`, `room`, `region`, `level`, `outcome` (`held`, `fell` or
+  `retreated`), `waves`, `waves_total`, `kills`, `spoils`, `stone_back`,
+  `ended_at`, `record` {`held`, `waves`: new records}, `town_collected`}].
+- `records` {room: {`held` (highest level held to the end), `waves` {level: most
+  waves}}}.
+- `regions` [{`room`, `name`, `species`, `entries`, `ranks` {"1".."4": packets},
+  `packets`, `special` (origins: `abyss`, `unholy`, `pillar`), `goblins`,
+  `calibrated` [{`slot`, `name`, `profile`}] (heroes who can be stationed
+  there)}].
+- `limits`, `levels` {`max` 60, `min_hours`, `max_hours`, `wave_minutes`},
+  `rank_names`, `tiers`, `events`, `affixes` {id: {`name`, effects}}, `towers`.
+
+A siege view:
+- identity and clock: `id`, `room`, `region`, `level`, `started_at`, `ends_at`
+  (the planned end, or the retreat, until the siege is over; then the real end),
+  `waves_total`, `waves_done`, `wave` (the one coming), `next_wave_at`, `over`,
+  `outcome`;
+- defences: `walls` {side: {`hp`, `max`}}, `keep`, `stone_left`, `stone_budget`;
+- `totals` {`kills`, `leaked`, `spoils`, `stone_used`, `breaches`};
+- `by_defender` [{`id`, `name`, `drops`}];
+- `heroes` [{`slot`, `name`, `class_name`, `stance`, `dps`, `expedition_id`}];
+- `last`: the last 6 waves, each {`wave`, `kind`, `sides`, `event`,
+  `bounty_done`, `kills`, `leaked`, `breached`, `fell`, `spoils`, `highlights`
+  [{`t`, `side`, `text`}], `groups` [{`name`, `entry`, `tier`, `rank`, `side`,
+  `affixes` (names), `flags`, `count`, `killed`, `leaked`, `boss`}], `walls`,
+  `keep`, `stone_used`};
+- `next`: what the Watchtower scouts of the coming wave. Nothing at level 0;
+  from 1 the `kind` and `sides`; from 2 the `event`; from 3 the `groups`.
+- `mf_bonus`, `town_collected`.
+
+Only waves that are over are ever shown.
+
+`GET /api/bestiary?room=Act_03_03` → `entries` [{`key`, `name`, `names`, `rank`,
+`rank_name`, `origin`, `speed`, `ranged`, `immune`, `flyer`, `affixes` [{`id`,
+`name`, `seen`}], `recorded`, `slain`}].
+
+`GET /api/defense-forecast?room=…&hours=2&heroes=1:roam,2:north&stone=500` →
+{`suggested`: level}, the highest level this town usually holds for 12 waves. With
+`&level=N` → {`level`, `waves`, `fall_chance`, `waves_median`, `waves_low`}.
+Simulated; it takes a few seconds, so ask for it on demand, never on a timer.
+
+| Action | Arguments | Needs the game |
+| --- | --- | --- |
+| `defense_start` | `room`, `level` (1-60), `hours` (0.25-8), `heroes` [{`slot`, `stance` (`roam` or a side)}], `stone` (the budget, 0 or more) | no; each hero needs a usable calibration in that region and must be free |
+| `defense_repair` | `stone` | no; between waves, from the camp's stone; re-draws only the waves still to come |
+| `defense_retreat` | – | no; ends the siege after the waves fought |
+| `defense_collect` | `siege` (optional id), or `all: true` (every waiting share of the region the hero stands in, oldest first) | any offline hero standing in the siege's region |
+| `defense_watch` | `room`, `level`, `hours`, `stone` (per siege); or `off: true` | no; needs towers |
+
+**The watch** keeps the town under siege with its towers alone, one siege after
+another:
+- **Catching up.** Each siege starts where the last one ended. While the panel
+  was closed that can be up to a day back, so the watch catches up when the panel
+  runs again, up to 4 sieges at a time. Each is settled at once if it is already
+  over.
+- **Pausing.** It pauses (`watch.paused` holds the reason) while 8 town shares
+  wait to be collected, when the town has no towers, or when a siege cannot start.
+- **Stopping.** `off` stands it down; a siege under way runs to its end.
+- **Starting by hand.** It is refused while a watch siege runs.
+
+`/api/defense` adds:
+- `watch` {`room`, `level`, `hours`, `stone`, `since`, `started`, `paused`}, or null;
+- `waiting` [{`id`, `room`, `region`, `level`, `outcome`, `kills`, `ended_at`}]:
+  the finished sieges whose town share waits. The history never drops them.
+
+**Stationed heroes.** Each one is armed as an expedition with `mode: 'defense'` in
+`state.json`, one per hero. The roster row gets `defense` {`id`, `region`,
+`level`, `waves_done`, `waves_total`, `wave`, `over`, `outcome`}, and `ready` when
+the siege is over.
+- **Claiming.** The normal `claim` action pays the hero's share. It is refused
+  while the siege runs. A hero with nothing to claim is simply freed.
+- **Cancelling.** Refused while the siege needs the hero.
+
+### Trade with the other towns
+
+The **Trading Post** (camp building, Headquarters 2) sends wagons. By its level:
+
+| Level | 1 | 2 | 3 | 4 | 5 |
+| --- | --- | --- | --- | --- | --- |
+| Wagons | 1 | 2 | 2 | 3 | 4 |
+| Units carried each way | 500 | 1,000 | 2,000 | 3,500 | 6,000 |
+| Speed | ×1 | ×1 | ×1.1 | ×1.2 | ×1.3 |
+
+Towns further away open at higher levels.
+
+**The ten towns.** Ironhold, Emberfall, Saltmarsh, Duskhaven, Frostmere, Sanctum
+of Dawn, Cinderpit, Goldcrest, Mirewatch and Skyreach. Each town:
+- is 1-8 hours away;
+- has a development level (1-5, grows with the gold traded there): deeper markets
+  and more categories;
+- has a taste: it makes some categories cheaply and needs others;
+- has a standing with you (0-5, from the gold traded): its tariff falls from 12%
+  to 0%;
+- may have news that moves a category's price for the day (Festival, Cave-in,
+  Caravan arrived, Key shortage, Crystal glut, Rune fair).
+
+**How prices move** (economy.py):
+- Each unit bought raises the next one's price; each unit sold lowers it.
+- Prices recover with an 18-hour half-life.
+- A round trip at one town always loses its margin and its tariff.
+
+**What a wagon does.** It leaves with cargo from the stock (rack keys stay) and a
+purse from the coffer. At the town it sells the cargo, then buys the orders with
+the purse and the takings. Wagons trade at arrival, in arrival order. Home again,
+`trade_unload`:
+- bought and unsold goods go into the stock (Basic and Crystal Keys onto the
+  rack), past the cap, since they are here;
+- the gold left goes into the coffer.
+
+`GET /api/trade`:
+- `wagons` {`count`, `capacity`, `speed`, `post`}.
+- `towns` [{`key`, `name`, `kind`, `text`, `hours`, `post`, `reachable`,
+  `development`, `standing`, `tariff`, `traded`, `event`, `market` [{`key`,
+  `name`, `category`, `ask`, `bid`, `stock`, `can_buy`, `can_sell`}]}].
+  - `ask` is the price of the next unit bought; `bid` is the price of the next
+    unit sold.
+- `runs` [{`id`, `town`, `town_name`, `cargo`, `orders`, `purse`, `left_at`,
+  `arrives_at`, `returns_at`, `state` (`travelling` or `arrived`), `home`,
+  `result` {`earned`, `spent`, `bought`, `sold`, `sold_gold`, `unsold`,
+  `gold_back`}}].
+- `coffer`, `history`.
+
+| Action | Arguments | Needs the game |
+| --- | --- | --- |
+| `trade_send` | `town`, `cargo` {"type:id": n}, `orders` {"type:id": n}, `purse` (gold) | no |
+| `trade_unload` | `run` | no; once, when the wagon is home |
+
+### Travelling merchants
+
+The **Market Square** (camp building, Headquarters 2) brings merchants. The day
+has four six-hour watches. In each watch a merchant may arrive: 40% at level 1,
+up to 80% at level 5.
+- **Stays and stalls.** A merchant stays a few hours; there are 1-3 stalls.
+- **Wares by level.** Higher levels bring rarer merchants and dearer wares.
+
+The merchants:
+- Wandering Gem Cutter, Old Prospector, Royal Quartermaster (buys only, above
+  market);
+- Keymaster Brann (Angelic, Chaos and dungeon keys), Rune Scholar, Goblin Peddler
+  (cheap, and gone fast);
+- Fortune Teller (tarot), Satanic Occultist (Satanic Crystals, Destiny Shards,
+  dice), Jewelers' Guild Envoy (jewels and orbs).
+
+The game's own vendors sell none of these goods. Buying from a merchant raises its
+next price; selling to it lowers its bid. Who comes is drawn from the camp's
+founding time and the watch, so every page agrees.
+
+`GET /api/market`:
+- `level`, `stalls`, `chance`.
+- `merchants` [{`id`, `merchant`, `name`, `text`, `arrives_at`, `leaves_at`,
+  `offers` [{`key`, `name`, `category`, `side` (`sell`: it sells to you; `buy`: it
+  buys from you), `left`, `unit` (the next unit's gold), `value`}]}].
+- `history`, `next_watch` (a merchant is expected in the watch starting then),
+  `known` (every merchant and the Market level it needs), `coffer`.
+
+| Action | Arguments | Needs the game |
+| --- | --- | --- |
+| `market_buy` | `visit`, `good`, `count` | no; from the coffer into the stock (the rack for rack keys) |
+| `market_sell` | `visit`, `good`, `count` | no; from the stock into the coffer |
+
+### Coffer and shipments
+
+| Action | Arguments | Needs the game |
+| --- | --- | --- |
+| `coffer_deposit` | `amount` | an offline hero loaded (purchase path, receipt) |
+| `coffer_collect` | `amount` (up to the coffer, at most 500,000,000) | an offline hero loaded (`afk worker credit`, receipt) |
+| `stock_send` | `items` {"type:id": n} | an offline hero loaded |
+| `stock_close_partial` | – | an offline hero loaded; only a stopped shipment |
+
+For `stock_send`, the game makes each stack with its ground-drop routine (a
+`worker_town_` delivery), then the Vault takes them. What can happen:
+- **The game refused the plan.** Nothing was made, and the goods go back into
+  the stock.
+- **The game did not answer in time.** The shipment stays planned (`town.sending`)
+  and is never given back while the game may still make it. The next
+  `stock_send` finishes it first; the goods asked for then are not taken.
+- **It stopped part way.** `stock_close_partial` sends what was made to the Vault
+  and puts the rest back into the stock.
+
+Nothing is ever made twice.
+
+A payout the game answered without writing a receipt is kept as `review`, like
+one refused after the gold rose.
+
+### Files (0.9)
+
+| File | Meaning |
+| --- | --- |
+| workers.json `town` | Towers, plating, wall and keep health, the fortification queue, the siege pointer, the last sieges, monsters slain, a shipment under way |
+| workers.json `trade` | Markets' stocks, towns' standing and prosperity, wagons, the coffer, history |
+| workers.json `market` | Trades with the merchants in town, history |
+| workers.json `credits` | Coffer payouts and their receipts |
+| plans/defense_<id>.json | A siege's record: frozen fortifications, heroes, roster, seed, waves, repairs and retreat |
+| plans/defense_<id>_h<slot>.json | A stationed hero's expedition plan (`mode: 'defense'`) |
+| plans/worker_defense_<id>.json | The town's share as a replay plan |
+| plans/worker_town_<time>_<id>.json | A shipment of goods to the Vault |
+| models/worker-credit-<request>.json | The plugin's receipt of one payout |
+| defense-records.json | Highest level held and most waves per region and level |

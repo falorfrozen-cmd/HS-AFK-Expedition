@@ -2646,6 +2646,20 @@ static double GoldNumber(CInstance* player)
     const RValue gold = GoldAmount(player);
     return IsNumberKind(gold) ? gold.ToDouble() : -1;
 }
+// The receipt of one payment (models\worker-pay-<request>.json) or credit
+// (models\worker-credit-<request>.json): the same fields for both.
+static std::string GoldReceiptJson(const std::string& request, bool ok, double amount, const std::string& why, double before, double after,
+                                   const std::string& saved)
+{
+    std::ostringstream o;
+    o << std::setprecision(17) << "{\"schema\":1,\"request_id\":\"" << JsonEscape(request) << "\",\"ok\":" << (ok ? "true" : "false")
+      << ",\"amount\":" << (std::isfinite(amount) ? amount : -1) << ",\"gold_before\":" << before << ",\"gold_after\":" << after
+      << ",\"saved\":\"" << JsonEscape(saved) << "\",\"error\":\"" << JsonEscape(why) << "\",\"character\":" << CharacterStampJson()
+      << ",\"at\":\"" << NowIso() << "\",\"plugin\":\"" AFK_EXPEDITION_VERSION "\"}";
+    return o.str();
+}
+// A worker delivery is being made (CmdWorkerDeliver); a credit waits for it.
+static bool g_WorkerDelivering = false;
 // worker recipes <request>: the Jeweler's recipes as the game holds them now,
 // written to models\jewel-recipes-<request>.json for the panel to plan crafts.
 static void CmdWorkerRecipes(const std::string& request)
@@ -2678,12 +2692,7 @@ static void CmdWorkerPay(const std::string& request, const std::string& amountTe
     char* end = nullptr;
     const double amount = std::strtod(amountText.c_str(), &end);
     auto receipt = [&](bool ok, const std::string& why, double before, double after, const std::string& saved) {
-        std::ostringstream o;
-        o << std::setprecision(17) << "{\"schema\":1,\"request_id\":\"" << JsonEscape(request) << "\",\"ok\":" << (ok ? "true" : "false")
-          << ",\"amount\":" << (std::isfinite(amount) ? amount : -1) << ",\"gold_before\":" << before << ",\"gold_after\":" << after
-          << ",\"saved\":\"" << JsonEscape(saved) << "\",\"error\":\"" << JsonEscape(why) << "\",\"character\":" << CharacterStampJson()
-          << ",\"at\":\"" << NowIso() << "\",\"plugin\":\"" AFK_EXPEDITION_VERSION "\"}";
-        WriteSmallJson(path, o.str());
+        WriteSmallJson(path, GoldReceiptJson(request, ok, amount, why, before, after, saved));
         Out("worker pay " + request + ": " + (ok ? "paid " : "refused ") + std::to_string(static_cast<long long>(std::isfinite(amount) ? amount : 0))
             + " gold" + (why.empty() ? "" : " | " + why));
     };
@@ -2722,14 +2731,78 @@ static void CmdWorkerPay(const std::string& request, const std::string& amountTe
         receipt(true, "", had, now, saved);
     } catch (...) { receipt(false, "the purchase threw", -1, -1, ""); }
 }
+// worker credit <request> <gold> (0.9): the town's coffer taken into the game.
+// The mirror of a payment: the loaded offline hero receives the gold the way a
+// merchant sale credits it (PickUpGoldCheck(hash, +amount, 1) with a
+// GetCounterHash taken right before), under the same guards: offline and
+// unlinked (SalesSafe), ReportClient watched, no delivery running, an offline
+// hero loaded. The gold may not pass the game's cap and must rise by exactly
+// the amount with no anti-cheat report; the game saves at once. A credit that
+// does not hold (an anti-cheat report, a failed save) is taken back through
+// the purchase path and refused, and the refusal says whether the take-back
+// worked. One receipt per request id: a request never credits twice.
+static void CmdWorkerCredit(const std::string& request, const std::string& amountText)
+{
+    if (!AfkExpedition::SafeIdentifier(request, 8, 64)) { Out("worker credit: invalid request id"); return; }
+    const std::string path = DATA_ROOT + "\\models\\worker-credit-" + request + ".json";
+    if (fs::exists(path)) { Out("worker credit " + request + ": already processed; see the receipt"); return; }
+    char* end = nullptr;
+    const double amount = std::strtod(amountText.c_str(), &end);
+    auto receipt = [&](bool ok, const std::string& why, double before, double after, const std::string& saved) {
+        WriteSmallJson(path, GoldReceiptJson(request, ok, amount, why, before, after, saved));
+        Out("worker credit " + request + ": " + (ok ? "credited " : "refused ") + std::to_string(static_cast<long long>(std::isfinite(amount) ? amount : 0))
+            + " gold" + (why.empty() ? "" : " | " + why));
+    };
+    if (!end || *end || !AfkExpedition::ValidCredit(amount)) { receipt(false, "invalid amount", -1, -1, ""); return; }
+    if (g_Exp.running) { receipt(false, "a reward delivery is running", -1, -1, ""); return; }
+    if (g_WorkerDelivering) { receipt(false, "a worker delivery is running", -1, -1, ""); return; }
+    std::string why;
+    if (!SalesSafe(why)) { receipt(false, why, -1, -1, ""); return; }
+    if (!InstallReportWatch()) { receipt(false, "anti-cheat reports cannot be watched", -1, -1, ""); return; }
+    ReplayEnv env;
+    if (!PrepareReplayEnv(env, why)) { receipt(false, why, -1, -1, ""); return; }
+    if (CurrentIdentityKey().empty()) { receipt(false, "no offline hero is loaded", -1, -1, ""); return; }
+    try {
+        const double had = GoldNumber(env.pi);
+        if (had < 0) { receipt(false, "the gold amount could not be read", -1, -1, ""); return; }
+        if (!AfkExpedition::CreditWithinCap(had, amount)) { receipt(false, "the gold would pass the game's cap", had, had, ""); return; }
+        // Takes the credit back like a purchase; it worked when the gold is
+        // back at its amount before the credit.
+        auto takeBack = [&]() -> std::string {
+            std::string backWhy;
+            if (GoldChange(env.pi, -amount, backWhy) && AfkExpedition::GoldRoseBy(had, GoldNumber(env.pi), 0)) return "the gold was taken back";
+            return "taking the gold back failed: " + (backWhy.empty() ? std::string("the gold did not return to its amount before the credit") : backWhy);
+        };
+        const uint64_t reports = g_ReportClientCalls.load();
+        const bool called = GoldChange(env.pi, amount, why);
+        const double now = GoldNumber(env.pi);
+        if (g_ReportClientCalls.load() != reports) why = "the game raised an anti-cheat report";
+        const bool given = AfkExpedition::GoldRoseBy(had, now, amount);
+        if (!called || !given || !why.empty()) {
+            // The credit did not run, did something else, or the game reported
+            // it: take back what it gave, then refuse.
+            std::string error = why.empty() ? "the gold did not rise by the amount" : why;
+            if (given) error += "; " + takeBack();
+            receipt(false, error, had, GoldNumber(env.pi), "");
+            return;
+        }
+        const std::string saved = PersistRewards();
+        if (saved.rfind("saved (", 0) != 0) {
+            const std::string back = takeBack();
+            receipt(false, "the game did not save (" + saved + "); " + back, had, GoldNumber(env.pi), saved);
+            return;
+        }
+        receipt(true, "", had, now, saved);
+    } catch (...) { receipt(false, "the credit threw", -1, -1, ""); }
+}
 
 // A worker's haul: every stack is made by the game's own ground-drop routine
 // (the call a mining node uses) and goes to its own spool, like the fragments
 // of a break-down; the Gem Sense share is rolled unit by unit with the
 // Prospector's ore recipe and the game's dice. One result file per delivery:
 // a delivery that finished is never made again, one that stopped half way
-// needs review.
-static bool g_WorkerDelivering = false;
+// needs review. A town delivery (0.9, id worker_town_*) goes the same way and
+// may carry any good the town trades instead of only a worker's materials.
 static void CmdWorkerDeliver(const std::string& planPath)
 {
     const std::string text = ReadFileText(planPath);
@@ -2739,6 +2812,7 @@ static void CmdWorkerDeliver(const std::string& planPath)
     RValue idValue = StructGet(plan, "delivery_id");
     const std::string id = idValue.m_Kind == VALUE_STRING ? idValue.ToString() : "";
     if (!AfkExpedition::SafeIdentifier(id) || id.rfind("worker_", 0) != 0) { Out("worker deliver: invalid delivery id"); return; }
+    const bool town = AfkExpedition::TownDelivery(id);
     const std::string resultPath = DATA_ROOT + "\\sessions\\" + id + ".result.json";
     if (fs::exists(resultPath)) {
         const std::string previous = ReadFileText(resultPath);
@@ -2764,7 +2838,15 @@ static void CmdWorkerDeliver(const std::string& planPath)
         for (int i = 0; i < n; ++i) {
             RValue it = g_Yytk->CallBuiltin("array_get", { items, RValue(static_cast<double>(i)) });
             const long long type = amountOf(StructGet(it, "type")), item = amountOf(StructGet(it, "id")), amount = amountOf(StructGet(it, "amount"));
-            if (!AfkExpedition::WorkerMaterial(static_cast<int>(type), static_cast<int>(item)) || amount < 1) { Out("worker deliver: refused item " + std::to_string(type) + ":" + std::to_string(item)); return; }
+            // A town delivery may carry any TownGood (keys 12, fragments and
+            // cards 13, materials 14, socketables 15), made below exactly like
+            // a worker's materials: {o, b, j:0, c:0} stacks of at most 999
+            // through LootGroundCreate. NOT YET VERIFIED IN THE GAME: only ores,
+            // jewel materials and Satanic Crystal Fragments (type 14) have been
+            // made through this path live (2026-09-24). Live creation of types
+            // 12, 13 and 15 through this path still has to be verified in the
+            // game. Every other delivery keeps the WorkerMaterial rule.
+            if (!AfkExpedition::DeliverableItem(town, static_cast<int>(type), static_cast<int>(item)) || amount < 1) { Out("worker deliver: refused item " + std::to_string(type) + ":" + std::to_string(item)); return; }
             long long& total = make[AfkExpedition::OutputKey(static_cast<int>(type), static_cast<int>(item))];
             total += amount;
             if (total > AfkExpedition::kMaxWorkerAmount) { Out("worker deliver: amount too large"); return; }
@@ -3199,11 +3281,12 @@ static void RunCommand(const std::string& raw)
     }
     if (w0 == "save") { Out("save: " + PersistRewards()); return; }
     if (w0 == "worker") {
-        // worker pay <request-id> <gold> | worker deliver <plan.json> (tools/workers.py)
+        // worker pay <request-id> <gold> | worker credit <request-id> <gold> | worker deliver <plan.json> (tools/workers.py)
         if (w1 == "pay") { std::string amount; ss >> amount; CmdWorkerPay(w2, amount); return; }
+        if (w1 == "credit") { std::string amount; ss >> amount; CmdWorkerCredit(w2, amount); return; }
         if (w1 == "deliver") { std::string rest; std::getline(ss, rest); CmdWorkerDeliver(w2 + rest); return; }
         if (w1 == "recipes") { CmdWorkerRecipes(w2); return; }
-        Out("worker: usage -> worker pay <request-id> <gold> | worker deliver <plan.json> | worker recipes <request-id>"); return;
+        Out("worker: usage -> worker pay <request-id> <gold> | worker credit <request-id> <gold> | worker deliver <plan.json> | worker recipes <request-id>"); return;
     }
     if (w0 == "goto") {
         // goto <RoomName>: travel with the game's own RoomGoto (what a portal

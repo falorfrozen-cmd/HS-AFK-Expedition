@@ -5,6 +5,7 @@
 // routine and rolls the Gem Sense share with the game's Prospector table and
 // dice. Everything here is data and decisions, testable without the game.
 #include <AfkExpedition/Conversion.hpp>
+#include <AfkExpedition/TownGoods.hpp>
 #include <cctype>
 #include <string>
 
@@ -24,6 +25,16 @@ inline bool WorkerMaterial(int type, int id)
     return (id >= 0 && id <= 23) || (id >= 27 && id <= 32) || id == 58 || id == 60 || id == 66;
 }
 inline bool WorkerOre(int id) { return id >= 27 && id <= 32; }
+
+// A town delivery (0.9): a worker delivery whose id starts with worker_town_
+// brings goods from the town's stock to the Vault and may create any good the
+// town trades (TownGood, generated from tools/goods.py). Every other delivery
+// keeps the materials rule above.
+inline bool TownDelivery(const std::string& deliveryId) { return deliveryId.rfind("worker_town_", 0) == 0; }
+inline bool DeliverableItem(bool townDelivery, int type, int id)
+{
+    return townDelivery ? TownGood(type, id) : WorkerMaterial(type, id);
+}
 
 // The Prospector walks a recipe's outputs and rolls irandom(99) for each one
 // that is not certain; the first hit wins (STATIC 2026-09-24, the prospect
@@ -71,6 +82,24 @@ inline bool SafeIdentifier(const std::string& text, size_t minimum = 1, size_t m
 inline bool ValidPayment(double amount)
 {
     return std::isfinite(amount) && amount >= 1 && amount <= kMaxWorkerPayment && std::floor(amount) == amount;
+}
+
+// The town's coffer taken into the game (0.9, `worker credit`): the loaded hero
+// receives the gold the way a merchant sale credits it. The amount is whole
+// gold from 1 to the cap, like a payment; the hero's gold after the credit may
+// not pass the game's cap (the game would clamp it, so part of the credit
+// would vanish); and the gold must rise by exactly the amount (within half a
+// unit). A take-back is confirmed the same way: the gold "rose" by 0 from
+// where it was before the credit. An unreadable amount (negative) never counts.
+inline bool ValidCredit(double amount) { return ValidPayment(amount); }
+inline bool CreditWithinCap(double had, double amount)
+{
+    return std::isfinite(had) && had >= 0 && ValidCredit(amount) && had + amount <= kMaxWorkerPayment;
+}
+inline bool GoldRoseBy(double before, double after, double amount)
+{
+    return std::isfinite(before) && std::isfinite(after) && std::isfinite(amount) && before >= 0 && after >= 0
+        && std::fabs(after - before - amount) <= 0.5;
 }
 
 // The Jeweler (0.8): the game's jewelcrafting recipes (the craft cube's table,

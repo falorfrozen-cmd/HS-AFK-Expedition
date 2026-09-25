@@ -97,25 +97,19 @@ def pools(build: str | None = None) -> dict:
 
     Only packets of the running game build with the protected drop values the
     replay needs count (the plugin refuses the others)."""
-    import afk
+    import afk, packet_facts
     build = build if build is not None else current_build()
-    files = sorted(afk.PACKETS.glob('*.json'))
-    stamp = (str(afk.PACKETS), build, len(files), max((f.stat().st_mtime_ns for f in files), default=0))
+    facts, version = packet_facts.facts()      # every packet's facts, cached on disk (0.9)
+    stamp = (str(afk.PACKETS), build, version)
     if _POOL_CACHE.get('stamp') == stamp:
         return _POOL_CACHE['value']
     chests, goblins = {}, {}
-    for f in files:
-        d = afk.read_json(f)
-        if not isinstance(d, dict) or not build or d.get('game_build_id') != build:
+    for f in facts.values():
+        if not build or f['build'] != build or not f['protected'] or not f['room']:
             continue
-        if not isinstance(d.get('protected'), dict) or not d.get('protected'):
-            continue
-        h, obj, room = d.get('packet_hash') or f.stem, d.get('self_object') or '', d.get('room')
-        if not room:
-            continue
+        h, obj, room = f['hash'], f['object'], f['room']
         if obj == CHEST_OBJECT:
-            args = d.get('args') or []
-            tier = CHEST_TIERS.get(_first_number(args))
+            tier = CHEST_TIERS.get(f['first'])
             if tier:
                 chests.setdefault(room, {}).setdefault(tier, []).append(h)
         elif obj in GOBLIN_BY_OBJECT:

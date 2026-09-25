@@ -23,6 +23,12 @@ This working tree contains the product and its tests.
 - Keys and jeweler materials come from the Vault only through the Item Editor's
   `/api/vault/afk-take` (one receipt per request, settled by cancelling). Never
   write the Vault database, and never let a test reach the player's editor.
+- The town (0.9) moves gold only through receipts: deposits through the purchase
+  path, payouts through `afk worker credit` (one request id each; a refused payout
+  whose gold rose stays out of the coffer as `review`). Its goods leave for the
+  Vault only as stacks the game makes (`worker_town_*` deliveries of goods.py
+  items). Siege rewards are replays of recorded packets in the siege's region.
+  Pages never write the town; actions and the monitor persist it.
 - Adventurers and goblin hunters only replay recorded packets of the running game
   build, with experience off, in the packets' region; never create chest objects.
 - The Jeweler makes only what the game's live recipe table (result types 37-41)

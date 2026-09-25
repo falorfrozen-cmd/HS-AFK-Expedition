@@ -59,6 +59,13 @@ class WaveTests(Folder):
         self.assertEqual(fell, len(waves)); self.assertLessEqual(waves[-1]['hp'], 0 + 1e-9)
         self.assertTrue(all(abs(w['kills'] - w['rate'] * 5) < 1 for w in waves), 'a wave pays the kills made at the measured pace')
 
+    def test_the_pace_leaves_out_special_kills_until_they_are_verified(self):
+        p = profile(pace=60.0)          # 550 ordinary kills and one unverified boss
+        self.assertAlmostEqual(siege.ordinary_pace(p), 60.0 * 550 / 551)
+        self.assertAlmostEqual(siege.ordinary_pace(p, specials=['e' * 64]), 60.0, msg='a verified boss counts')
+        plan = siege.build_plan(p, 3, 1.0, 'siege_x', self.mods, seed=1)
+        self.assertAlmostEqual(plan['siege']['pace'], 60.0 * 550 / 551)
+
     def test_a_comfortable_wave_repairs_the_gate(self):
         waves, _ = siege.timeline(12, 0, None, 1, 3, 5, {})     # pace near the demand: some damage
         hp = waves[-1]['hp']

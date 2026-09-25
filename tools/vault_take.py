@@ -1,7 +1,9 @@
-"""Keys and jewelcrafting materials from the Vault to the camp (0.8).
+"""Keys, materials and the town's other goods from the Vault to the camp (0.8, 0.9).
 
 The camp's key rack (a golden chest takes a Basic Key, a crystal chest a
-Crystal Key) and the Jeweler's material stock are filled from the Item
+Crystal Key) and its stock (the Jeweler's materials, and from 0.9 every good
+of the town: ores, materials, dusts, rare consumables, keys, shards, tarot
+cards, runes, gems, jewels and orbs, see goods.py) are filled from the Item
 Editor's Infinite Vault, category AFK Materials. The editor (2.16.1 or newer)
 carries a take out at most once per request id (POST /api/vault/afk-take): a
 repeated id answers with the recorded take, and a cancelled id never takes
@@ -18,12 +20,13 @@ from __future__ import annotations
 import re
 import urllib.error
 
+import goods
 import ingest_spool
-from worker_jeweler import MATERIAL_NAMES
 
 ROUTE = '/api/vault/afk-take'
 RACK = {'12:0': 'Basic Key', '12:1': 'Crystal Key'}   # the adventurer's key rack
 MAX_TAKE = 100_000
+MAX_KINDS = 32                     # the editor takes at most 32 kinds in one request
 OLD_EDITOR = 'Update the Item Editor to 2.16.1 or newer to take keys and materials from the Vault.'
 _KIND = re.compile(r'(\d{1,3}):(\d{1,3})')
 
@@ -33,15 +36,14 @@ class OldEditor(Exception):
 
 
 def goes_to(key: str) -> str | None:
-    """'rack' for a Basic or Crystal Key, 'stock' for a jewel recipe material, None otherwise."""
+    """'rack' for a Basic or Crystal Key, 'stock' for any other town good, None otherwise."""
     if key in RACK:
         return 'rack'
-    match = _KIND.fullmatch(str(key))
-    return 'stock' if match and int(match.group(1)) == 14 and int(match.group(2)) in MATERIAL_NAMES else None
+    return 'stock' if _KIND.fullmatch(str(key)) and goods.known(key) else None
 
 
 def name(key: str) -> str:
-    return RACK.get(key) or MATERIAL_NAMES.get(int(str(key).split(':')[1]), key)
+    return RACK.get(key) or goods.name(key)
 
 
 def describe(items: dict) -> str:
@@ -52,10 +54,12 @@ def clean_items(raw) -> dict[str, int]:
     """``{"type:id": count}`` of rack keys and jeweler materials, whole counts from 1 to MAX_TAKE."""
     if not isinstance(raw, dict) or not raw:
         raise ValueError('Choose the keys or materials to take from the Vault.')
+    if len(raw) > MAX_KINDS:
+        raise ValueError(f'Take at most {MAX_KINDS} kinds of goods at once.')
     items = {}
     for key, count in raw.items():
         if goes_to(key) is None:
-            raise ValueError('Only Basic Keys, Crystal Keys and jewelcrafting materials come to the camp.')
+            raise ValueError("Only the town's goods come to the camp: keys, materials, shards, runes, gems and the like.")
         if type(count) is not int or not 1 <= count <= MAX_TAKE:
             raise ValueError(f'Take a whole number of each, from 1 to {MAX_TAKE:,}.')
         items[str(key)] = count

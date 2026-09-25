@@ -13,13 +13,14 @@ import notify
 import calibration, recovery, validate_farm
 import collection
 import workers, camp, traits, worker_loot, worker_jeweler, teams, vault_take
+import defense, trade, town_panel
 from product_data import Presentation, SUPPORT, support_warnings
 
 ROOT=Path(__file__).resolve().parents[1]
 WEB=ROOT/'web'
 CLASSES={i+1:n for i,n in enumerate(('Viking','Pyromancer','Marksman','Pirate','Nomad','Redneck','Necromancer','Samurai','Paladin','Amazon','Demon Slayer','Demonspawn','Shaman','White Mage','Marauder','Plague Doctor','Shield Lancer','Illusionist','Jotunn','Exo','Butcher','Stormweaver','Bard','Prophet'))}
 XOR=bytes.fromhex('e3953db1016bb65854383f46a17429cc454551f2a7f7abb726f137a88191e67e')
-VERSION='0.7.0'
+VERSION='0.9.0'
 IDENTIFIER=re.compile(r'[A-Za-z0-9_-]{1,120}\Z')
 
 def require(ok,message):
@@ -153,7 +154,7 @@ def delivery_seconds(result):
     except (KeyError,TypeError,ValueError):
         return None
 
-class Panel:
+class Panel(town_panel.TownPanel):
     def __init__(self,data=afk.DATA):
         self.data=Path(data); self.token=secrets.token_urlsafe(32)
         self.lock=threading.Lock(); self.job_lock=threading.Lock(); self.state_lock=threading.Lock(); self.closed=threading.Event()
@@ -189,6 +190,7 @@ class Panel:
     def monitor(self):
         from game_session import Session,running
         while not self.closed.wait(3):
+            self.settle_late_credits();self.settle_town_late()
             if self.lock.acquire(blocking=False):
                 try:
                     folder=self.game_bin(); pid=running(folder/'Hero_Siege.exe')
@@ -311,6 +313,12 @@ class Panel:
             import siege
             row['siege']=siege.live_view(plan,elapsed)
             row['ready']=elapsed>=siege.report_hours(plan)
+            if row['ready']:row['ready_at']=(started+timedelta(hours=siege.report_hours(plan))).isoformat()   # a fallen Siege: over at the fall (never shown before)
+        if plan.get('mode')=='defense':
+            info=self.defense_row(plan)
+            if info:
+                row['defense']=info['defense'];row['ready']=info['ready']
+                if info['ready_at']:row['ready_at']=info['ready_at']
         return row
 
     def snapshot(self,focus=None):
@@ -371,7 +379,8 @@ class Panel:
                     repeat=self.repeat_view(state,armed,afk.hero_key(focus_hero) if focus_hero else None),profile_live_matches=self.live_matches(live),regions=self.regions_view(),
                     background=self.background_view(armed,progress,review,live) if armed else self.background_view(None,{},None,live),pause_note=self.pause_note,
                     expeditions=[self.roster_view(a,live) for a in afk.armed_list(state)],focus=dict(focus or {}),
-                    collection=self.collection_summary(),siege_records=self.siege_records(focus_hero),workers=self.workers_view())
+                    collection=self.collection_summary(),siege_records=self.siege_records(focus_hero),workers=self.workers_view(),
+                    town=self.town_summary())
 
     def delivery_view(self,armed,plan,progress):
         """Delivery speeds with this computer's estimate for the calls due now."""
@@ -533,6 +542,9 @@ class Panel:
         return s
 
     def log(self,message):
+        # The monitor settles late receipts before any action has run: with no job yet,
+        # the message goes where note() puts it instead of failing (and losing the receipt).
+        if self.job is None:return self.note(message)
         with self.state_lock:self.job['output']=(self.job['output']+str(message)+'\n')[-40000:]
 
     def cli(self,*args):
@@ -550,7 +562,7 @@ class Panel:
             try:
                 if action in ('plan','start','cancel','recover','ingest','portrait','configure','save_modifiers','save_loot_filter','save_preferences','settle_partial','accept_position',
                               'wishlist_add','wishlist_remove','worker_learn','worker_rename','worker_start','worker_cancel','worker_transfer','worker_settle_partial',
-                              'worker_route'):
+                              'worker_route')+town_panel.TOWN_LOCAL:
                     self.action(action,args)
                 else:
                     with self.lock:self.action(action,args)
@@ -756,6 +768,10 @@ class Panel:
         if name=='cancel':
             armed=self.target_armed(args)
             require(not progress_view(self.data,armed['expedition_id']+'_claim').get('state'),'An expedition cannot be cancelled here once delivery has started.')
+            plan=read(Path(armed['plan']),{}) or {}
+            if plan.get('mode')=='defense':
+                info=self.defense_row(plan)
+                require(not info or info['ready'],'This hero is on the walls: the siege needs it until it ends. Sound the retreat to end the siege early.')
             self.cli('cancel','--expedition',armed['expedition_id']);return
         if name=='ingest':
             ident=args.get('id','');require(bool(IDENTIFIER.fullmatch(ident)),'Invalid reward ID.')
@@ -781,6 +797,7 @@ class Panel:
             path=self.data/'portraits'/(self.portrait_key(c)+'.png');path.parent.mkdir(parents=True,exist_ok=True)
             path.write_bytes(raw);self.log('Character screenshot saved locally. It does not change the game save.');return
         if name.startswith('worker_') or name in ('camp_build','team_start','camp_take'):return self.worker_action(name,args)
+        if name in town_panel.TOWN_ACTIONS:return self.town_action(name,args)
         if name=='verify_special':
             ident=args.get('hash','');require(isinstance(ident,str) and bool(re.fullmatch(r'[a-f0-9]{12,64}',ident)),'Choose a special monster to verify.')
             s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
@@ -852,7 +869,7 @@ class Panel:
                               queue=[dict(q,name=camp.BY_KEY[q['building']]['name']) for q in state['camp']['queue']]))
 
     def workers_overview(self):
-        state=workers.load(self.data);out=workers.overview(state)
+        state=workers.load(self.data);before=json.loads(json.dumps(state['candidates']));out=workers.overview(state)
         out['candidates']={t:workers.describe_candidates(state,t) for t in camp.effects(state['camp'])['types']}
         pool=worker_loot.pools();names=zone_names()
         out['hotspots']=camp.hotspots(state['camp'],workers.hotspot_targets(pool))
@@ -863,7 +880,16 @@ class Panel:
         out['recipes']=[dict(worker_jeweler.recipe_view(r),affordable=worker_jeweler.affordable(state['camp']['stock'],r),bench_ok=bench>=worker_jeweler.TIER_BY_TYPE[r['result_type']]['tier'])
                         for r in kept['recipes']]
         out['material_names']=worker_jeweler.MATERIAL_NAMES;out['jewel_names']=worker_jeweler.JEWEL_NAMES
-        workers.save(self.data,state)   # candidates rolled for the first time are kept
+        # Candidates rolled for the first time are kept: written between actions only, onto the
+        # file as it is then (never this page's older copy), and only where none were rolled meanwhile.
+        rolled={t:v for t,v in state['candidates'].items() if v!=before.get(t)}
+        if rolled and self.job_lock.acquire(blocking=False):
+            try:
+                latest=workers.load(self.data)
+                for t,v in rolled.items():
+                    if latest['candidates'].get(t)==before.get(t):latest['candidates'][t]=v
+                workers.save(self.data,latest)
+            finally:self.job_lock.release()
         return out
 
     def worker_entries(self):
@@ -928,6 +954,9 @@ class Panel:
         elif purpose=='retrain':
             w=workers.retrain(state,entry.get('worker'),entry.get('what','trait'))
             self.log(f"{w['name']} was retrained: "+', '.join(t['name'] for t in traits.describe(w['traits']))+'.')
+        elif purpose=='deposit':
+            tr=trade.ensure(state);tr['coffer']+=int(entry['amount'])
+            self.log(f"The town's coffer now holds {tr['coffer']:,} gold.")
 
     def unanswered_payments(self):
         return [k for k,v in workers.load(self.data)['payments'].items() if v.get('state') in ('pending','unknown')]
@@ -1414,6 +1443,20 @@ class Panel:
             self.log(json.dumps(session.close()))
             self.live=None;self.game_running=False
 
+def forecast_query(query):
+    """The siege forecast's query: room, hours, level, stone and heroes ("slot:stance,slot:stance")."""
+    out=dict(room=query.get('room',''))
+    try:
+        if query.get('hours'):out['hours']=float(query['hours'])
+        if query.get('level'):out['level']=int(query['level'])
+        if query.get('stone'):out['stone']=int(query['stone'])
+        heroes=[]
+        for part in filter(None,(query.get('heroes') or '').split(',')):
+            slot,_,stance=part.partition(':');heroes.append(dict(slot=int(slot),stance=stance or 'roam'))
+        out['heroes']=heroes
+    except ValueError:raise ValueError('The forecast query is malformed.')
+    return out
+
 def focus_query(query):
     """/api/state?slot=N or ?expedition=ID: which expedition the top-level fields describe."""
     from urllib.parse import parse_qs
@@ -1454,6 +1497,15 @@ class Handler(BaseHTTPRequestHandler):
             if route=='/api/specials':return self.send(200,self.app.specials_view())
             if route=='/api/workers':return self.send(200,self.app.workers_overview())
             if route=='/api/camp/vault':return self.send(200,self.app.camp_vault_view())
+            if route in ('/api/town','/api/defense','/api/trade','/api/market','/api/bestiary','/api/defense-forecast'):
+                from urllib.parse import parse_qs
+                query={k:v[0] for k,v in parse_qs(urlsplit(self.path).query).items()}
+                if route=='/api/town':return self.send(200,self.app.town_view())
+                if route=='/api/defense':return self.send(200,self.app.defense_view())
+                if route=='/api/trade':return self.send(200,self.app.trade_view())
+                if route=='/api/market':return self.send(200,self.app.market_view())
+                if route=='/api/bestiary':return self.send(200,self.app.bestiary_view(query.get('room','')))
+                return self.send(200,self.app.defense_forecast(forecast_query(query)))
             if route=='/api/share':
                 from urllib.parse import parse_qs
                 return self.send(200,self.app.share_summary(parse_qs(urlsplit(self.path).query).get('id',[''])[0]))
