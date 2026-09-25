@@ -39,7 +39,8 @@ BUILDINGS = (
          text='Hiring: new worker types, more candidates to choose from, better traits, retraining.',
          levels=(_cost(300 * K, 150, hours=0.5), _cost(800 * K, 500, 150, hours=2), _cost(2 * M, 1200, 500, 50, 6),
                  _cost(5 * M, 3000, 1200, 200, 12), _cost(12 * M, 7000, 3000, 600, 24))),
-    dict(key='walls', name='Walls', start=0, unlock_hq=1, text="Your heroes' Siege gate: more health, better repairs.",
+    dict(key='walls', name='Walls', start=0, unlock_hq=1,
+         text="The town's walls (health, armor, masons) and tower slots; your heroes' Siege gate.",
          levels=(_cost(400 * K, 300, hours=1), _cost(1.2 * M, 900, 100, hours=3), _cost(3 * M, 2000, 400, hours=8),
                  _cost(7 * M, 4500, 1000, 150, 14), _cost(15 * M, 9000, 2500, 500, 24))),
     dict(key='storehouse', name='Storehouse', start=1, unlock_hq=1, text="How much of each resource, the Jeweler's stock and the key rack can hold.",
@@ -54,9 +55,23 @@ BUILDINGS = (
     dict(key='jeweler_bench', name="Jeweler's Bench", start=0, unlock_hq=3, text="The Jeweler's workplace: each level opens the next tier of the game's jewel recipes.",
          levels=(_cost(1.5 * M, 1000, 300, hours=4), _cost(3 * M, 2000, 600, 100, 8), _cost(6 * M, 4000, 1200, 300, 12),
                  _cost(10 * M, 7000, 2500, 700, 18), _cost(18 * M, 12000, 5000, 1500, 24))),
-    dict(key='watchtower', name='Watchtower', start=0, unlock_hq=3, text='Daily hot spots: a target where workers do better today.',
+    dict(key='watchtower', name='Watchtower', start=0, unlock_hq=3,
+         text="Daily hot spots where workers do better today; scouts a siege's next wave.",
          levels=(_cost(1 * M, 800, 300, hours=3), _cost(2.5 * M, 1800, 700, 60, 6), _cost(5 * M, 3500, 1500, 200, 12),
                  _cost(9 * M, 6000, 3000, 450, 18), _cost(16 * M, 10000, 5000, 900, 24))),
+    # 0.9: the town
+    dict(key='workshop', name='Siege Workshop', start=0, unlock_hq=1,
+         text='Builds and raises towers: each level allows two more tower levels; a second site at level 4.',
+         levels=(_cost(350 * K, 250, hours=1), _cost(1 * M, 800, 150, hours=3), _cost(2.5 * M, 1800, 500, 30, 8),
+                 _cost(6 * M, 4000, 1200, 150, 14), _cost(13 * M, 8500, 2800, 450, 24))),
+    dict(key='market', name='Market Square', start=0, unlock_hq=2,
+         text='Travelling merchants stop here: more stalls, longer stays and rarer wares with each level.',
+         levels=(_cost(500 * K, 400, 100, hours=2), _cost(1.4 * M, 1100, 350, hours=5), _cost(3.2 * M, 2500, 800, 60, 10),
+                 _cost(7 * M, 5000, 1800, 250, 16), _cost(14 * M, 9500, 3800, 700, 24))),
+    dict(key='trading_post', name='Trading Post', start=0, unlock_hq=2,
+         text='Trade with the other towns: more of them on your map, bigger loads and lower tariffs with each level.',
+         levels=(_cost(600 * K, 500, 150, hours=2), _cost(1.6 * M, 1300, 400, hours=5), _cost(3.6 * M, 2800, 900, 80, 10),
+                 _cost(7.5 * M, 5500, 2000, 300, 16), _cost(15 * M, 10000, 4200, 800, 24))),
 )
 BY_KEY = {b['key']: b for b in BUILDINGS}
 
@@ -118,6 +133,7 @@ def effects(camp: dict) -> dict:
     hq, barracks, tavern, walls = level(camp, 'hq'), level(camp, 'barracks'), level(camp, 'tavern'), level(camp, 'walls')
     store, forge, training = level(camp, 'storehouse'), level(camp, 'forge'), level(camp, 'training')
     bench, tower = level(camp, 'jeweler_bench'), level(camp, 'watchtower')
+    workshop, market, post = level(camp, 'workshop'), level(camp, 'market'), level(camp, 'trading_post')
     return dict(
         sites=2 if hq >= 3 else 1, all_bonus=0.05 if hq >= 5 else 0.0,
         max_workers=2 + barracks, team_size={1: 2, 2: 2, 3: 3, 4: 3, 5: 4}[barracks],
@@ -134,6 +150,8 @@ def effects(camp: dict) -> dict:
         recipe_tier=bench, double_output={0: 0.0, 1: 0.0, 2: 0.0, 3: 0.05, 4: 0.05, 5: 0.10}[bench],
         hotspots={0: 0, 1: 1, 2: 2, 3: 2, 4: 3, 5: 3}[tower], hotspot_bonus={0: 0.0, 1: 0.2, 2: 0.2, 3: 0.3, 4: 0.3, 5: 0.4}[tower],
         rare_bonus={0: 0.0, 1: 0.0, 2: 0.0, 3: 0.03, 4: 0.03, 5: 0.06}[tower],
+        scout=min(3, tower), tower_max=2 * workshop, fort_sites=2 if workshop >= 4 else 1,
+        market=market, trading_post=post,
     )
 
 
