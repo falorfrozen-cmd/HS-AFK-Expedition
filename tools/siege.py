@@ -80,6 +80,17 @@ def pace_factors(profile: dict) -> list[float] | None:
     return [r / mean for r in rates] if mean > 0 else None
 
 
+def ordinary_pace(profile: dict, specials=()) -> float:
+    """The calibration's kills per minute without the special kills a plan leaves out
+    (a boss or event monster that has not passed `afk special verify`), so a wave never
+    spreads them over the ordinary packets."""
+    pace = float(profile.get('kills_per_min') or 0)
+    kills = [q for q in profile.get('packets', []) if q.get('kind') == 'kill']
+    total = sum(float(q.get('count') or 0) for q in kills)
+    kept = sum(float(q.get('count') or 0) for q in kills if q.get('rank') in ORDINARY_RANKS or q.get('hash') in set(specials))
+    return pace * (kept / total) if total else pace
+
+
 def _round(value: float, rng: random.Random) -> int:
     whole = math.floor(value)
     return int(whole + (1 if rng.random() < value - whole else 0))
@@ -205,7 +216,7 @@ def build_plan(profile: dict, level, hours, expedition_id: str, modifiers: dict,
     hours = float(hours)
     if not math.isfinite(hours) or not 0.25 <= hours <= afk.MAX_HOURS:
         raise ValueError('Duration must be between 15 minutes and 8 hours.')
-    pace = float(profile.get('kills_per_min') or 0)
+    pace = ordinary_pace(profile, specials)
     if not pace > 0:
         raise ValueError('This calibration has no kill pace.')
     # A siege lasts whole waves: the armed time is exactly the planned waves, so
@@ -289,7 +300,7 @@ def live_view(plan: dict, elapsed_hours: float) -> dict:
 
 def forecast(profile: dict, level: int, hours: float, runs: int = 120, specials=(), gate=None) -> dict:
     """What a Siege at this level usually looks like for this calibration (simulated)."""
-    pace = float(profile.get('kills_per_min') or 0)
+    pace = ordinary_pace(profile, specials)
     if not pace > 0:
         raise ValueError('This calibration has no kill pace.')
     factors = pace_factors(profile)
