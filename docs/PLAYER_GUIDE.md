@@ -343,6 +343,11 @@ An adventurer opens the world chests of a region you played in: wooden chests
 from level 1, golden chests (a Basic Key each) from level 3, crystal chests (a
 Crystal Key each) from level 8. It takes the Basic and Crystal Keys from the
 camp's key rack and brings unused ones back, together with the keys it finds.
+Fill the rack from your Vault: with the Item Editor (2.16.1 or newer) open, take
+Basic and Crystal Keys out of AFK Materials, as many as the rack holds (25 at
+Storehouse level 1, then 60, 120, 250 and 500). They leave the Vault and hang on
+the rack; if the answer is lost on the way, AFK FARM finishes the take by itself,
+and keys are never taken twice.
 Every chest's loot is the game's own drop, replayed from a chest you opened
 while playing with recording on; so collect the haul with any offline hero
 standing in that region. The more regions you play with recording on, the more
@@ -360,7 +365,8 @@ no experience for them. Collect in that region, like an adventurer's haul.
 
 The jeweler works the game's own jewelcrafting recipes (the craft cube's jewels
 and gems) from the camp's material stock. Fill the stock by sending your miners'
-Gem Sense materials there (a miner's route: Vault or stock). The Jeweler's Bench
+Gem Sense materials there (a miner's route: Vault or stock), or take jewelcrafting
+materials out of the Vault's AFK Materials, like keys. The Jeweler's Bench
 opens the recipe tiers; the jewels are made by the game when you collect, with
 any offline hero, and go to the Vault. Your hero's own Jewelcrafting level does
 not matter and does not change.

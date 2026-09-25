@@ -128,9 +128,27 @@ with tempfile.TemporaryDirectory(prefix='afk-panel-qa-') as tmp:
             afk.write_json(self.data/'sessions'/f"{plan['delivery_id']}.result.json",dict(delivery_id=plan['delivery_id'],state='done',created=created,prospect_outputs=outputs))
             applied=workers.apply_delivery(state,worker_id,plan,dict(created=created,prospect_outputs=outputs));workers.save(self.data,state)
             self.log(f"Fixture: {w['name']} delivered {plan['ore_total']:,} ore (+{plan['xp']:,} XP).");return applied
+        def vault_editor(self):
+            return 'fixture'   # never the player's Item Editor
+        def ask_vault(self,base,action,request=None,items=None):
+            # The editor's camp route, simulated on the control file's own Vault (never the player's Vault).
+            controls=afk.read_json(control,{});vault=controls.setdefault('vault',{'12:0':156,'12:1':27,'14:5':40,'12:33':52})
+            done=controls.setdefault('vault_takes',{})
+            if action=='stock':
+                return dict(category='AFK Materials',stock=[dict(cls=int(k.split(':')[0]),base=int(k.split(':')[1]),name=k,count=n,stacks=1)
+                                                             for k,n in sorted(vault.items()) if n])
+            if request not in done and action=='take':
+                short=[k for k,n in items.items() if vault.get(k,0)<n]
+                if short:return dict(err=f"AFK Materials has {vault.get(short[0],0):,} of {short[0]}, not {items[short[0]]:,}. Nothing was taken.")
+                for k,n in items.items():vault[k]-=n
+                done[request]=[dict(cls=int(k.split(':')[0]),base=int(k.split(':')[1]),count=n) for k,n in sorted(items.items())]
+            elif request not in done:done[request]=None   # cancelled before it arrived
+            afk.write_json(control,controls)
+            return dict(state='cancelled',taken=[]) if done[request] is None else dict(state='done',taken=done[request],eventId=len(done))
         def action(self,name,args):
             allowed=('start','cancel','save_modifiers','wishlist_add','wishlist_remove','worker_hire','worker_respec','worker_learn',
-                     'worker_rename','worker_start','worker_cancel','worker_collect','worker_tool','worker_retrain','worker_route','camp_build')
+                     'worker_rename','worker_start','worker_cancel','worker_collect','worker_tool','worker_retrain','worker_route','camp_build',
+                     'camp_take')
             if name not in allowed:raise ValueError('Fixture allows local actions only.')
             return super().action(name,args)
     app=FixturePanel(afk.DATA);server=panel.ThreadingHTTPServer(('127.0.0.1',9567),panel.Handler);server.app=app

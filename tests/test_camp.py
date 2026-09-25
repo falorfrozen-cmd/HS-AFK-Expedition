@@ -61,7 +61,9 @@ class BuildingTests(unittest.TestCase):
             camp.take(c, dict(stone=10, spoils=500))
         taken = camp.take(c, dict(stone=500)); camp.give_back(c, taken)
         self.assertEqual(c['resources']['stone'], 8000)
-        self.assertEqual(camp.add_keys(c, {0: 60})['0'], 50, 'the key rack holds 50 at Storehouse 3')
+        self.assertEqual(camp.add_keys(c, {0: 150})['0'], 120, 'the key rack holds 120 at Storehouse 3')
+        self.assertEqual(camp.add_keys(c, {1: 5}, force=True)['1'], 5, 'a Vault take arrives past the cap')
+        self.assertEqual(camp.add_keys(c, {0: 1})['0'], 0)
 
     def test_a_stored_camp_is_repaired_not_trusted(self):
         c = camp.normalize(dict(buildings=dict(hq=9, tavern='x', walls=-2), resources=dict(stone=-5, spoils='a'), queue=[dict(building='castle')]))

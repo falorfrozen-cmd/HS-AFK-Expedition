@@ -207,7 +207,7 @@ def hotspot_targets(pool: dict | None = None) -> dict:
 
 # ------------------------------------------------------------------ state
 def empty(at=None) -> dict:
-    return dict(schema=SCHEMA, workers=[], payments={}, camp=camp.new(at), candidates={})
+    return dict(schema=SCHEMA, workers=[], payments={}, vault_takes={}, camp=camp.new(at), candidates={})
 
 
 def migrate(value: dict) -> dict:
@@ -233,6 +233,7 @@ def load(data, at=None) -> dict:
         return empty(at)
     value = migrate(value)
     value.setdefault('payments', {})
+    value['vault_takes'] = value.get('vault_takes') if isinstance(value.get('vault_takes'), dict) else {}
     value['candidates'] = value.get('candidates') if isinstance(value.get('candidates'), dict) else {}
     value['camp'] = camp.normalize(value.get('camp'))
     camp.settle(value['camp'], at)

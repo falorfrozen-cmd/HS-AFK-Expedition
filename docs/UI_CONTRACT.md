@@ -531,6 +531,29 @@ A payment's `purpose` is now `hire`, `respec`, `build`, `tool` or `retrain`. Cam
 resources set aside for a `build` or `tool` payment are given back if the game
 refuses it; an `unknown` payment keeps them until its receipt decides.
 
+**Keys and materials from the Vault.** The key rack (Basic Key `12:0`, Crystal Key
+`12:1`) and the Jeweler's stock (jewel recipe materials `14:0`-`14:23`, `14:44`)
+are filled from the Item Editor's Vault, category AFK Materials, through the
+editor's `POST /api/vault/afk-take` (Item Editor 2.16.1 or newer). The key rack
+holds 25/60/120/250/500 keys by Storehouse level; the stock 500 to 25,000.
+
+- `GET /api/camp/vault` asks the running editor: `editor` (bool), `stock`
+  [{`key` ("type:id"), `name`, `count`, `goes_to` (`rack`/`stock`)}] (dungeon keys
+  and other materials are left out), `keys`, `key_cap`, `key_room`, `stock_cap`,
+  `stock_room`, `pending` (takes still being settled) and `error` (for example an
+  editor older than 2.16.1).
+- `camp_take` {`items` {"type:id": count}}: whole counts from 1 to 100,000 of rack
+  keys and jewel materials. Refused before the editor is asked when the rack or the
+  stock has no room for them. Each take has one receipt in workers.json
+  (`vault_takes`, request id, `state` `pending`/`done`/`refused`/`unknown`); the
+  editor carries a request out at most once. Anything but a clear `done` is
+  settled by cancelling the request: the editor reports the take it made (it
+  reaches the camp once, even past the cap) or makes sure it never takes anything.
+  An `unknown` take (the editor went quiet) is settled the same way by the panel
+  once the editor answers again. `/api/state` → `workers.pending_vault_takes`
+  lists the last unsettled or refused ones (`request_id`, `items`, `state`,
+  `error`).
+
 ### Traits
 
 Every worker has `traits` [{`id`, `name`, `rarity` (common, rare, epic,

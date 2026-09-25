@@ -127,7 +127,7 @@ def effects(camp: dict) -> dict:
         types=['miner'] + (['adventurer', 'goblin_hunter'] if tavern >= 1 else []) + (['jeweler'] if bench >= 1 else []),
         gate_hp=100.0 + 10.0 * walls, gate_repair=float(max(0, walls - 1)), gate_max_damage=45.0 if walls >= 5 else 50.0,
         resource_cap=(1000, 3000, 8000, 20000, 50000)[store - 1], stock_cap=(500, 1500, 4000, 10000, 25000)[store - 1],
-        key_cap=(10, 25, 50, 100, 250)[store - 1],
+        key_cap=(25, 60, 120, 250, 500)[store - 1],
         tool_tier=forge,
         xp_bonus=0.10 * training, respec_discount=0.25 if training >= 2 else 0.0, mentor=0.10 if training >= 3 else 0.0,
         weekly_free_respec=training >= 5,
@@ -184,24 +184,26 @@ def give_back(camp: dict, taken: dict) -> None:
         camp['resources'][r] = camp['resources'].get(r, 0) + int((taken or {}).get(r, 0) or 0)
 
 
-def add_stock(camp: dict, items: dict) -> dict:
-    """Jeweler's materials ("type:id" -> units) up to the stock cap; returns what was kept."""
+def add_stock(camp: dict, items: dict, force: bool = False) -> dict:
+    """Jeweler's materials ("type:id" -> units) up to the stock cap; returns what was kept.
+    ``force``: past the cap (a Vault take the editor carried out always arrives)."""
     cap = effects(camp)['stock_cap']
     kept = {}
     for key, n in items.items():
-        room = max(0, cap - sum(camp['stock'].values()))
+        room = max(0, cap - sum(camp['stock'].values())) if not force else max(0, int(n))
         kept[key] = min(max(0, int(n)), room)
         if kept[key]:
             camp['stock'][key] = camp['stock'].get(key, 0) + kept[key]
     return kept
 
 
-def add_keys(camp: dict, keys: dict) -> dict:
-    """Keys (base id -> count) onto the key rack up to its cap; returns what was kept."""
+def add_keys(camp: dict, keys: dict, force: bool = False) -> dict:
+    """Keys (base id -> count) onto the key rack up to its cap; returns what was kept.
+    ``force``: past the cap (a Vault take the editor carried out always arrives)."""
     cap = effects(camp)['key_cap']
     kept = {}
     for key, n in keys.items():
-        room = max(0, cap - sum(camp['keys'].values()))
+        room = max(0, cap - sum(camp['keys'].values())) if not force else max(0, int(n))
         kept[str(key)] = min(max(0, int(n)), room)
         if kept[str(key)]:
             camp['keys'][str(key)] = camp['keys'].get(str(key), 0) + kept[str(key)]

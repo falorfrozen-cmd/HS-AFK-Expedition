@@ -12,7 +12,7 @@ import loot_filter
 import notify
 import calibration, recovery, validate_farm
 import collection
-import workers, camp, traits, worker_loot, worker_jeweler, teams
+import workers, camp, traits, worker_loot, worker_jeweler, teams, vault_take
 from product_data import Presentation, SUPPORT, support_warnings
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -202,6 +202,7 @@ class Panel:
             if time.monotonic()-self.editor_at>20:
                 self.editor=ingest_spool.discover_editor(.1);self.editor_at=time.monotonic()
             self.settle_late_payments()
+            self.settle_late_vault_takes()
             self.sync_notification()
 
     def sync_notification(self):
@@ -779,7 +780,7 @@ class Panel:
             width,height=struct.unpack('>II',raw[16:24]);require(0<width<=4096 and 0<height<=4096,'Portrait dimensions must be 4096 pixels or smaller.')
             path=self.data/'portraits'/(self.portrait_key(c)+'.png');path.parent.mkdir(parents=True,exist_ok=True)
             path.write_bytes(raw);self.log('Character screenshot saved locally. It does not change the game save.');return
-        if name.startswith('worker_') or name in ('camp_build','team_start'):return self.worker_action(name,args)
+        if name.startswith('worker_') or name in ('camp_build','team_start','camp_take'):return self.worker_action(name,args)
         if name=='verify_special':
             ident=args.get('hash','');require(isinstance(ident,str) and bool(re.fullmatch(r'[a-f0-9]{12,64}',ident)),'Choose a special monster to verify.')
             s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
@@ -845,6 +846,8 @@ class Panel:
         return dict(crew=crew,hire_price=workers.hire_price(state),max_workers=workers.max_workers(state),
                     pending_payments=[dict(request_id=k,**{x:v.get(x) for x in ('purpose','amount','state','error')})
                                       for k,v in state.get('payments',{}).items() if v.get('state') in ('pending','unknown','refused')][-5:],
+                    pending_vault_takes=[dict(request_id=k,**{x:v.get(x) for x in ('items','state','error')})
+                                         for k,v in state.get('vault_takes',{}).items() if v.get('state') in ('pending','unknown','refused')][-5:],
                     camp=dict(resources=dict(state['camp']['resources']),resource_cap=eff['resource_cap'],hq=camp.level(state['camp'],'hq'),
                               queue=[dict(q,name=camp.BY_KEY[q['building']]['name']) for q in state['camp']['queue']]))
 
@@ -974,6 +977,106 @@ class Panel:
                 'it is never charged twice.')
         require(entry['state']=='paid','The game did not take the gold: '+(entry.get('error') or 'no receipt came back')+'. Nothing was bought.')
         return request,entry['receipt']
+
+    # Keys for the rack and materials for the Jeweler's stock come from the Item Editor's
+    # Vault (AFK Materials), one receipt per request (vault_takes); the editor carries a
+    # request out at most once. Anything but a clear "done" is settled by cancelling the
+    # request: the editor then reports the take it made (it reaches the camp once) or
+    # makes sure the request never takes anything.
+    def vault_editor(self):
+        return self.editor or ingest_spool.discover_editor(.2)
+
+    def ask_vault(self,base,action,request=None,items=None):
+        """The editor's reply; {'old': True} from an editor without the camp route; None without a clear answer."""
+        try:
+            if action=='take':return vault_take.take(base,request,items)
+            if action=='cancel':return vault_take.cancel(base,request)
+            return vault_take.stock(base)
+        except vault_take.OldEditor:return dict(old=True)
+        except (OSError,ValueError):return None
+
+    def record_vault_take(self,request,reply):
+        """Store what the editor did with a take; a done take reaches the camp exactly once."""
+        state=workers.load(self.data);entry=state['vault_takes'][request]
+        if reply is None:
+            entry.update(state='unknown',error='the Item Editor did not answer')
+        elif reply.get('old'):
+            entry.update(state='refused',error=vault_take.OLD_EDITOR)
+        elif reply.get('state')=='done':
+            if not entry.get('applied'):
+                got=vault_take.taken(reply)
+                camp.add_keys(state['camp'],{k.split(':')[1]:n for k,n in got.items() if vault_take.goes_to(k)=='rack'},force=True)
+                camp.add_stock(state['camp'],{k:n for k,n in got.items() if vault_take.goes_to(k)=='stock'},force=True)
+                entry.update(applied=True,taken=got)
+                self.log(f'Took {vault_take.describe(got)} from the Vault for the camp.')
+            entry.update(state='done',error=None,event=reply.get('eventId'))
+        else:
+            entry.update(state='refused',error=reply.get('err') or 'the Item Editor cancelled it')
+        workers.save(self.data,state)
+        return entry
+
+    def unanswered_vault_takes(self):
+        return [k for k,v in workers.load(self.data)['vault_takes'].items() if v.get('state') in ('pending','unknown')]
+
+    def settle_vault_takes(self,base=None):
+        """Settle takes whose answer was lost: the editor reports each take (credited once) or cancels it."""
+        pending=self.unanswered_vault_takes()
+        base=base or (self.vault_editor() if pending else None)
+        for request in pending if base else []:
+            reply=self.ask_vault(base,'cancel',request)
+            if reply is not None:self.record_vault_take(request,reply)
+
+    def settle_late_vault_takes(self):
+        # From the monitor: only between actions, so the worker records have one writer at a time.
+        try:
+            if not self.editor or not self.unanswered_vault_takes() or not self.job_lock.acquire(blocking=False):return
+            try:self.settle_vault_takes(self.editor)
+            finally:self.job_lock.release()
+        except Exception as error:
+            if str(error)!=getattr(self,'vault_settle_error',None):self.vault_settle_error=str(error);self.log(f'An earlier Vault take is not settled yet: {error}')
+
+    def camp_vault_view(self):
+        """What the Vault's AFK Materials can give the camp and the room for it (asks the Item Editor)."""
+        state=workers.load(self.data);eff=camp.effects(state['camp'])
+        out=dict(editor=False,stock=[],keys=dict(state['camp']['keys']),key_cap=eff['key_cap'],
+                 key_room=max(0,eff['key_cap']-sum(state['camp']['keys'].values())),stock_cap=eff['stock_cap'],
+                 stock_room=max(0,eff['stock_cap']-sum(state['camp']['stock'].values())),
+                 pending=[dict(request_id=k,**{x:v.get(x) for x in ('items','state','error','at')})
+                          for k,v in state['vault_takes'].items() if v.get('state') in ('pending','unknown')])
+        base=self.vault_editor();reply=self.ask_vault(base,'stock') if base else None
+        if reply is not None:
+            out['editor']=True
+            if reply.get('old') or reply.get('err'):out['error']=vault_take.OLD_EDITOR if reply.get('old') else reply['err']
+            for row in reply.get('stock') or []:
+                key=f"{row['cls']}:{row['base']}"
+                if vault_take.goes_to(key):out['stock'].append(dict(key=key,name=vault_take.name(key),count=row['count'],goes_to=vault_take.goes_to(key)))
+        return out
+
+    def camp_take(self,items):
+        """Take keys (the rack) and jewel materials (the Jeweler's stock) from the Vault's AFK Materials."""
+        base=self.vault_editor();require(base,'Open the Item Editor: the keys and materials come from its Vault (AFK Materials).')
+        self.settle_vault_takes(base)
+        state=workers.load(self.data);eff=camp.effects(state['camp'])
+        keys=sum(n for k,n in items.items() if vault_take.goes_to(k)=='rack')
+        room=eff['key_cap']-sum(state['camp']['keys'].values())
+        require(keys<=room,f"The key rack has room for {max(0,room):,} more keys. Build the Storehouse up for a bigger rack.")
+        materials=sum(n for k,n in items.items() if vault_take.goes_to(k)=='stock')
+        room=eff['stock_cap']-sum(state['camp']['stock'].values())
+        require(materials<=room,f"The Jeweler's stock has room for {max(0,room):,} more materials. Build the Storehouse up for more.")
+        request=uuid.uuid4().hex
+        state['vault_takes'][request]=dict(items=items,state='pending',at=datetime.now(timezone.utc).isoformat());workers.save(self.data,state)
+        self.log(f'Taking {vault_take.describe(items)} from the Vault...')
+        reply=self.ask_vault(base,'take',request,items)
+        if reply is None or (not reply.get('old') and reply.get('state')!='done'):
+            refused=(reply or {}).get('err')
+            settled=self.ask_vault(base,'cancel',request)   # settle it now: done after all, or never
+            if settled is None and refused:settled=dict(state='cancelled')   # an error reply means nothing was taken
+            reply=dict(settled,err=refused) if settled is not None and refused and settled.get('state')=='cancelled' else settled
+        entry=self.record_vault_take(request,reply)
+        require(entry['state']!='unknown','The Item Editor did not answer. If it gave them, AFK FARM puts them in the camp by itself; '
+                'nothing is ever taken twice.')
+        error=(entry.get('error') or 'no answer').rstrip('.')
+        require(entry['state']=='done',f'The Vault did not give them: {error}'+('.' if error.endswith('Nothing was taken') else '. Nothing was taken.'))
 
     def collect_worker(self,worker_id):
         """Deliver one worker's haul through the game, then send it to the Vault."""
@@ -1153,6 +1256,8 @@ class Panel:
         if name=='worker_route':
             w=workers.set_route(state,args.get('worker'),args.get('route'));workers.save(self.data,state)
             self.log(f"{w['name']}'s jewelcrafting materials now go to "+('the Jeweler\'s stock.' if w['route']=='stock' else 'the Vault.'));return
+        if name=='camp_take':
+            self.camp_take(vault_take.clean_items(args.get('items')));return
         if name=='camp_build':
             plan=camp.next_build(state['camp'],args.get('building'))
             require(plan['to'] and not plan['blockers'],f"{camp.BY_KEY[plan['key']]['name']}: "+'; '.join(plan['blockers'])+'.')
@@ -1348,6 +1453,7 @@ class Handler(BaseHTTPRequestHandler):
             if route=='/api/siege-forecast':return self.send(200,self.app.siege_forecast(urlsplit(self.path).query))
             if route=='/api/specials':return self.send(200,self.app.specials_view())
             if route=='/api/workers':return self.send(200,self.app.workers_overview())
+            if route=='/api/camp/vault':return self.send(200,self.app.camp_vault_view())
             if route=='/api/share':
                 from urllib.parse import parse_qs
                 return self.send(200,self.app.share_summary(parse_qs(urlsplit(self.path).query).get('id',[''])[0]))

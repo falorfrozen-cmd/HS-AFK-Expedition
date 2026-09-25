@@ -289,6 +289,18 @@ worker-replay` (the claim machinery: resumable, never twice). A game update ends
 the replayability of old packets; such a trip is cancelled (keys come back).
 Real chest objects are never created (the game's spawn check reports them).
 
+**Keys and jeweler materials from the Vault.** The rack and the stock are filled
+from the Vault's AFK Materials by the Item Editor itself (`POST
+/api/vault/afk-take`, 2.16.1): AFK FARM never writes the Vault database. The
+editor carries a request id out at most once (checked inside its write
+transaction) and a cancelled id never takes. The panel keeps one receipt per
+request (`vault_takes`) and settles anything but a clear "done" by cancelling:
+the editor then reports the take it made, which reaches the camp once (even past
+the Storehouse cap, since it already left the Vault), or makes sure that request
+never takes anything. As with a gold payment, a lost answer can neither double
+the keys nor lose them. The rack's caps (25-500) were raised for this: an
+8-hour adventurer trip uses about 8 Basic and 3 Crystal Keys.
+
 **The Jeweler uses the game's recipes.** The plugin reads the craft cube's table
 (`worker recipes`: global.craftComboList / craftComboResult, result types 37-41,
 amounts through PilipaliDecrypt) and, at delivery, reads the recipe again and

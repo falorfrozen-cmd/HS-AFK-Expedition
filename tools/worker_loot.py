@@ -11,7 +11,8 @@ live room, so a haul is collected with an offline hero standing in the trip's
 region, and only packets of the running game build can replay.
 
 Keys are the game's: a golden chest takes a Basic Key, a crystal chest a
-Crystal Key, from the camp's key rack. Keys a trip finds go to the rack.
+Crystal Key, from the camp's key rack (filled from the Vault, see vault_take.py).
+Keys a trip finds go to the rack.
 
 Standard library only.
 """
