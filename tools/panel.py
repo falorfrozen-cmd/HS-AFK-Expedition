@@ -12,7 +12,7 @@ import loot_filter
 import notify
 import calibration, recovery, validate_farm
 import collection
-import workers
+import workers, camp, traits, worker_loot, worker_jeweler, teams, vault_take
 from product_data import Presentation, SUPPORT, support_warnings
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -202,6 +202,7 @@ class Panel:
             if time.monotonic()-self.editor_at>20:
                 self.editor=ingest_spool.discover_editor(.1);self.editor_at=time.monotonic()
             self.settle_late_payments()
+            self.settle_late_vault_takes()
             self.sync_notification()
 
     def sync_notification(self):
@@ -548,7 +549,8 @@ class Panel:
         def run():
             try:
                 if action in ('plan','start','cancel','recover','ingest','portrait','configure','save_modifiers','save_loot_filter','save_preferences','settle_partial','accept_position',
-                              'wishlist_add','wishlist_remove','worker_learn','worker_rename','worker_start','worker_cancel','worker_transfer','worker_settle_partial'):
+                              'wishlist_add','wishlist_remove','worker_learn','worker_rename','worker_start','worker_cancel','worker_transfer','worker_settle_partial',
+                              'worker_route'):
                     self.action(action,args)
                 else:
                     with self.lock:self.action(action,args)
@@ -697,7 +699,7 @@ class Panel:
             if mode=='siege':
                 import siege
                 level=args.get('siege_level')
-                plan=siege.build_plan(p,level,hours,ident,modifiers,specials=self.verified_for(p))
+                plan=siege.build_plan(p,level,hours,ident,modifiers,specials=self.verified_for(p),gate=self.camp_gate())
                 label='Siege L'+str(level)+' · '+expedition_label(p['room'],plan['hours'],hero)
             else:
                 plan=afk.make_plan(hours,[(p['room'],1)],ident,40,'pickup',profile_overrides={p['room']:p})
@@ -778,7 +780,7 @@ class Panel:
             width,height=struct.unpack('>II',raw[16:24]);require(0<width<=4096 and 0<height<=4096,'Portrait dimensions must be 4096 pixels or smaller.')
             path=self.data/'portraits'/(self.portrait_key(c)+'.png');path.parent.mkdir(parents=True,exist_ok=True)
             path.write_bytes(raw);self.log('Character screenshot saved locally. It does not change the game save.');return
-        if name.startswith('worker_'):return self.worker_action(name,args)
+        if name.startswith('worker_') or name in ('camp_build','team_start','camp_take'):return self.worker_action(name,args)
         if name=='verify_special':
             ident=args.get('hash','');require(isinstance(ident,str) and bool(re.fullmatch(r'[a-f0-9]{12,64}',ident)),'Choose a special monster to verify.')
             s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
@@ -805,9 +807,9 @@ class Panel:
         try:level=int((values.get('level') or ['0'])[0]);hours=float((values.get('hours') or ['2'])[0])
         except ValueError:raise ValueError('Invalid Siege level or duration.')
         require(1<=level<=siege.MAX_LEVEL and math.isfinite(hours) and .25<=hours<=afk.MAX_HOURS,'Invalid Siege level or duration.')
-        result=siege.forecast(p,level,hours,specials=self.verified_for(p))
+        gate=self.camp_gate();result=siege.forecast(p,level,hours,specials=self.verified_for(p),gate=gate)
         hero=afk.hero_key(p['character'])
-        result.update(suggested_level=siege.suggest_level(p,hours),best_waves=siege.best(self.data,hero,p['room'],level) if hero else 0,
+        result.update(suggested_level=siege.suggest_level(p,hours,gate=gate),gate_hp=gate['gate_hp'],best_waves=siege.best(self.data,hero,p['room'],level) if hero else 0,
                       wave_minutes=siege.WAVE_MINUTES,max_level=siege.MAX_LEVEL)
         return result
 
@@ -829,27 +831,52 @@ class Panel:
         return (siege.load_records(self.data)['heroes'].get(hero) or {}) if hero else {}
 
     # ------------------------------------------------------------ workers
+    def camp_gate(self):
+        """The Siege gate the camp's Walls give (camp effects: gate_hp, gate_repair, gate_max_damage)."""
+        return camp.effects(workers.load(self.data)['camp'])
+
     def workers_view(self):
         """The crew in /api/state: levels, points and trips (details: /api/workers)."""
         state=workers.load(self.data)
         crew=[]
         for w in state['workers']:
-            v=workers.view(w)
-            crew.append(dict((k,v[k]) for k in ('id','name','type','level','xp_into_level','xp_for_next','points','max_trip_hours','trip')))
-        return dict(crew=crew,hire_price=workers.hire_price(state),max_workers=workers.MAX_WORKERS,
+            v=workers.view(w,state=state)
+            crew.append(dict((k,v[k]) for k in ('id','name','type','type_name','level','xp_into_level','xp_for_next','points','max_trip_hours','trip','traits','tool')))
+        eff=camp.effects(state['camp'])
+        return dict(crew=crew,hire_price=workers.hire_price(state),max_workers=workers.max_workers(state),
                     pending_payments=[dict(request_id=k,**{x:v.get(x) for x in ('purpose','amount','state','error')})
-                                      for k,v in state.get('payments',{}).items() if v.get('state') in ('pending','unknown','refused')][-5:])
+                                      for k,v in state.get('payments',{}).items() if v.get('state') in ('pending','unknown','refused')][-5:],
+                    pending_vault_takes=[dict(request_id=k,**{x:v.get(x) for x in ('items','state','error')})
+                                         for k,v in state.get('vault_takes',{}).items() if v.get('state') in ('pending','unknown','refused')][-5:],
+                    camp=dict(resources=dict(state['camp']['resources']),resource_cap=eff['resource_cap'],hq=camp.level(state['camp'],'hq'),
+                              queue=[dict(q,name=camp.BY_KEY[q['building']]['name']) for q in state['camp']['queue']]))
 
     def workers_overview(self):
-        return workers.overview(workers.load(self.data))
+        state=workers.load(self.data);out=workers.overview(state)
+        out['candidates']={t:workers.describe_candidates(state,t) for t in camp.effects(state['camp'])['types']}
+        pool=worker_loot.pools();names=zone_names()
+        out['hotspots']=camp.hotspots(state['camp'],workers.hotspot_targets(pool))
+        out['regions']={kind:[dict(room=room,name=names.get(room,room),recorded=found) for room,found in sorted(worker_loot.regions(kind,pool).items())]
+                        for kind in ('adventurer','goblin_hunter')}
+        out['chests']=[dict(c) for c in worker_loot.CHESTS];out['goblins']=[dict(g) for g in worker_loot.GOBLINS];out['key_names']=worker_loot.KEY_NAMES
+        kept=worker_jeweler.load_recipes(self.data);bench=camp.effects(state['camp'])['recipe_tier']
+        out['recipes']=[dict(worker_jeweler.recipe_view(r),affordable=worker_jeweler.affordable(state['camp']['stock'],r),bench_ok=bench>=worker_jeweler.TIER_BY_TYPE[r['result_type']]['tier'])
+                        for r in kept['recipes']]
+        out['material_names']=worker_jeweler.MATERIAL_NAMES;out['jewel_names']=worker_jeweler.JEWEL_NAMES
+        workers.save(self.data,state)   # candidates rolled for the first time are kept
+        return out
 
     def worker_entries(self):
         entries=[]
         for w in workers.load(self.data)['workers']:
             trip=workers.trip_view(w)
             if trip and not trip['ready']:
-                entries.append(notify.entry('worker-'+w['id'],afk.parse_iso(trip['ready_at']),'AFK FARM: haul ready',
-                               f"{w['name']} is back from the mine with {trip['ore_name']}. Open AFK FARM and collect it with any offline hero loaded."))
+                if 'ore' in trip:
+                    text=f"{w['name']} is back from the mine with {trip['ore_name']}. Open AFK FARM and collect it with any offline hero loaded."
+                else:
+                    place=zone_names().get(trip['region'],trip['region'])
+                    text=f"{w['name']} is back from {place}. Open AFK FARM and collect the haul with any offline hero standing in {place}."
+                entries.append(notify.entry('worker-'+w['id'],afk.parse_iso(trip['ready_at']),'AFK FARM: haul ready',text))
         return entries
 
     # A payment request gets exactly one receipt, written by the game when it runs
@@ -877,16 +904,30 @@ class Panel:
             if entry['state']=='paid' and not entry.get('applied'):
                 self.log(f"Paid {entry['amount']:,} gold ({receipt.get('gold_before'):,.0f} -> {receipt.get('gold_after'):,.0f}); the game saved.")
                 self.apply_payment(state,request,entry,receipt);entry['applied']=True
+            if entry['state']=='refused' and entry.get('reserved') and not entry.get('released'):
+                camp.give_back(state['camp'],entry['reserved']);entry['released']=True   # the camp resources set aside for it
         workers.save(self.data,state)
         return entry
 
     def apply_payment(self,state,request,entry,receipt):
-        if entry['purpose']=='hire' and not any((w.get('payment') or {}).get('request_id')==request for w in state['workers']):
-            w=workers.new_worker(state,entry.get('name'),payment=dict(request_id=request,amount=entry['amount'],at=receipt.get('at'),character=receipt.get('character')))
+        purpose=entry['purpose']
+        if purpose=='hire' and not any((w.get('payment') or {}).get('request_id')==request for w in state['workers']):
+            w=workers.new_worker(state,entry.get('name'),payment=dict(request_id=request,amount=entry['amount'],at=receipt.get('at'),character=receipt.get('character')),
+                                 worker_type=entry.get('type','miner'),worker_traits=entry.get('traits'))
+            workers.roll_candidates(state,w['type'])
             self.log(f"{w['name']} joined your crew. Send them on a trip from the Workers page.")
-        elif entry['purpose']=='respec':
+        elif purpose=='respec':
             w=workers.respec(workers.find(state,entry.get('worker')))
             self.log(f"{w['name']}'s skills were reset; every point can be spent again.")
+        elif purpose=='build':
+            site=camp.start(state['camp'],entry['building'],request)
+            self.log(f"{camp.BY_KEY[entry['building']]['name']} level {site['to']} is being built; ready at {site['ready_at']}.")
+        elif purpose=='tool':
+            w=workers.find(state,entry.get('worker'));w['tool']=max(int(w.get('tool',0)),int(entry['tier']))
+            self.log(f"{w['name']} got a tier {entry['tier']} {camp.TOOL_NAMES.get(w['type'],'tool').lower()}.")
+        elif purpose=='retrain':
+            w=workers.retrain(state,entry.get('worker'),entry.get('what','trait'))
+            self.log(f"{w['name']} was retrained: "+', '.join(t['name'] for t in traits.describe(w['traits']))+'.')
 
     def unanswered_payments(self):
         return [k for k,v in workers.load(self.data)['payments'].items() if v.get('state') in ('pending','unknown')]
@@ -919,14 +960,16 @@ class Panel:
         if completed:self.log('The earlier purchase was completed; nothing else was charged.')
         return completed
 
-    def worker_pay(self,purpose,amount,extra=None):
+    def worker_pay(self,purpose,amount,extra=None,reserve=None):
         """Take ``amount`` gold from the loaded hero through the game's purchase path and complete the purchase.
+        ``reserve``: camp resources set aside with the payment, given back if the game refuses it.
         Returns None, and charges nothing new, when an earlier unanswered purchase was completed instead."""
         s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
         if self.finish_earlier_payments():return None
         state=workers.load(self.data);request=uuid.uuid4().hex
+        reserved=camp.take(state['camp'],reserve) if reserve else None
         state['payments'][request]=dict(purpose=purpose,amount=amount,state='pending',at=datetime.now(timezone.utc).isoformat(),
-                                        character=s['character'],**(extra or {}))
+                                        character=s['character'],reserved=reserved,**(extra or {}))
         workers.save(self.data,state)
         self.log(f"Paying {amount:,} gold from {s['character']['name']} in the game...")
         entry=self.record_payment(request,self.send_payment(request,amount))
@@ -935,16 +978,119 @@ class Panel:
         require(entry['state']=='paid','The game did not take the gold: '+(entry.get('error') or 'no receipt came back')+'. Nothing was bought.')
         return request,entry['receipt']
 
+    # Keys for the rack and materials for the Jeweler's stock come from the Item Editor's
+    # Vault (AFK Materials), one receipt per request (vault_takes); the editor carries a
+    # request out at most once. Anything but a clear "done" is settled by cancelling the
+    # request: the editor then reports the take it made (it reaches the camp once) or
+    # makes sure the request never takes anything.
+    def vault_editor(self):
+        return self.editor or ingest_spool.discover_editor(.2)
+
+    def ask_vault(self,base,action,request=None,items=None):
+        """The editor's reply; {'old': True} from an editor without the camp route; None without a clear answer."""
+        try:
+            if action=='take':return vault_take.take(base,request,items)
+            if action=='cancel':return vault_take.cancel(base,request)
+            return vault_take.stock(base)
+        except vault_take.OldEditor:return dict(old=True)
+        except (OSError,ValueError):return None
+
+    def record_vault_take(self,request,reply):
+        """Store what the editor did with a take; a done take reaches the camp exactly once."""
+        state=workers.load(self.data);entry=state['vault_takes'][request]
+        if reply is None:
+            entry.update(state='unknown',error='the Item Editor did not answer')
+        elif reply.get('old'):
+            entry.update(state='refused',error=vault_take.OLD_EDITOR)
+        elif reply.get('state')=='done':
+            if not entry.get('applied'):
+                got=vault_take.taken(reply)
+                camp.add_keys(state['camp'],{k.split(':')[1]:n for k,n in got.items() if vault_take.goes_to(k)=='rack'},force=True)
+                camp.add_stock(state['camp'],{k:n for k,n in got.items() if vault_take.goes_to(k)=='stock'},force=True)
+                entry.update(applied=True,taken=got)
+                self.log(f'Took {vault_take.describe(got)} from the Vault for the camp.')
+            entry.update(state='done',error=None,event=reply.get('eventId'))
+        else:
+            entry.update(state='refused',error=reply.get('err') or 'the Item Editor cancelled it')
+        workers.save(self.data,state)
+        return entry
+
+    def unanswered_vault_takes(self):
+        return [k for k,v in workers.load(self.data)['vault_takes'].items() if v.get('state') in ('pending','unknown')]
+
+    def settle_vault_takes(self,base=None):
+        """Settle takes whose answer was lost: the editor reports each take (credited once) or cancels it."""
+        pending=self.unanswered_vault_takes()
+        base=base or (self.vault_editor() if pending else None)
+        for request in pending if base else []:
+            reply=self.ask_vault(base,'cancel',request)
+            if reply is not None:self.record_vault_take(request,reply)
+
+    def settle_late_vault_takes(self):
+        # From the monitor: only between actions, so the worker records have one writer at a time.
+        try:
+            if not self.editor or not self.unanswered_vault_takes() or not self.job_lock.acquire(blocking=False):return
+            try:self.settle_vault_takes(self.editor)
+            finally:self.job_lock.release()
+        except Exception as error:
+            if str(error)!=getattr(self,'vault_settle_error',None):self.vault_settle_error=str(error);self.log(f'An earlier Vault take is not settled yet: {error}')
+
+    def camp_vault_view(self):
+        """What the Vault's AFK Materials can give the camp and the room for it (asks the Item Editor)."""
+        state=workers.load(self.data);eff=camp.effects(state['camp'])
+        out=dict(editor=False,stock=[],keys=dict(state['camp']['keys']),key_cap=eff['key_cap'],
+                 key_room=max(0,eff['key_cap']-sum(state['camp']['keys'].values())),stock_cap=eff['stock_cap'],
+                 stock_room=max(0,eff['stock_cap']-sum(state['camp']['stock'].values())),
+                 pending=[dict(request_id=k,**{x:v.get(x) for x in ('items','state','error','at')})
+                          for k,v in state['vault_takes'].items() if v.get('state') in ('pending','unknown')])
+        base=self.vault_editor();reply=self.ask_vault(base,'stock') if base else None
+        if reply is not None:
+            out['editor']=True
+            if reply.get('old') or reply.get('err'):out['error']=vault_take.OLD_EDITOR if reply.get('old') else reply['err']
+            for row in reply.get('stock') or []:
+                key=f"{row['cls']}:{row['base']}"
+                if vault_take.goes_to(key):out['stock'].append(dict(key=key,name=vault_take.name(key),count=row['count'],goes_to=vault_take.goes_to(key)))
+        return out
+
+    def camp_take(self,items):
+        """Take keys (the rack) and jewel materials (the Jeweler's stock) from the Vault's AFK Materials."""
+        base=self.vault_editor();require(base,'Open the Item Editor: the keys and materials come from its Vault (AFK Materials).')
+        self.settle_vault_takes(base)
+        state=workers.load(self.data);eff=camp.effects(state['camp'])
+        keys=sum(n for k,n in items.items() if vault_take.goes_to(k)=='rack')
+        room=eff['key_cap']-sum(state['camp']['keys'].values())
+        require(keys<=room,f"The key rack has room for {max(0,room):,} more keys. Build the Storehouse up for a bigger rack.")
+        materials=sum(n for k,n in items.items() if vault_take.goes_to(k)=='stock')
+        room=eff['stock_cap']-sum(state['camp']['stock'].values())
+        require(materials<=room,f"The Jeweler's stock has room for {max(0,room):,} more materials. Build the Storehouse up for more.")
+        request=uuid.uuid4().hex
+        state['vault_takes'][request]=dict(items=items,state='pending',at=datetime.now(timezone.utc).isoformat());workers.save(self.data,state)
+        self.log(f'Taking {vault_take.describe(items)} from the Vault...')
+        reply=self.ask_vault(base,'take',request,items)
+        if reply is None or (not reply.get('old') and reply.get('state')!='done'):
+            refused=(reply or {}).get('err')
+            settled=self.ask_vault(base,'cancel',request)   # settle it now: done after all, or never
+            if settled is None and refused:settled=dict(state='cancelled')   # an error reply means nothing was taken
+            reply=dict(settled,err=refused) if settled is not None and refused and settled.get('state')=='cancelled' else settled
+        entry=self.record_vault_take(request,reply)
+        require(entry['state']!='unknown','The Item Editor did not answer. If it gave them, AFK FARM puts them in the camp by itself; '
+                'nothing is ever taken twice.')
+        error=(entry.get('error') or 'no answer').rstrip('.')
+        require(entry['state']=='done',f'The Vault did not give them: {error}'+('.' if error.endswith('Nothing was taken') else '. Nothing was taken.'))
+
     def collect_worker(self,worker_id):
         """Deliver one worker's haul through the game, then send it to the Vault."""
         state=workers.load(self.data);w=workers.find(state,worker_id);trip=w.get('trip')
         require(trip,f"{w['name']} is not on a trip.")
+        if w.get('type','miner') in ('adventurer','goblin_hunter'):return self.collect_loot(worker_id)
+        jeweler=w.get('type')=='jeweler'
         if trip.get('delivery'):
             path=Path(trip['delivery']['plan']);plan=read(path,{}) or {}
             require(plan.get('delivery_id')==trip['delivery']['delivery_id'],'The planned haul is missing; it was not made again.')
         else:
-            view=workers.trip_view(w);plan=workers.delivery_plan(w,trip,view['credited_work_hours'])
-            require(plan['items'] or plan['prospect'],f"{w['name']} has not mined anything yet.")
+            view=workers.trip_view(w)
+            plan=(worker_jeweler.delivery_plan if jeweler else workers.delivery_plan)(w,trip,view['credited_work_hours'])
+            require(plan['items'] or plan['prospect'] or plan.get('crafts') or jeweler,f"{w['name']} has not {'made' if jeweler else 'mined'} anything yet.")
             path=self.data/'plans'/f"{plan['delivery_id']}.json";afk.write_json(path,plan)
             trip['delivery']=dict(delivery_id=plan['delivery_id'],plan=str(path),planned_at=plan['planned_at'])
             workers.save(self.data,state)
@@ -962,11 +1108,75 @@ class Panel:
         require(result.get('state')=='done',f"The haul stopped part way ({result.get('error') or 'no reason given'}). What was made stays in its records; "
                 'nothing is made twice. Close the haul as partial to keep that part.')
         state=workers.load(self.data)
+        if jeweler:
+            applied=worker_jeweler.apply(state,workers.find(state,worker_id),plan,result);workers.save(self.data,state)
+            who=applied['worker'];made=sum(int(n) for n in (result.get('crafted') or {}).values())
+            self.log(f"{who['name']}: +{plan['xp']:,} XP"+(f", now level {who['level']}" if applied['levels'] else '')
+                     +f"; {made:,} jewels made ({plan['craft_count']:,} crafts"+(f", {plan['extra']:,} extra" if plan['extra'] else '')+')'
+                     +f"; +{applied['camp'].get('dust',0):,} gem dust for the camp.")
+            if made:self.transfer_worker_haul(ident,who['name'])
+            return applied
         applied=workers.apply_delivery(state,worker_id,plan,result);workers.save(self.data,state)
         w=applied['worker']
-        self.log(f"{w['name']}: +{plan['xp']:,} XP" + (f", now level {w['level']}" if applied['levels'] else '') + f"; {plan['ore_total']:,} ore mined.")
+        stone=(applied.get('camp') or {}).get('stone',0)
+        self.log(f"{w['name']}: +{plan['xp']:,} XP" + (f", now level {w['level']}" if applied['levels'] else '') + f"; {plan['ore_total']:,} ore mined"
+                 + (f"; +{stone:,} stone for the camp." if stone else '.'))
         self.transfer_worker_haul(ident,w['name'])
         return applied
+
+    def collect_loot(self,worker_id):
+        """An adventurer's or goblin hunter's haul: the region's recorded chest or goblin
+        packets replayed through the game (no XP for the hero), then the Vault. The loot
+        replays in the trip's region, so an offline hero must stand there."""
+        state=workers.load(self.data);w=workers.find(state,worker_id);trip=w['trip'];region=trip['region']
+        place=f"{zone_names().get(region,region)} ({region})"
+        s=self.fresh();require(not s['replay_running'],'Wait for reward delivery to finish.')
+        if trip.get('delivery'):
+            path=Path(trip['delivery']['plan']);plan=read(path,{}) or {}
+            require(plan.get('expedition_id')==trip['delivery']['delivery_id'],'The planned haul is missing; it was not made again.')
+        else:
+            view=workers.trip_view(w);require(view['credited_work_hours']>0,f"{w['name']} has only just left.")
+            build=(read(self.data/'build.json',{}) or {}).get('game_build')
+            require(not trip.get('build') or trip['build']==build,
+                    f"The game was updated since {w['name']} left: the recorded packets of the old game build cannot replay. "
+                    f"Cancel the trip (its keys come back to the rack) and send {w['name']} again.")
+            prefs=load_preferences(self.data)
+            label='AFK · Workers · '+w['name']+' · '+datetime.now().strftime('%Y-%m-%d')
+            plan=worker_loot.delivery_plan(w,trip,view['credited_work_hours'],s['character'],label,prefs['filtered_items'],prefs['delivery_speed'])
+            path=self.data/'plans'/f"{plan['expedition_id']}.json";afk.write_json(path,plan)
+            trip['delivery']=dict(delivery_id=plan['expedition_id'],plan=str(path),planned_at=plan['planned_at']);workers.save(self.data,state)
+        ident=plan['expedition_id'];result_path=self.data/'sessions'/f'{ident}.result.json'
+        if plan['packets'] and not (read(result_path,{}) or {}).get('rewards_saved'):
+            require(s['room']==region,f"Load any offline hero in {place} to collect {w['name']}'s haul: its loot replays there.")
+            if not (self.data/'sessions'/f'{ident}.progress.json').exists() and not same_character(plan['character'],s['character']):
+                plan['character']=s['character'];afk.write_json(path,plan)   # nothing delivered yet: the hero standing there receives it
+            self.log(f"Delivering {w['name']}'s haul through the game in {place}...")
+            self.cli('worker-replay',path)
+        result=read(result_path,{}) or {}
+        require(not plan['packets'] or result.get('rewards_saved'),'The haul was not delivered completely; collect again to continue where it stopped.')
+        state=workers.load(self.data)
+        applied=worker_loot.apply(state,workers.find(state,worker_id),plan,result);workers.save(self.data,state)
+        haul=plan['haul'];who=applied['worker']
+        if who['type']=='adventurer':
+            what=f"{sum(haul['opened'].values()):,} chests opened ("+', '.join(f"{n} {t}" for t,n in haul['opened'].items() if n)+')'
+            if haul['locked']:what+=f", {haul['locked']:,} left locked without a key"
+            if haul['keys_found']:what+='; keys found: '+', '.join(f"{n} {worker_loot.KEY_NAMES.get(int(k),'key')}" for k,n in haul['keys_found'].items())
+        else:
+            what=f"{sum(haul['caught'].values()):,} goblins caught"+(' ('+', '.join(f"{n} {k}" for k,n in haul['caught'].items())+')' if haul['caught'] else '')
+            if haul['fled']:what+=f", {haul['fled']:,} fled"
+        self.log(f"{who['name']}: +{haul['xp']:,} XP"+(f", now level {who['level']}" if applied['levels'] else '')+f"; {what}; +{applied['camp'].get('spoils',0):,} spoils for the camp.")
+        return applied
+
+    def read_jewel_recipes(self,force=False):
+        """The game's jewel recipes: kept per game build, read again from the running game when needed."""
+        kept=worker_jeweler.load_recipes(self.data);build=(read(self.data/'build.json',{}) or {}).get('game_build')
+        if kept['recipes'] and kept.get('build')==build and not force:return kept
+        request=uuid.uuid4().hex;reply=afk.Ipc(self.game_bin()).send(f'afk worker recipes {request}',timeout=30)
+        path=self.data/'models'/f'jewel-recipes-{request}.json';answer=read(path,{}) or {}
+        path.unlink(missing_ok=True)
+        require(reply is not None and answer.get('ok') is True,"The game's jewel recipes could not be read: "+(answer.get('error') or 'open the game with an offline hero loaded')+'.')
+        kept=worker_jeweler.keep_recipes(self.data,answer,build)
+        self.log(f"Read {len(kept['recipes'])} jewel recipes from the game.");return kept
 
     def transfer_worker_haul(self,ident,name=None):
         """Send a delivered haul to the Vault (AFK Materials); retry later if the editor is closed."""
@@ -1017,22 +1227,77 @@ class Panel:
     def worker_action(self,name,args):
         state=workers.load(self.data)
         if name=='worker_hire':
-            price=workers.hire_price(state);require(price,f'Your crew is full ({workers.MAX_WORKERS} workers).')
+            price=workers.hire_price(state);require(price,f'Your crew is full ({workers.max_workers(state)} workers). Build the Barracks up for more.')
+            kind=args.get('type') or 'miner';require(kind in workers.TYPE_NAMES,'Unknown worker type.')
+            rows=workers.candidates(state,kind);workers.save(self.data,state)
+            slot=args.get('candidate',0);require(type(slot) is int and 0<=slot<len(rows),'Choose one of the candidates.')
             wanted=str(args.get('name') or '').strip() or None
             if wanted:require(bool(workers.NAME.fullmatch(wanted)),'Names use letters, digits, spaces, apostrophes and hyphens (up to 24).')
-            self.worker_pay('hire',price,dict(name=wanted));return
+            self.worker_pay('hire',price,dict(name=wanted,type=kind,traits=rows[slot]['traits']));return
         if name=='worker_respec':
             w=workers.find(state,args.get('worker'));require(workers.spent(w),f"{w['name']} has no skill points to reset.")
-            self.worker_pay('respec',workers.respec_price(w),dict(worker=w['id']));return
+            week=datetime.now(timezone.utc).strftime('%G-W%V')
+            if camp.effects(state['camp'])['weekly_free_respec'] and state['camp'].get('free_respec_week')!=week:
+                workers.respec(w);state['camp']['free_respec_week']=week;workers.save(self.data,state)   # Training Grounds 5: one free reset a week
+                self.log(f"{w['name']}'s skills were reset for free (Training Grounds, once a week).");return
+            self.worker_pay('respec',workers.respec_price(w,state),dict(worker=w['id']));return
+        if name=='worker_retrain':
+            w=workers.find(state,args.get('worker'));what=args.get('what','trait')
+            require(camp.effects(state['camp'])['retrain'],'Retraining needs Tavern level 3.')
+            require(what in ('trait','quirk'),"Choose 'trait' or 'quirk'.")
+            if what=='quirk':require(any(t.get('quirk') for t in w.get('traits') or []),f"{w['name']} has no quirk.")
+            self.worker_pay('retrain',workers.retrain_price(w),dict(worker=w['id'],what=what));return
+        if name=='worker_tool':
+            w=workers.find(state,args.get('worker'));tier=int(w.get('tool',0))+1
+            require(tier<=camp.effects(state['camp'])['tool_tier'],f"A tier {tier} {camp.TOOL_NAMES.get(w['type'],'tool').lower()} needs Forge level {tier}.")
+            cost=camp.tool_cost(tier);factor=workers.cost_factor(w)
+            cost={k:int(round(v*factor)) for k,v in cost.items()}
+            self.worker_pay('tool',cost['gold'],dict(worker=w['id'],tier=tier),reserve=cost);return
+        if name=='worker_route':
+            w=workers.set_route(state,args.get('worker'),args.get('route'));workers.save(self.data,state)
+            self.log(f"{w['name']}'s jewelcrafting materials now go to "+('the Jeweler\'s stock.' if w['route']=='stock' else 'the Vault.'));return
+        if name=='camp_take':
+            self.camp_take(vault_take.clean_items(args.get('items')));return
+        if name=='camp_build':
+            plan=camp.next_build(state['camp'],args.get('building'))
+            require(plan['to'] and not plan['blockers'],f"{camp.BY_KEY[plan['key']]['name']}: "+'; '.join(plan['blockers'])+'.')
+            self.worker_pay('build',plan['cost']['gold'],dict(building=plan['key'],to=plan['to']),reserve=plan['cost']);return
         if name=='worker_learn':
             w=workers.learn(state,args.get('worker'),args.get('skill'));workers.save(self.data,state)
-            self.log(f"{w['name']} learned {workers.NODES[args['skill']]['name']} (rank {workers.ranks(w,args['skill'])}).");return
+            self.log(f"{w['name']} learned {workers.nodes_for(w)[args['skill']]['name']} (rank {workers.ranks(w,args['skill'])}).");return
         if name=='worker_rename':
             w=workers.rename(state,args.get('worker'),args.get('name'));workers.save(self.data,state);self.log(f"Renamed to {w['name']}.");return
+        if name=='worker_recipes':
+            self.read_jewel_recipes(force=True);return
+        if name=='team_start':
+            rows=args.get('members');require(isinstance(rows,list),'Choose the team members.')
+            members=[]
+            for row in rows:
+                require(isinstance(row,dict),'Choose the team members.')
+                target=row.get('recipe') if row.get('recipe') is not None else (row.get('region') if row.get('region') is not None else row.get('ore'))
+                members.append(dict(worker=row.get('worker'),target=target))
+            recipes=self.read_jewel_recipes() if any(workers.find(state,m['worker']).get('type')=='jeweler' for m in members) else None
+            team=teams.start(state,members,args.get('hours',1),recipes=recipes);workers.save(self.data,state)
+            names=', '.join(workers.find(state,i)['name'] for i in team['members'])
+            found=[s['name'] for s in teams.SYNERGIES if s['key'] in team['synergies']]
+            self.log(f"{names} set out together for {team['hours']:g} h"+(f"; synergy: {', '.join(found)}" if found else '')+'.')
+            threading.Thread(target=self.sync_notification,daemon=True).start();return
         if name=='worker_start':
-            trip=workers.start_trip(state,args.get('worker'),args.get('ore'),args.get('hours',1));workers.save(self.data,state)
+            target=args.get('ore') if args.get('region') is None else args.get('region')
+            recipes=None
+            if workers.find(state,args.get('worker')).get('type')=='jeweler':
+                target=args.get('recipe');recipes=self.read_jewel_recipes()
+            trip=workers.start_trip(state,args.get('worker'),target,args.get('hours',1),recipes=recipes);workers.save(self.data,state)
             w=workers.find(state,args.get('worker'))
-            self.log(f"{w['name']} went mining {workers.ORE_BY_ID[trip['ore']]['name']} for {trip['work_hours']:g} h of work (back in {trip['real_hours']:.2f} h).")
+            if 'recipe' in trip:
+                self.log(f"{w['name']} sat down at the Jeweler's Bench: {trip['planned']:,} x {trip['recipe_name']} in {trip['work_hours']:g} h "
+                         f"(ready in {trip['real_hours']:.2f} h); the materials left the stock.")
+            elif 'ore' in trip:
+                self.log(f"{w['name']} went mining {workers.ORE_BY_ID[trip['ore']]['name']} for {trip['work_hours']:g} h of work (back in {trip['real_hours']:.2f} h).")
+            else:
+                keys=', '.join(f"{n} {worker_loot.KEY_NAMES.get(int(k),'key')}" for k,n in (trip.get('keys') or {}).items())
+                self.log(f"{w['name']} set out for {zone_names().get(trip['region'],trip['region'])} for {trip['work_hours']:g} h (back in {trip['real_hours']:.2f} h)"
+                         +(f", taking {keys} from the key rack." if keys else '.'))
             threading.Thread(target=self.sync_notification,daemon=True).start();return
         if name=='worker_cancel':
             workers.cancel_trip(state,args.get('worker'));workers.save(self.data,state);self.log('Trip cancelled; nothing was mined.')
@@ -1188,6 +1453,7 @@ class Handler(BaseHTTPRequestHandler):
             if route=='/api/siege-forecast':return self.send(200,self.app.siege_forecast(urlsplit(self.path).query))
             if route=='/api/specials':return self.send(200,self.app.specials_view())
             if route=='/api/workers':return self.send(200,self.app.workers_overview())
+            if route=='/api/camp/vault':return self.send(200,self.app.camp_vault_view())
             if route=='/api/share':
                 from urllib.parse import parse_qs
                 return self.send(200,self.app.share_summary(parse_qs(urlsplit(self.path).query).get('id',[''])[0]))

@@ -43,6 +43,8 @@ hero), Satanic and above are broken down with the game's Prospector recipes
 (fragments to the Vault in stacks of up to 999). Selling runs only offline with no
 connection to the Hero Siege servers. Choose it on the Loot page.
 
+0.8 (in progress): a **camp** you build up for your workers (nine buildings, camp resources, the Siege gate's Walls), **traits**, **adventurers** (world chests with the game's keys), **goblin hunters**, a **jeweler** working the game's own jewel recipes, and **team trips** with synergies; the key rack and the jeweler's stock are filled from the Vault's AFK Materials (Item Editor 2.16.1 or newer), never twice; every item still comes from the game's own routines.
+
 0.7.0: **several heroes at once** (one expedition per hero), **Siege** (hold a
 calibrated region against growing waves: elite, treasure-goblin and boss waves, a
 Magic Find bonus per level, records), a **collection** of all 916 uniques and set

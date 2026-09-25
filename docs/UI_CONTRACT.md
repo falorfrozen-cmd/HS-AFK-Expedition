@@ -480,7 +480,7 @@ the game is open. Worker trips schedule `worker-<id>` ready notifications.
 
 | File | Meaning |
 | --- | --- |
-| workers.json | Crew (levels, skills, trips, stats, history) and payment records (schema 1) |
+| workers.json | Crew (levels, skills, traits, tools, trips, stats, history), payment records, the camp and the Tavern's candidates (schema 2 since 0.8; a schema 1 file is migrated on load) |
 | models/worker-pay-<request>.json | The plugin's receipt of one payment |
 | plans/worker_<id>_<time>.json | A planned haul (items, Gem Sense units, XP) |
 | sessions/worker_<id>_<time>.result.json | The plugin's delivery result (`done`, `error` or `partial`), `ingest` |
@@ -488,3 +488,149 @@ the game is open. Worker trips schedule `worker-<id>` ready notifications.
 | collection-cache.json | Collectibles found per spool (display cache) |
 | siege-records.json | Best wave per hero, region and level |
 | special-packets.json | Verified special monster packets |
+
+## 0.8: the camp, traits and more worker types (engine; UI to be designed)
+
+Rules and numbers: tools/camp.py and tools/traits.py module notes. The camp and
+traits are AFK FARM's own game layer: they change the crew's numbers and the Siege
+gate, never what the game creates. Stone, spoils and gem dust exist only in AFK
+FARM; gold is always the game's, taken through the payment path above.
+
+### Camp
+
+`GET /api/workers` adds `camp`: `buildings` [{`key`, `name`, `text`, `level`,
+`max_level` (5), `unlock_hq`, `next` {`to`, `cost` {`gold`, `stone`, `spoils`,
+`dust`}, `hours`, `blockers` [text]}}], `queue` [{`building`, `name`, `to`,
+`started_at`, `ready_at`, `progress`}], `sites`, `resources` {`stone`, `spoils`,
+`dust`}, `resource_cap`, `stock`, `stock_cap`, `keys`, `key_cap`, `effects` (every
+number the buildings set, e.g. `max_workers`, `team_size`, `candidates`, `types`,
+`gate_hp`, `tool_tier`, `xp_bonus`, `hotspots`). It also adds `hotspots` (today's:
+{`type`, `target`, `bonus`}), `candidates` {type: [{`slot`, `type_name`,
+`traits`, `price`}]} for every type the camp allows, `types`, `trees` (every
+worker type's skill tree), `traits` and `quirks` (the tables).
+`/api/state` → `workers.camp` = `resources`, `resource_cap`, `hq`, `queue`.
+
+Buildings: Headquarters (the camp level; no building may pass it; level 3 gives a
+second building site), Barracks (crew size 3-7, team size 2-4), Tavern (worker
+types, candidates, trait odds, retraining at 3, daily candidates at 5), Walls (the
+Siege gate: 110-150 health, better repairs, at 5 at most 45 damage a wave),
+Storehouse (resource cap, Jeweler's stock, key rack), Forge (tool tiers), Training
+Grounds (worker XP, cheaper resets, apprentices, a free weekly reset at 5),
+Jeweler's Bench (the Jeweler and its recipe tiers), Watchtower (daily hot spots).
+A building finishes on its own when its time is up (lazily, on the next read).
+
+| Action | Arguments | Needs the game |
+| --- | --- | --- |
+| `camp_build` | `building` | an offline hero loaded; takes `next.cost.gold`, sets the camp resources aside |
+| `worker_hire` | `type` (default miner), `candidate` (slot, default 0), `name` (optional) | as before |
+| `worker_tool` | `worker` | the next tool tier (up to the Forge level); gold and camp resources |
+| `worker_retrain` | `worker`, `what` (`trait` or `quirk`) | Tavern 3; `retrain_price` gold |
+| `worker_route` | `worker`, `route` (`vault`/`stock`) | no; `stock` opens with the Jeweler |
+
+A payment's `purpose` is now `hire`, `respec`, `build`, `tool` or `retrain`. Camp
+resources set aside for a `build` or `tool` payment are given back if the game
+refuses it; an `unknown` payment keeps them until its receipt decides.
+
+**Keys and materials from the Vault.** The key rack (Basic Key `12:0`, Crystal Key
+`12:1`) and the Jeweler's stock (jewel recipe materials `14:0`-`14:23`, `14:44`)
+are filled from the Item Editor's Vault, category AFK Materials, through the
+editor's `POST /api/vault/afk-take` (Item Editor 2.16.1 or newer). The key rack
+holds 25/60/120/250/500 keys by Storehouse level; the stock 500 to 25,000.
+
+- `GET /api/camp/vault` asks the running editor: `editor` (bool), `stock`
+  [{`key` ("type:id"), `name`, `count`, `goes_to` (`rack`/`stock`)}] (dungeon keys
+  and other materials are left out), `keys`, `key_cap`, `key_room`, `stock_cap`,
+  `stock_room`, `pending` (takes still being settled) and `error` (for example an
+  editor older than 2.16.1).
+- `camp_take` {`items` {"type:id": count}}: whole counts from 1 to 100,000 of rack
+  keys and jewel materials. Refused before the editor is asked when the rack or the
+  stock has no room for them. Each take has one receipt in workers.json
+  (`vault_takes`, request id, `state` `pending`/`done`/`refused`/`unknown`); the
+  editor carries a request out at most once. Anything but a clear `done` is
+  settled by cancelling the request: the editor reports the take it made (it
+  reaches the camp once, even past the cap) or makes sure it never takes anything.
+  An `unknown` take (the editor went quiet) is settled the same way by the panel
+  once the editor answers again. `/api/state` → `workers.pending_vault_takes`
+  lists the last unsettled or refused ones (`request_id`, `items`, `state`,
+  `error`).
+
+### Traits
+
+Every worker has `traits` [{`id`, `name`, `rarity` (common, rare, epic,
+legendary, quirk), `text`, `quirk`, `target` (a Specialist's favourite)}], `tool`,
+`tool_name`, `route`, `retrain_price`, `type_name`. Crew entries in `/api/state`
+carry `traits`, `tool` and `type_name` too. A trip stores `mods` (its multipliers
+from traits, the camp and the hot spot, frozen at the start): `speed`, `amount`,
+`xp`, `rare`, `tool`, `hotspot`, `bonus_find`; trip views show them.
+
+### Adventurers and goblin hunters
+
+Rules: tools/worker_loot.py module note. They go to a **region** where the plugin
+recorded world chests or loot goblins while the player played; every opened chest
+or caught goblin is one recorded packet of that region replayed through the game's
+drop routine (no experience for the hero; gold picked up; filtered items handled
+like a claim; the Vault label `AFK · Workers · <name> · <date>`).
+
+- `GET /api/workers` adds `regions` {`adventurer`|`goblin_hunter`: [{`room`,
+  `name`, `recorded` {tier or goblin kind: packets}}]} (running game build only),
+  `chests` (tiers: `key`, `name`, `unlock`, `key_id`), `goblins` (kinds: `key`,
+  `name`, `unlock`) and `key_names`. Worker views add `chests` / `goblins` with
+  `unlocked`.
+- `worker_start` {`worker`, `region`, `hours`} sends one (a miner keeps `ore`). An
+  adventurer takes every Basic Key and Crystal Key from the camp's key rack; the
+  keys it did not use come back, and keys it finds go onto the rack. Wooden chests
+  open at level 1, golden (a Basic Key) at 3, crystal (a Crystal Key) at 8;
+  goblins: treasure 1, rune 6, shadow 12, orb 18, ore 24 (once recorded).
+- The trip view has `region`, `target_name`, `keys` instead of the ore fields.
+- `worker_collect` {`worker`} needs an offline hero **standing in the trip's
+  region** (the replay reads the live room); the error says where. It runs
+  `afk.py worker-replay <plan>`; a stopped delivery continues on the next
+  collect, a delivered one is never replayed. The log reports chests (and locked
+  ones), keys found, goblins caught and fled, and the camp's spoils.
+
+### The Jeweler
+
+Rules: tools/worker_jeweler.py module note. The Jeweler works the game's own jewel
+recipes (the craft cube's table, result types 37-41: tier 1-4 jewels and tier 5
+gems) from the camp's material stock; every jewel is made by the game at delivery
+(`worker deliver` with `crafts` [{`recipe`, `count`}]). It does not use or change
+the hero's own Jewelcrafting level.
+
+- The plugin reads the recipes from the running game (`afk worker recipes <id>`):
+  action `worker_recipes` reads them again; a jeweler's `worker_start` reads them
+  when none are kept for this game build. `GET /api/workers` adds `recipes`
+  [{`index`, `result_type`, `name`, `tier`, `level`, `output` {`type` 15, `id`,
+  `amount`}, `inputs` [{`type`, `id`, `amount`}], `affordable` (crafts the stock
+  pays for), `bench_ok`}], `material_names` and `jewel_names`.
+- `worker_start` {`worker`, `recipe` (its `index`), `hours`}: the materials of every
+  planned craft (6 an hour, skills and traits) leave the stock at once; a
+  cancelled session gives them all back, an early collect the unused ones.
+- Tiers: the Jeweler's Bench level and a worker level (1, 8, 16, 24, 32).
+- The trip view has `recipe`, `target_name` (the jewel), `planned`.
+- Collecting needs any offline hero (like a miner); the jewels go to the Vault.
+  The camp gets gem dust (one per material used, five per jewel).
+- Miners: `worker_route` {`worker`, `route`: `stock`} sends their Gem Sense
+  materials to the stock instead of the game (the plugin rolls them with the
+  Prospector's own recipe and dice but does not make them; its result says
+  `routed: true`, and only such a result fills the stock).
+
+### Team trips
+
+Rules: tools/teams.py module note. `team_start` {`members` [{`worker`, and
+`ore`, `region` or `recipe` as for `worker_start`}], `hours`} sends 2 to
+`team_size` idle workers at once (all start, or none: a refusal gives back the
+keys and materials already taken). Each still works its own target and is
+collected on its own. Every member gets +10% experience; Team Player auras reach
+teammates; a Lone Wolf works 10% slower in a team (and 15% faster alone). Crews
+with a synergy (`synergies`: key, name, types, text, bonus by type): Goblin
+Patrol (miner + goblin hunter), Treasure Trail (adventurer + goblin hunter),
+On-site Cutting (miner + jeweler), Deep Vein (adventurer + miner), Full Caravan
+(all four). `GET /api/workers` adds `teams` (out now: `id`, `members`, `types`,
+`hours`, `started_at`, `synergies`, `synergy_names`, `out`, `names`),
+`team_size` and `synergies`; a member's trip has `team`.
+
+### Siege and the Walls
+
+Siege plans and `/api/siege-forecast` use the gate the Walls give; the forecast adds
+`gate_hp`, and the plan's `siege` carries `gate_hp` and `gate` {`hp`, `repair`,
+`max_damage`}.

@@ -168,7 +168,9 @@ class PanelWorkerTests(unittest.TestCase):
         # would schedule real "haul ready" tasks on this computer).
         patchers = [patch.object(self.app, 'fresh', return_value=self.live), patch.object(self.app, 'cli'),
                     patch.object(self.app, 'sync_notification'), patch.object(panel.notify, 'sync_all', side_effect=AssertionError('Task Scheduler')),
-                    patch.object(panel.notify, 'toast', side_effect=AssertionError('Windows notification'))]
+                    patch.object(panel.notify, 'toast', side_effect=AssertionError('Windows notification')),
+                    # never read the player's recorded packets from a test
+                    patch.object(panel.worker_loot, 'pools', return_value=dict(build='B', chests={}, goblins={}))]
         for p in patchers: p.start(); self.addCleanup(p.stop)
 
     def run_action(self, name, args, game):
@@ -228,6 +230,66 @@ class PanelWorkerTests(unittest.TestCase):
         st = W.load(self.d)
         self.assertEqual(len(st['payments']), 1, 'nothing new was requested'); self.assertEqual(st['workers'], [])
         self.assertEqual(game.gold, 1_000_000)
+
+    def test_hiring_picks_a_tavern_candidate_with_its_traits(self):
+        st = W.load(self.d); st['camp']['buildings']['tavern'] = 2; W.save(self.d, st)
+        with self.assertRaisesRegex(ValueError, 'Choose one of the candidates'):
+            self.run_action('worker_hire', dict(type='miner', candidate=7), FakeGame(self.d))
+        rows = W.load(self.d)['candidates']['miner']['list']
+        self.run_action('worker_hire', dict(type='miner', candidate=2, name='Brom'), FakeGame(self.d))
+        st = W.load(self.d)
+        self.assertEqual(st['workers'][0]['traits'], rows[2]['traits'])
+        self.assertNotEqual(st['candidates']['miner']['list'], rows, 'hiring rolls new candidates')
+        overview = self.app.workers_overview()
+        self.assertEqual(sorted(overview['candidates']), ['adventurer', 'goblin_hunter', 'miner'])
+        self.assertEqual(overview['candidates']['miner'][0]['price'], 1_000_000)
+        st['camp']['buildings']['tavern'] = 0; W.save(self.d, st)
+        with self.assertRaisesRegex(ValueError, 'needs a better camp'):
+            self.run_action('worker_hire', dict(type='adventurer'), FakeGame(self.d))
+
+    def test_building_sets_camp_resources_aside_and_a_refusal_gives_them_back(self):
+        st = W.load(self.d); st['camp']['resources']['stone'] = 1000; W.save(self.d, st)
+        with self.assertRaisesRegex(ValueError, 'Forge: needs Headquarters level 2'):
+            self.run_action('camp_build', dict(building='forge'), FakeGame(self.d))
+        game = FakeGame(self.d)
+        self.run_action('camp_build', dict(building='tavern'), game)
+        st = W.load(self.d)
+        self.assertEqual(game.gold, 1_000_000 - 300_000); self.assertEqual(st['camp']['resources']['stone'], 850)
+        self.assertEqual([(q['building'], q['to']) for q in st['camp']['queue']], [('tavern', 1)])
+        st['camp']['queue'] = []; W.save(self.d, st)
+        with self.assertRaisesRegex(ValueError, 'did not take the gold'):
+            self.run_action('camp_build', dict(building='walls'), FakeGame(self.d, gold=10))
+        st = W.load(self.d)
+        self.assertEqual(st['camp']['resources']['stone'], 850, 'the refused payment gave the stone back')
+        self.assertEqual(st['camp']['queue'], [])
+
+    def test_tools_need_the_forge_and_retraining_needs_tavern_3(self):
+        st = W.load(self.d); w = W.new_worker(st, 'Brom', worker_traits=[dict(id='diligent'), dict(id='lazy', quirk=True)])
+        st['camp']['resources'] = dict(stone=1000, spoils=0, dust=0); W.save(self.d, st)
+        with self.assertRaisesRegex(ValueError, 'needs Forge level 1'):
+            self.run_action('worker_tool', dict(worker=w['id']), FakeGame(self.d))
+        with self.assertRaisesRegex(ValueError, 'Retraining needs Tavern level 3'):
+            self.run_action('worker_retrain', dict(worker=w['id']), FakeGame(self.d))
+        st = W.load(self.d); st['camp']['buildings'].update(forge=1, tavern=3); W.save(self.d, st)
+        game = FakeGame(self.d)
+        self.run_action('worker_tool', dict(worker=w['id']), game)
+        self.run_action('worker_retrain', dict(worker=w['id'], what='quirk'), game)
+        st = W.load(self.d); brom = st['workers'][0]
+        self.assertEqual(brom['tool'], 1); self.assertEqual(st['camp']['resources']['stone'], 800)
+        self.assertEqual(brom['traits'], [dict(id='diligent')])
+        self.assertEqual(game.gold, 1_000_000 - 100_000 - W.RETRAIN_PRICE)
+
+    def test_training_grounds_5_resets_skills_for_free_once_a_week(self):
+        st = W.load(self.d); w = W.new_worker(st, 'Brom'); w['xp'] = 10 ** 5; w['level'] = W.level_for(10 ** 5)[0]
+        w['skills'] = dict(swift_pick=2); st['camp']['buildings']['training'] = 5; W.save(self.d, st)
+        game = FakeGame(self.d)
+        self.run_action('worker_respec', dict(worker=w['id']), game)
+        self.assertEqual(game.gold, 1_000_000); self.assertEqual(W.load(self.d)['workers'][0]['skills'], {})
+        st = W.load(self.d); st['workers'][0]['skills'] = dict(swift_pick=1); W.save(self.d, st)
+        self.run_action('worker_respec', dict(worker=w['id']), game)
+        st = W.load(self.d)
+        self.assertEqual(game.gold, 1_000_000 - W.respec_price(st['workers'][0], st), 'the second reset that week is paid, 25% off')
+        self.assertEqual(W.respec_price(st['workers'][0], st), int(round(W.RESPEC_PRICE_PER_LEVEL * st['workers'][0]['level'] * 0.75)))
 
     def test_a_late_respec_resets_the_skills_once_the_game_takes_the_gold(self):
         st = W.empty(); w = W.new_worker(st, 'Brom'); w['xp'] = 10 ** 5; w['level'] = W.level_for(10 ** 5)[0]

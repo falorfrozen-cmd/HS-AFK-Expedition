@@ -18,6 +18,15 @@ This working tree contains the product and its tests.
   every stack is created in the game by LootGroundCreate, Gem Sense uses the game's
   Prospector table and dice, and prices are taken through the game's purchase path.
   Only the materials Worker.hpp lists may be delivered. Never re-roll a planned haul.
+- The camp, camp resources, traits and teams (camp.py, traits.py, teams.py) are
+  AFK FARM's own layer: they change multipliers and rules, never create items.
+- Keys and jeweler materials come from the Vault only through the Item Editor's
+  `/api/vault/afk-take` (one receipt per request, settled by cancelling). Never
+  write the Vault database, and never let a test reach the player's editor.
+- Adventurers and goblin hunters only replay recorded packets of the running game
+  build, with experience off, in the packets' region; never create chest objects.
+- The Jeweler makes only what the game's live recipe table (result types 37-41)
+  makes, from the camp's stock; never touch the hero's Jewelcrafting level.
 - Siege is a challenge layer over the measured pace, not a combat model; say so.
 - A special monster (rank outside 1-4) replays only after `afk special verify`.
 - No decompiled game source in this tree. Archive private raw research outside the hub.

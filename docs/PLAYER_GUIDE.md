@@ -304,3 +304,77 @@ it never charges twice, so do not buy again meanwhile.
 
 Worker levels, skills and haul sizes are AFK FARM's own rules. Every stack is still
 created by the game, the same way a mining node creates ore.
+
+## The camp (0.8)
+
+Your workers live in a camp you build up with gold (taken from the hero loaded in
+the game, like hiring) and with what the workers bring home: **stone** (miners,
+one per ore), **spoils** (adventurers and goblin hunters) and **gem dust** (the
+jeweler). Camp resources exist only in AFK FARM.
+
+- **Headquarters** is the camp level; no building can pass it. Level 3 opens a
+  second building site; level 5 makes every worker 5% better.
+- **Barracks**: 3 to 7 workers, and team trips of 2 to 4.
+- **Tavern**: adventurers and goblin hunters, candidates to choose from when you
+  hire, better traits, retraining (level 3).
+- **Walls**: your heroes' Siege gate gets more health and repairs better.
+- **Storehouse**: how much stone, spoils, dust, jewel materials and keys the
+  camp holds.
+- **Forge**: tools for each worker (pickaxe, lockpick, net, chisel).
+- **Training Grounds**: more worker experience, cheaper skill resets,
+  apprentices, one free reset a week at level 5.
+- **Jeweler's Bench**: the jeweler and the tiers of the game's jewel recipes.
+- **Watchtower**: daily hot spots where a worker does better.
+
+Buildings take real time (30 minutes to 24 hours) and finish on their own.
+
+## Traits
+
+Every new worker is born with a trait, and sometimes a quirk with an upside and a
+downside: Diligent works faster, Lucky finds rare things more often, Night Owl
+likes long trips, a Lone Wolf works best alone, a Team Player helps its team,
+Greedy brings more but costs more to train. The Tavern shows candidates with
+their traits so you can choose, and from level 3 retrains a trait or removes a
+quirk for gold.
+
+## Adventurers
+
+An adventurer opens the world chests of a region you played in: wooden chests
+from level 1, golden chests (a Basic Key each) from level 3, crystal chests (a
+Crystal Key each) from level 8. It takes the Basic and Crystal Keys from the
+camp's key rack and brings unused ones back, together with the keys it finds.
+Fill the rack from your Vault: with the Item Editor (2.16.1 or newer) open, take
+Basic and Crystal Keys out of AFK Materials, as many as the rack holds (25 at
+Storehouse level 1, then 60, 120, 250 and 500). They leave the Vault and hang on
+the rack; if the answer is lost on the way, AFK FARM finishes the take by itself,
+and keys are never taken twice.
+Every chest's loot is the game's own drop, replayed from a chest you opened
+while playing with recording on; so collect the haul with any offline hero
+standing in that region. The more regions you play with recording on, the more
+places your adventurer can go.
+
+## Goblin hunters
+
+A goblin hunter chases the loot goblins of a region you played in: treasure
+goblins from level 1, rune goblins from level 6, shadow goblins from 12 (orb and
+ore goblins once recorded). Goblins that are not caught flee. Their loot is the
+game's own drop, replayed from goblins you killed while playing; your hero gets
+no experience for them. Collect in that region, like an adventurer's haul.
+
+## The jeweler
+
+The jeweler works the game's own jewelcrafting recipes (the craft cube's jewels
+and gems) from the camp's material stock. Fill the stock by sending your miners'
+Gem Sense materials there (a miner's route: Vault or stock), or take jewelcrafting
+materials out of the Vault's AFK Materials, like keys. The Jeweler's Bench
+opens the recipe tiers; the jewels are made by the game when you collect, with
+any offline hero, and go to the Vault. Your hero's own Jewelcrafting level does
+not matter and does not change.
+
+## Team trips
+
+Send 2 to 4 workers out together (the Barracks sets how many). Each does its own
+work, everyone earns 10% more experience, and some crews help each other:
+Goblin Patrol (miner and goblin hunter), Treasure Trail (adventurer and goblin
+hunter), On-site Cutting (miner and jeweler), Deep Vein (adventurer and miner),
+and all four trades together (Full Caravan).
