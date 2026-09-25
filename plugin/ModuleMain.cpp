@@ -725,9 +725,11 @@ static std::string CaptureKill(const RValue& inst, const std::vector<RValue>& ar
     return hash;
 }
 
+namespace DefenseLab { static void OnDropItem(CInstance* self, int argc, RValue** args); }   // research R2 (DefenseLab.inl)
 static RValue& Hook_DropItem(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
     ++g_DropItemCalls;
+    DefenseLab::OnDropItem(S, argc, A);
     if (g_ReplayActive.load()) {
         // our own replay call: context was set by the caller
         if (g_OrigDropItem) return g_OrigDropItem(S, O, R, argc, A);
