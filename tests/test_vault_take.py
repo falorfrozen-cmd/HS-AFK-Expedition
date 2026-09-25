@@ -21,7 +21,7 @@ class FakeEditor:
     'after' (it is carried out and the answer lost); ``down``: every call fails."""
 
     def __init__(self, stock=None, lose=None, old=False):
-        self.stock = dict(stock or {'12:0': 156, '12:1': 27, '14:5': 40, '12:33': 52, '14:60': 300})
+        self.stock = dict(stock or {'12:0': 156, '12:1': 27, '14:5': 40, '12:33': 52, '14:60': 300, '12:20': 9, '14:59': 1})
         self.events = {}
         self.lose, self.old, self.down = lose, old, False
         self.calls = []
@@ -100,7 +100,8 @@ class CampVaultTests(unittest.TestCase):
         self.assertIn('Took 20 Basic Key, 5 Crystal Key from the Vault for the camp.', self.app.job['output'])
         view = self.app.camp_vault_view()
         self.assertEqual({r['key']: (r['count'], r['goes_to']) for r in view['stock']},
-                         {'12:0': (136, 'rack'), '12:1': (22, 'rack'), '14:5': (28, 'stock')})   # dungeon keys and fragments stay out
+                         {'12:0': (136, 'rack'), '12:1': (22, 'rack'), '14:5': (28, 'stock'), '12:33': (52, 'stock'),
+                          '14:60': (300, 'stock')})   # the town's goods; a Pickaxe and a Reflection of Tarethiel stay out
         self.assertEqual((view['editor'], view['key_cap'], view['key_room'], view['pending']), (True, 25, 0, []))
 
     def test_a_lost_answer_is_settled_at_once_and_never_taken_twice(self):
@@ -156,7 +157,7 @@ class CampVaultTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Jeweler's stock has room for 500 more"):
             self.take({'14:5': 501})
         self.assertEqual(len(self.editor.calls), calls, 'the editor is not asked when the camp has no room')
-        for items in ({'12:33': 1}, {'14:60': 1}, {'12:0': 0}, {'12:0': 1.5}, {'12:0': True}, {}, None):
+        for items in ({'12:20': 1}, {'14:59': 1}, {'11:14': 1}, {'12:0': 0}, {'12:0': 1.5}, {'12:0': True}, {}, None):
             with self.assertRaises(ValueError):
                 self.take(items)
         self.assertEqual(len(self.receipts()), 1)

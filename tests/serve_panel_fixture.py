@@ -4,6 +4,14 @@
 with unique drops (collection, wishlist, share card), a Siege record and a
 worker; hiring and collecting a haul are simulated without the game. Windows
 notifications and Task Scheduler are switched off.
+
+0.9 adds the town:
+- towers, plated walls, a coffer and a stocked camp;
+- a bestiary of recorded monsters in Act_03_03;
+- a siege under way and a finished one whose town share waits;
+- a wagon on the road and one home, and two merchants in town.
+The coffer's payouts, shipments to the Vault and the town-share delivery are
+simulated.
 """
 import json, os, sys, tempfile, threading, time
 from datetime import datetime, timedelta, timezone
@@ -15,7 +23,7 @@ os.environ['AFK_NOTIFY_DISABLED']='1'
 with tempfile.TemporaryDirectory(prefix='afk-panel-qa-') as tmp:
     os.environ['LOCALAPPDATA']=tmp
     sys.path.insert(0,str(ROOT/'tools'))
-    import afk,panel,siege,workers,worker_loot
+    import afk,panel,siege,workers,worker_loot,defense,bestiary,merchants,town,trade,battle
     hero=dict(identity_version=2,slot=2,name='Suh',**{'class':8},class_name='Samurai',level=100)
     other=dict(identity_version=2,slot=5,name='SeraphTest',**{'class':14},class_name='White Mage',level=1)
     panel.characters=lambda data:[hero,other]
@@ -82,6 +90,52 @@ with tempfile.TemporaryDirectory(prefix='afk-panel-qa-') as tmp:
     c=workers.new_worker(crew,'Kara',worker_type='adventurer',worker_traits=[dict(id='lucky')]);c['xp']=sum(workers.xp_to_next(l) for l in range(1,9));c['level']=9
     c['skills']=dict(lockpicking=2,treasure_sense=3)
     workers.start_trip(crew,c['id'],'Act_01_01',2,at=now-timedelta(hours=3),seed=6)
+    # 0.9 the town: recorded monsters of Act_03_03 (the hero's own packets f, e and d among them),
+    # fortifications, a stocked camp, a coffer, a finished siege and one under way, wagons.
+    def monster(h,key,rank,name,affixes=(),special=0,ranged=False,speed=2.8):
+        return dict(schema=2,packet_hash=h,room='Act_03_03',game_build_id='QA',monster_key=key,rank=rank,self_object='Enemy_obj',script='gml_Script_DropItem',
+                    args=[rank,0,1.0,1.0,1,0],protected=dict(max_hp=1000.0*rank,damage=10.0*rank,killExperience=40.0*rank,dSlots=rank,dCommonChance=4,
+                    dCommonDropMult=11,dSatanicDropMult=1,extraMagicFind=0,lootAmount=0),
+                    self_snapshot=dict(name=name,moveSpeed=speed,isRanged=1 if ranged else 0,fireImmune=False,coldImmune=key=='e_ice_elemental_2',
+                                       poisonImmune=False,affixList=list(affixes),specialType=special))
+    for row in (monster('f'*64,'e_orc_warrior_3',3,'Warchief',(2,9)),monster('e'*64,'e_orc_warrior_3',4,'Warchief',(5,10,21)),
+                monster('d'*64,'e_treasure_goblin_3',2,'Hoarder Champion',(17,)),monster('6'*64,'e_orc_warrior_1',1,'Orc Warrior'),
+                monster('7'*64,'e_orc_hunter_1',1,'Orc Hunter',ranged=True),monster('8'*64,'e_orc_hunter_2',2,'Boulderer',(0,16),ranged=True),
+                monster('9'*64,'e_sand_wasp_1',1,'Sand Wasp',speed=4.0),monster('a'*63+'1','e_sand_wasp_3',3,'Wasp Queen',(8,35)),
+                monster('b'*63+'1','e_desert_beast_3',4,'Colossal Behemoth',(30,32,38)),monster('c'*63+'1','e_ice_elemental_2',2,'Dark Ice Magician',(11,),ranged=True),
+                monster('d'*63+'1','e_orc_warrior_1',1,'Orc Warrior',special=9),monster('e'*63+'1','e_orc_warrior_3',4,'Warchief',(3,5,18),special=9)):
+        afk.write_json(afk.PACKETS/(row['packet_hash']+'.json'),row)
+    for b,level in dict(walls=3,workshop=3,market=2,trading_post=2,watchtower=3,hq=3).items():crew['camp']['buildings'][b]=level
+    crew['camp']['resources'].update(stone=6400,spoils=1250,dust=180)
+    crew['camp']['stock']={'14:27':820,'14:28':340,'14:0':45,'14:6':30,'14:12':12,'15:9':6,'15:17':2,'13:1':38,'13:18':4,'14:60':220,'14:64':1,'12:33':3}
+    crew['town']=town.new()
+    crew['town']['towers']={'t1':dict(id='t1',kind='ballista',level=4,place='north',priority=None,perk=None,built_at=workers.iso(now-timedelta(days=2))),
+        't2':dict(id='t2',kind='brazier',level=3,place='east',priority=None,perk=None,built_at=workers.iso(now-timedelta(days=2))),
+        't3':dict(id='t3',kind='frost',level=2,place='south',priority=None,perk=None,built_at=workers.iso(now-timedelta(days=1))),
+        't4':dict(id='t4',kind='storm',level=5,place='keep',priority='flying',perk='arc',built_at=workers.iso(now-timedelta(days=1))),
+        't5':dict(id='t5',kind='mortar',level=2,place='west',priority=None,perk=None,built_at=workers.iso(now-timedelta(hours=9)))}
+    crew['town']['next_tower']=6;crew['town']['plating'].update(north=2,east=1)
+    crew['town']['queue']=[dict(target='tower:t2',to=4,started_at=workers.iso(now-timedelta(hours=1)),ready_at=workers.iso(now+timedelta(hours=2,minutes=20)),request='fixture')]
+    crew['trade']=trade.new(now-timedelta(days=3));crew['trade']['founded_at']=crew['camp']['founded_at'];crew['trade']['coffer']=2_450_000
+    crew['trade']['towns']={'ironhold':dict(traded=420_000,prosperity=420_000)}
+    crew['trade']['runs']=[dict(id='wagon_fixture1',town='emberfall',cargo={'14:27':400},orders={'14:0':20},purse=150_000,from_coffer=150_000,payment=None,
+                                left_at=workers.iso(now-timedelta(hours=1)),arrives_at=workers.iso(now+timedelta(hours=1,minutes=30)),
+                                returns_at=workers.iso(now+timedelta(hours=4)),state='travelling',result=None),
+                           dict(id='wagon_fixture2',town='ironhold',cargo={'14:0':30},orders={'14:28':200},purse=80_000,from_coffer=80_000,payment=None,
+                                left_at=workers.iso(now-timedelta(hours=5)),arrives_at=workers.iso(now-timedelta(hours=3,minutes=30)),
+                                returns_at=workers.iso(now-timedelta(hours=2)),state='travelling',result=None)]
+    workers.save(afk.DATA,crew)
+    bestiary._CACHE.clear()
+    entries=bestiary.index('QA')['Act_03_03']
+    snap=defense.snapshot(crew['town'],crew['camp']['buildings'])
+    whole={s_:snap['walls'][s_]['max'] for s_ in battle.SIDES}
+    def siege_record(ident,level,hours,started,seed):
+        return defense.new_record(ident,'Act_03_03',level,hours,town_snapshot=snap,walls_now=whole,keep_now=snap['keep']['max'],heroes=[],entries=entries,
+                                  goblins={'treasure':['4'*64],'rune':['5'*64]},stone_budget=800,build='QA',at=started,seed=seed,region_name='The Desert')
+    old=siege_record('defense_fixture_done',5,1.0,now-timedelta(hours=6),5)
+    afk.write_json(afk.PLANS/'defense_fixture_done.json',old)
+    crew=workers.load(afk.DATA);crew['town']['siege']=dict(id=old['id'],path=str(afk.PLANS/'defense_fixture_done.json'),room='Act_03_03',level=5,
+                                                          started_at=old['started_at'],hours=old['hours'],heroes=[],settled=False)
     workers.save(afk.DATA,crew)
     control=Path(tmp)/'control.json';stop=Path(tmp)/'stop'
     afk.write_json(control,dict(gold=5000000,live=dict(character=other,room='Act_01_01',capture_on=False,replay_running=False,game_build='QA',farm_context=dict(hash='b'*64))))
@@ -148,10 +202,51 @@ with tempfile.TemporaryDirectory(prefix='afk-panel-qa-') as tmp:
         def action(self,name,args):
             allowed=('start','cancel','save_modifiers','wishlist_add','wishlist_remove','worker_hire','worker_respec','worker_learn',
                      'worker_rename','worker_start','worker_cancel','worker_collect','worker_tool','worker_retrain','worker_route','camp_build',
-                     'camp_take')
+                     'camp_take')+panel.town_panel.TOWN_ACTIONS
             if name not in allowed:raise ValueError('Fixture allows local actions only.')
             return super().action(name,args)
-    app=FixturePanel(afk.DATA);server=panel.ThreadingHTTPServer(('127.0.0.1',9567),panel.Handler);server.app=app
+        def send_credit(self,request,amount):
+            # The game's credit, simulated on the fixture's gold (500,000,000 cap).
+            controls=afk.read_json(control,{});gold=controls.get('gold',0);ok=gold+amount<=500_000_000
+            if ok:controls['gold']=gold+amount;afk.write_json(control,controls)
+            receipt=dict(request_id=request,ok=ok,amount=amount,gold_before=gold,gold_after=gold+amount if ok else gold,character=self.fresh()['character'],
+                         error='' if ok else 'the gold would pass the game\'s cap',at=datetime.now(timezone.utc).isoformat())
+            afk.write_json(self.data/'models'/f'worker-credit-{request}.json',receipt)
+            return receipt
+        def finish_stock_send(self):
+            # The game making the goods, simulated: the shipment is done and "reaches" the Vault.
+            state=self.town_load();sending=state['town'].get('sending')
+            if not sending:raise ValueError('Nothing is being sent to the Vault.')
+            state['town']['sending']=None;self.town_save(state)
+            self.log('Fixture: the game made '+panel.town_panel.goods.describe(sending['items'])+' and the Vault took them.');return dict(state='done')
+        def defense_collect(self,ident=None):
+            # The town share's replay in the region, simulated: marked delivered.
+            state=self.town_load();entry=next((h for h in state['town']['history'] if (ident is None or h['id']==ident) and not h.get('town_collected')),None)
+            if not entry:raise ValueError('No finished siege is waiting for its town share.')
+            entry['town_collected']=True;self.town_save(state)
+            self.log(f"Fixture: the town's share of the level {entry['level']} siege was delivered.");return entry
+    # Two merchants in town, fixed for the fixture (the real ones come and go with the watches).
+    def fixture_visits(camp_,at=None):
+        at=at or datetime.now(timezone.utc);watch=merchants.watch_of(at)
+        return [dict(id=f'keymaster@{watch}',merchant='keymaster',name='Keymaster Brann',text=merchants.MERCHANT_BY_KEY['keymaster']['text'],
+                     arrives_at=workers.iso(now-timedelta(hours=1)),leaves_at=workers.iso(now+timedelta(hours=3)),
+                     offers=[dict(key='12:8',side='sell',qty=3,price=62_000.0),dict(key='12:33',side='sell',qty=8,price=15_500.0),
+                             dict(key='12:17',side='sell',qty=4,price=10_000.0),dict(key='13:1',side='buy',qty=40,price=2_600.0),
+                             dict(key='14:64',side='buy',qty=2,price=46_000.0)]),
+                dict(id=f'quartermaster@{watch}',merchant='quartermaster',name='Royal Quartermaster',text=merchants.MERCHANT_BY_KEY['quartermaster']['text'],
+                     arrives_at=workers.iso(now-timedelta(minutes=20)),leaves_at=workers.iso(now+timedelta(hours=5)),
+                     offers=[dict(key='14:27',side='buy',qty=600,price=62.0),dict(key='14:28',side='buy',qty=300,price=135.0),
+                             dict(key='14:60',side='buy',qty=150,price=310.0),dict(key='13:18',side='buy',qty=6,price=3_100.0)])]
+    merchants.visits=fixture_visits
+    app=FixturePanel(afk.DATA)
+    app.town_load(persist=True)   # settles the finished siege into the history (its town share waits)
+    crew=workers.load(afk.DATA);started=now-timedelta(minutes=37)
+    running=siege_record('defense_fixture_live',6,2.0,started,9)
+    afk.write_json(afk.PLANS/'defense_fixture_live.json',running)
+    crew['town']['siege']=dict(id=running['id'],path=str(afk.PLANS/'defense_fixture_live.json'),room='Act_03_03',level=6,started_at=running['started_at'],
+                               hours=running['hours'],heroes=[],settled=False)
+    workers.save(afk.DATA,crew)
+    server=panel.ThreadingHTTPServer(('127.0.0.1',9567),panel.Handler);server.app=app
     thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
     info=dict(url='http://127.0.0.1:9567',temp=tmp,data=str(afk.DATA),control=str(control),stop=str(stop),pid=os.getpid())
     (WORK/'fixture-info.json').write_text(json.dumps(info,indent=2),encoding='utf-8')
