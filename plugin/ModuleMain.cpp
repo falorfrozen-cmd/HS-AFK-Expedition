@@ -3046,6 +3046,7 @@ static std::string LoadedNeighbours()
 
 // ------------------------------------------------------------------ commands
 #include "TestSession.inl"
+#include "DefenseLab.inl"   // research R2: the live-defense lab (afk def ...)
 
 static void CmdStatus()
 {
@@ -3115,6 +3116,7 @@ static void RunCommand(const std::string& raw)
     }
 
     if (w0 == "status") { CmdStatus(); return; }
+    if (w0 == "def") { DefenseLab::Command(w1, w2, ss); return; }
     if (w0 == "convert" && w1 == "probe") {
         // Research: filtered-item conversion against the live game, outside any delivery.
         //   afk convert probe          offline flag, report watcher, recipe table
@@ -3703,6 +3705,7 @@ static void FrameCallback(FWFrame& FrameContext)
     UNREFERENCED_PARAMETER(FrameContext);
     static uint32_t fc = 0;
     ++fc;
+    DefenseLab::Frame();
     HandleCloseRequest();
     if (fc % 6 == 0) PollCommands();
     static auto nextFarmSample=std::chrono::steady_clock::now();
