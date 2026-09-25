@@ -313,7 +313,7 @@ class Panel(town_panel.TownPanel):
             import siege
             row['siege']=siege.live_view(plan,elapsed)
             row['ready']=elapsed>=siege.report_hours(plan)
-            row['ready_at']=(started+timedelta(hours=siege.report_hours(plan))).isoformat()   # a fallen Siege is over at the fall
+            if row['ready']:row['ready_at']=(started+timedelta(hours=siege.report_hours(plan))).isoformat()   # a fallen Siege: over at the fall (never shown before)
         if plan.get('mode')=='defense':
             info=self.defense_row(plan)
             if info:
@@ -869,7 +869,7 @@ class Panel(town_panel.TownPanel):
                               queue=[dict(q,name=camp.BY_KEY[q['building']]['name']) for q in state['camp']['queue']]))
 
     def workers_overview(self):
-        state=workers.load(self.data);out=workers.overview(state)
+        state=workers.load(self.data);before=json.loads(json.dumps(state['candidates']));out=workers.overview(state)
         out['candidates']={t:workers.describe_candidates(state,t) for t in camp.effects(state['camp'])['types']}
         pool=worker_loot.pools();names=zone_names()
         out['hotspots']=camp.hotspots(state['camp'],workers.hotspot_targets(pool))
@@ -880,10 +880,15 @@ class Panel(town_panel.TownPanel):
         out['recipes']=[dict(worker_jeweler.recipe_view(r),affordable=worker_jeweler.affordable(state['camp']['stock'],r),bench_ok=bench>=worker_jeweler.TIER_BY_TYPE[r['result_type']]['tier'])
                         for r in kept['recipes']]
         out['material_names']=worker_jeweler.MATERIAL_NAMES;out['jewel_names']=worker_jeweler.JEWEL_NAMES
-        # Candidates rolled for the first time are kept, but a page may only write between
-        # actions: while one runs, its own save must not be overwritten (they are rolled again later).
-        if self.job_lock.acquire(blocking=False):
-            try:workers.save(self.data,state)
+        # Candidates rolled for the first time are kept: written between actions only, onto the
+        # file as it is then (never this page's older copy), and only where none were rolled meanwhile.
+        rolled={t:v for t,v in state['candidates'].items() if v!=before.get(t)}
+        if rolled and self.job_lock.acquire(blocking=False):
+            try:
+                latest=workers.load(self.data)
+                for t,v in rolled.items():
+                    if latest['candidates'].get(t)==before.get(t):latest['candidates'][t]=v
+                workers.save(self.data,latest)
             finally:self.job_lock.release()
         return out
 

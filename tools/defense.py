@@ -366,7 +366,8 @@ def _group(ident, entry, tier, health, sides, rand, affix_pool, i, n, count=None
 def hero_shooter(slot: int, character: dict, profile: dict, stance: str = 'roam') -> dict:
     """A stationed hero as a battle shooter. Its measured kills per minute, rank
     by rank, times each rank's health is the health it clears per second."""
-    pace = float(profile.get('kills_per_min') or 0)
+    import siege
+    pace = siege.ordinary_pace(profile, afk.verified_specials())
     if not pace > 0:
         raise ValueError('This calibration has no kill pace.')
     counts = {}
@@ -451,9 +452,9 @@ def _row(wave: dict, result: dict) -> dict:
                                 affixes=[affix(a)['name'] for a in spec.get('affixes', [])], flags=list(spec.get('flags', [])),
                                 count=spec.get('count', 0), killed=0, leaked=0, boss=bool(spec.get('boss')))
         g = groups[root]
-        if k['loot']:
+        if k['loot']:              # summoned minions and split spawn are not the group's own monsters
             g['killed'] += k['killed']
-        g['leaked'] += k['leaked']
+            g['leaked'] += k['leaked']
     bounty_done = False
     if wave.get('bounty') in groups:
         g = groups[wave['bounty']]
@@ -463,7 +464,13 @@ def _row(wave: dict, result: dict) -> dict:
                 groups=sorted(groups.values(), key=lambda g: g['id']),
                 walls={s: w['hp'] for s, w in result['walls'].items()}, breached=[s for s, w in result['walls'].items() if w['breached']],
                 keep=result['keep']['hp'], fell=result['keep']['fallen'], seconds=result['seconds'], highlights=result['highlights'][:12],
-                spoils=kills // SPOILS_PER_KILLS + (BOUNTY_SPOILS if bounty_done else 0))
+                spoils=BOUNTY_SPOILS if bounty_done else 0)
+
+
+def spoils(rows) -> int:
+    """The camp's spoils of these waves: one per SPOILS_PER_KILLS kills of the whole run,
+    plus the bounties (a row's ``spoils``)."""
+    return sum(r['kills'] for r in rows) // SPOILS_PER_KILLS + sum(r['spoils'] for r in rows)
 
 
 def retreat_wave(record: dict):
@@ -566,7 +573,18 @@ def is_over(record: dict, at=None) -> bool:
 
 
 def ends_at(record: dict):
+    """When the siege ended or ends: the fall, a retreat or the planned end (a record-keeping
+    time; a page shows planned_end until the siege is over)."""
     return parse_iso(record['started_at']) + timedelta(minutes=record['wave_minutes'] * end_wave(record))
+
+
+def planned_end(record: dict):
+    """The end the player may see while the siege runs: the planned one, or the retreat."""
+    last = record['waves_total']
+    retreat = retreat_wave(record)
+    if retreat is not None:
+        last = min(last, retreat)
+    return parse_iso(record['started_at']) + timedelta(minutes=record['wave_minutes'] * last)
 
 
 def outcome(record: dict, at=None) -> str | None:
@@ -605,7 +623,7 @@ def view(record: dict, at=None, watchtower: int = 0) -> dict:
     walls = last['after']['walls'] if last else record['start_state']['walls']
     keep = last['after']['keep'] if last else record['start_state']['keep']
     over = done >= end_wave(record)
-    totals = dict(kills=sum(r['kills'] for r in fought), leaked=sum(r['leaked'] for r in fought), spoils=sum(r['spoils'] for r in fought),
+    totals = dict(kills=sum(r['kills'] for r in fought), leaked=sum(r['leaked'] for r in fought), spoils=spoils(fought),
                   stone_used=sum(r.get('stone_used', 0) for r in fought), breaches=sum(len(r['breached']) for r in fought))
     shooters = {}
     for r in fought:
@@ -615,7 +633,8 @@ def view(record: dict, at=None, watchtower: int = 0) -> dict:
     names.update({h['shooter']['id']: h['shooter']['name'] for h in record['heroes']})
     names['keep'] = 'Keep'
     return dict(id=record['id'], room=record['room'], region=record['region'], level=record['level'], started_at=record['started_at'],
-                ends_at=iso(ends_at(record)), waves_total=record['waves_total'], waves_done=done, wave=None if over else done + 1,
+                ends_at=iso(ends_at(record) if over else planned_end(record)), waves_total=record['waves_total'], waves_done=done,
+                wave=None if over else done + 1,
                 next_wave_at=None if over else iso(parse_iso(record['started_at']) + timedelta(minutes=record['wave_minutes'] * (done + 1))),
                 over=over, outcome=outcome(record, at),
                 walls={s: dict(hp=round(walls[s], 1), max=record['town']['walls'][s]['max']) for s in battle.SIDES},

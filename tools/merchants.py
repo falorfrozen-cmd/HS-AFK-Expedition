@@ -14,7 +14,9 @@ Arrivals:
 - A merchant stays a few hours, as long as a stall is free.
 
 A merchant's wares and wants are small markets of their own (economy.py): each
-unit bought raises the next one's price, each unit sold lowers it. Bought goods
+unit bought raises the next one's price, each unit sold lowers it. A merchant
+never sells and buys the same good, sells at or above a good's value and buys at
+or below it, so no two merchants can be played against each other. Bought goods
 go into the camp's stock (Basic and Crystal Keys onto the key rack); sold goods
 leave it for gold in the town's coffer. Gold goes out through the town's
 coffer first and the game's purchase path for the rest (the panel's receipts).
@@ -44,31 +46,31 @@ STAY_BONUS = (1.0, 1.0, 1.1, 1.2, 1.35, 1.5)
 
 MERCHANTS = (
     dict(key='gem_cutter', name='Wandering Gem Cutter', market=1, weight=4, stay=(3, 6), wares=4, wants=2,
-         sells=('gem', 'material'), buys=('ore', 'material'), greed=0.20, premium=0.10,
+         sells=('gem', 'material'), buys=('ore', 'material'), greed=0.20, premium=0.04,
          text='Cuts stones by the roadside. Sells gems and jewelcrafting stones; buys ore.'),
     dict(key='prospector', name='Old Prospector', market=1, weight=4, stay=(2, 5), wares=4, wants=2,
-         sells=('ore', 'dust'), buys=('material', 'gem'), greed=0.15, premium=0.10,
+         sells=('ore', 'dust'), buys=('material', 'gem'), greed=0.15, premium=0.04,
          text='Grizzled and dusty. Sells ore and dust by the sack; buys the stones others cut.'),
     dict(key='quartermaster', name='Royal Quartermaster', market=1, weight=3, stay=(4, 8), wares=0, wants=4,
-         sells=(), buys=('ore', 'material', 'dust', 'shard'), greed=0.0, premium=0.20,
+         sells=(), buys=('ore', 'material', 'dust', 'shard'), greed=0.0, premium=0.06,
          text='Buys for the army and pays the crown\'s coin: ore, stones, dust and shards, above market.'),
     dict(key='keymaster', name='Keymaster Brann', market=2, weight=3, stay=(3, 6), wares=4, wants=2,
-         sells=('key',), buys=('shard', 'relic'), greed=0.30, premium=0.05,
+         sells=('key',), buys=('shard', 'relic'), greed=0.30, premium=0.02,
          text='A ring of keys to every door, the Angelic Realm\'s included, for a price.'),
     dict(key='rune_scholar', name='Rune Scholar', market=2, weight=3, stay=(3, 7), wares=4, wants=3,
-         sells=('rune',), buys=('rune', 'gem'), greed=0.25, premium=0.10,
+         sells=('rune',), buys=('rune', 'gem'), greed=0.25, premium=0.04,
          text='Reads runes like others read letters. Trades runes; buys gems to study.'),
     dict(key='goblin_peddler', name='Goblin Peddler', market=2, weight=2, stay=(1, 3), wares=5, wants=0,
-         sells=('material', 'dust', 'shard', 'key', 'rune', 'gem'), buys=(), greed=-0.20, premium=0.0,
+         sells=('material', 'dust', 'shard', 'key', 'rune', 'gem'), buys=(), greed=-0.04, premium=0.0,
          text='Everything is "slightly used" and cheaper than anywhere else. Gone before you ask where from.'),
     dict(key='fortune_teller', name='Fortune Teller', market=3, weight=2, stay=(3, 6), wares=4, wants=2,
-         sells=('tarot',), buys=('tarot', 'dust'), greed=0.25, premium=0.10,
+         sells=('tarot',), buys=('tarot', 'dust'), greed=0.25, premium=0.04,
          text='Deals tarot cards and reads your future in them. Buys the cards you do not want.'),
     dict(key='occultist', name='Satanic Occultist', market=3, weight=2, stay=(2, 5), wares=3, wants=2,
-         sells=('relic', 'dust'), buys=('key', 'jewel'), greed=0.35, premium=0.10,
+         sells=('relic', 'dust'), buys=('key', 'jewel'), greed=0.35, premium=0.04,
          text='Satanic Crystals, Destiny Shards and dice from places best not named.'),
     dict(key='guild_envoy', name="Jewelers' Guild Envoy", market=4, weight=2, stay=(4, 8), wares=4, wants=3,
-         sells=('jewel', 'orb'), buys=('material', 'gem', 'orb'), greed=0.25, premium=0.15,
+         sells=('jewel', 'orb'), buys=('material', 'gem', 'orb'), greed=0.25, premium=0.05,
          text='The guild\'s finest jewels and orbs; it buys stones and gems for its workshops.'),
 )
 MERCHANT_BY_KEY = {m['key']: m for m in MERCHANTS}
@@ -110,14 +112,16 @@ def _visit(founded: str, watch: int, level: int) -> dict | None:
     stay = rand.uniform(*m['stay']) * STAY_BONUS[level]
     offers = []
     dearest = DEAREST[level]
-    for side, cats, n in (('sell', m['sells'], m['wares']), ('buy', m['buys'], m['wants'])):
-        pool = sorted(k for c in cats for k in goods.of(c) if goods.value(k) <= dearest)
+    sold = set()
+    for side, cats, n, spread in (('sell', m['sells'], m['wares'], (1.0, 1.15)), ('buy', m['buys'], m['wants'], (0.85, 1.0))):
+        pool = sorted(k for c in cats for k in goods.of(c) if goods.value(k) <= dearest and k not in sold)
         rand.shuffle(pool)
         for key in pool[:n]:
             value = goods.value(key)
             depth = max(1.0, 30_000.0 * value ** -0.7) * (1.0 + 0.25 * level)
             offers.append(dict(key=key, side=side, qty=max(1, int(round(depth * rand.uniform(0.6, 1.2)))),
-                               price=round(value * rand.uniform(0.9, 1.15), 2)))
+                               price=round(value * rand.uniform(*spread), 2)))
+            sold.add(key)
     ident = f"{m['key']}@{watch}"
     return dict(id=ident, merchant=m['key'], name=m['name'], text=m['text'], arrives_at=C.iso(start.replace(microsecond=0)),
                 leaves_at=C.iso((start + timedelta(hours=stay)).replace(microsecond=0)), offers=offers)
@@ -169,15 +173,16 @@ def quote(market: dict, visit: dict, key: str, side: str, qty: int) -> dict:
     left = o['qty'] - done
     if qty > left:
         raise ValueError(f"{visit['name']} {'has only' if side == 'sell' else 'wants only'} {max(0, left):,} more {goods.name(key)}.")
-    target = float(o['qty'])
     if side == 'sell':
-        # its shelf empties as the player buys: from stock target-done down
-        stock = target * 2 - done
-        gold = E.buy_cost(o['price'], stock, target, qty, m['greed'])
+        # its shelf starts at its target (the first unit at its price) and empties as the
+        # player buys: the last of its offer costs about 1.41 times as much
+        target = 2.0 * o['qty']
+        gold = E.buy_cost(o['price'], target - done, target, qty, m['greed'])
     else:
-        # its wish shrinks as the player sells: the price falls with each unit
-        stock = target * 0.5 + done
-        gold = E.sell_value(o['price'], stock, target, qty, -m['premium'])
+        # its wish starts at its price and shrinks as the player sells: the last unit it
+        # wants fetches about 0.71 of it
+        target = float(o['qty'])
+        gold = E.sell_value(o['price'], target + done, target, qty, -m['premium'])
     return dict(visit=visit['id'], key=key, name=goods.name(key), side=side, qty=qty, gold=gold, left=left)
 
 

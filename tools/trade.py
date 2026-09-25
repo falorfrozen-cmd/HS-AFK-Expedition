@@ -118,8 +118,7 @@ def normalize(trade) -> dict:
                       if k in TOWN_BY_KEY and isinstance(v, dict)}
     out['towns'] = {k: dict(traded=_int(v.get('traded')), prosperity=_int(v.get('prosperity')))
                     for k, v in (out['towns'] if isinstance(out['towns'], dict) else {}).items() if k in TOWN_BY_KEY and isinstance(v, dict)}
-    out['runs'] = [r for r in out['runs'] if isinstance(r, dict) and r.get('id') and r.get('town') in TOWN_BY_KEY] \
-        if isinstance(out['runs'], list) else []
+    out['runs'] = [r for r in out['runs'] if _sound_run(r)] if isinstance(out['runs'], list) else []
     out['coffer'] = _int(out.get('coffer'))
     out['history'] = [h for h in out['history'] if isinstance(h, dict)][:HISTORY] if isinstance(out['history'], list) else []
     out['schema'] = SCHEMA
@@ -128,6 +127,28 @@ def normalize(trade) -> dict:
 
 def _int(value) -> int:
     return value if type(value) is int and value > 0 else 0
+
+
+def _sound_run(r) -> bool:
+    """A stored wagon settle, returned and view can read (hand edits and cut-short files are left out)."""
+    if not isinstance(r, dict) or not r.get('id') or r.get('town') not in TOWN_BY_KEY or r.get('state') not in ('travelling', 'arrived'):
+        return False
+    try:
+        for key in ('left_at', 'arrives_at', 'returns_at'):
+            C.parse_iso(r[key])
+    except (KeyError, TypeError, ValueError):
+        return False
+    for key in ('cargo', 'orders'):
+        if not isinstance(r.get(key), dict) or any(not goods.known(k) or type(n) is not int or n < 1 for k, n in r[key].items()):
+            return False
+    if type(r.get('purse')) is not int or r['purse'] < 0:
+        return False
+    if r['state'] == 'arrived':
+        res = r.get('result')
+        need = ('earned', 'spent', 'bought', 'sold', 'unsold', 'gold_back')
+        if not isinstance(res, dict) or any(k not in res for k in need):
+            return False
+    return True
 
 
 def ensure(state: dict) -> dict:

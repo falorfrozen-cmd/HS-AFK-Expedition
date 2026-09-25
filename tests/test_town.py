@@ -378,6 +378,38 @@ class SiegeTests(TownFolder):
             self.act('defense_start', room=ROOM, level=1, hours=1, heroes=[], stone=10)
 
 
+class AfterSiegeTests(TownFolder):
+    def test_the_town_builds_repairs_and_moves_towers_again_once_a_siege_is_over(self):
+        self.fund(gold=5_000_000, stone=5_000, walls=2, hq=2, workshop=2)
+        self.edit(lambda st: (st['town']['towers'].update(t1=dict(id='t1', kind='ballista', level=3, place='keep', priority=None, perk=None)),
+                              st['camp']['stock'].update({'14:28': 200})))
+        self.act('defense_start', room=ROOM, level=1, hours=0.25, heroes=[], stone=0)
+        with self.assertRaisesRegex(ValueError, 'the town is under siege'):
+            self.act('fort_build', kind='ballista', place='north')
+        self.age(20)
+        self.assertTrue(self.state()['town']['siege']['settled'])
+        self.act('fort_build', kind='ballista', place='north')
+        self.act('fort_arrange', tower='t1', place='east')
+        self.edit(lambda st: town.set_health(st['town'], dict(north=10.0, east=2_500.0, south=2_500.0, west=2_500.0), 5_000.0,
+                                             datetime.now(timezone.utc)))
+        self.act('wall_repair', stone=10)
+
+    def test_pages_cannot_save_the_town(self):
+        st = self.app.town_load(persist=False)
+        with self.assertRaisesRegex(RuntimeError, 'a page tried to write the town'):
+            self.app.town_save(st)
+
+    def test_the_view_never_shows_the_fall_before_it_happens(self):
+        self.fund(stone=1_000, walls=1, hq=1, workshop=1)
+        self.edit(lambda st: st['town']['towers'].update(t1=dict(id='t1', kind='ballista', level=1, place='keep', priority=None, perk=None)))
+        self.act('defense_start', room=ROOM, level=40, hours=2.0, heroes=[], stone=0)
+        record = json.loads(Path(self.state()['town']['siege']['path']).read_text(encoding='utf-8'))
+        self.assertLess(defense.end_wave(record), record['waves_total'], 'this siege falls early')
+        view = self.app.defense_view()['siege']
+        planned = afk.parse_iso(record['started_at']) + timedelta(hours=2)
+        self.assertEqual((view['ends_at'], view['over']), (afk.iso(planned), False), 'the planned end until it happens')
+
+
 class WatchTests(TownFolder):
     def watch(self, **args):
         self.fund(gold=0, stone=1_000, walls=2, hq=2, workshop=1)
@@ -423,6 +455,17 @@ class WatchTests(TownFolder):
         kept = town.keep_history(rows, dict(id='new', town_collected=False))
         self.assertEqual(len(kept), 21)
         self.assertEqual(kept[0]['id'], 'new'); self.assertEqual(kept[-1]['id'], 's25')
+        again = town.normalize(dict(history=kept))['history']
+        self.assertEqual([h['id'] for h in again], [h['id'] for h in kept], 'a load keeps it too')
+
+    def test_the_watch_stands_down_after_the_keep_falls(self):
+        self.watch(level=45, hours=0.5)
+        self.age(60)
+        self.app.settle_town_late()
+        st = self.state()
+        self.assertEqual(st['town']['history'][0]['outcome'], 'fell')
+        self.assertIn('the keep fell', st['town']['watch']['paused'])
+        self.assertTrue(st['town']['siege']['settled'], 'no siege starts on a fallen keep')
 
     def test_every_waiting_share_of_the_region_is_collected_oldest_first(self):
         self.watch()
@@ -561,15 +604,54 @@ class RackTests(TownFolder):
 
 
 class ShipmentTests(TownFolder):
-    def test_a_shipment_the_game_made_nothing_of_gives_the_goods_back(self):
+    def test_an_unanswered_shipment_stays_planned_and_is_never_made_twice(self):
         self.edit(lambda st: st['camp']['stock'].update({'13:1': 5}))
         silent = FakeGame(self.d)
-        silent.send = lambda line, timeout=30: silent.commands.append(line) or None   # the game never answers
+        silent.send = lambda line, timeout=30: silent.commands.append(line) or None   # the game does not answer in time
         with patch.object(afk, 'Ipc', silent):
-            with self.assertRaisesRegex(ValueError, 'made nothing.*back in the stock'):
+            with self.assertRaisesRegex(ValueError, 'did not answer in time.*stays planned'):
+                self.app.action('stock_send', dict(items={'13:1': 3}))
+        st = self.state()
+        self.assertEqual(st['camp']['stock'], {'13:1': 2}, 'not given back: the game may still make them')
+        self.assertIsNotNone(st['town']['sending'])
+        with self.assertRaisesRegex(ValueError, 'has not worked on this shipment yet'):
+            self.act('stock_close_partial')
+        with patch.object(self.app, 'transfer_worker_haul') as transfer:
+            self.act('stock_send', items={'13:1': 1})        # sending again finishes the planned one first
+        st = self.state()
+        self.assertEqual((st['camp']['stock'], st['town']['sending']), ({'13:1': 2}, None))
+        transfer.assert_called_once()
+
+    def test_a_shipment_the_game_refused_gives_the_goods_back(self):
+        self.edit(lambda st: st['camp']['stock'].update({'13:1': 5}))
+        refusing = FakeGame(self.d)
+        refusing.send = lambda line, timeout=30: ['worker deliver: refused item 13:1']
+        with patch.object(afk, 'Ipc', refusing):
+            with self.assertRaisesRegex(ValueError, 'made nothing: worker deliver: refused item 13:1. The goods are back'):
                 self.app.action('stock_send', dict(items={'13:1': 3}))
         st = self.state()
         self.assertEqual((st['camp']['stock'], st['town']['sending']), ({'13:1': 5}, None))
+
+    def test_a_stopped_shipment_is_closed_as_partial(self):
+        self.edit(lambda st: st['camp']['stock'].update({'13:1': 5, '15:2': 4}))
+        stopping = FakeGame(self.d)
+        def stop(line, timeout=30):
+            plan = json.loads(Path(line.split(' ', 3)[3]).read_text(encoding='utf-8'))
+            item = dict(itemType=13, itemDefinitionStruct=dict(b=1, o=2))
+            (self.d / 'spool' / f"{plan['delivery_id']}.ndjson").write_text(json.dumps(dict(kind='item', item=item)) + '\n', encoding='utf-8')
+            afk.write_json(self.d / 'sessions' / f"{plan['delivery_id']}.result.json", dict(delivery_id=plan['delivery_id'], state='error',
+                                                                                          error='a stack could not be created'))
+            return ['ok']
+        stopping.send = stop
+        with patch.object(afk, 'Ipc', stopping):
+            with self.assertRaisesRegex(ValueError, 'stopped part way.*Close it as partial'):
+                self.app.action('stock_send', dict(items={'13:1': 3, '15:2': 4}))
+        with patch.object(self.app, 'transfer_worker_haul') as transfer:
+            done = self.act('stock_close_partial')
+        self.assertEqual((done['made'], done['back']), ({'13:1': 2}, {'13:1': 1, '15:2': 4}))
+        st = self.state()
+        self.assertEqual((st['camp']['stock'], st['town']['sending']), ({'13:1': 3, '15:2': 4}, None))
+        transfer.assert_called_once()
 
     def test_goods_reach_the_vault_as_items_the_game_makes(self):
         self.edit(lambda st: st['camp']['stock'].update({'15:17': 3, '14:64': 2}))

@@ -59,6 +59,12 @@ def new() -> dict:
                 queue=[], siege=None, watch=None, history=[], slain={}, sending=None)
 
 
+def under_siege(town: dict) -> bool:
+    """A siege runs (the pointer of a finished one stays, settled)."""
+    siege = town.get('siege')
+    return bool(siege) and not siege.get('settled')
+
+
 def _int(value, low=0, high=None) -> int:
     value = value if type(value) is int else low
     value = max(low, value)
@@ -89,7 +95,8 @@ def normalize(town) -> dict:
     out['siege'] = out['siege'] if isinstance(out['siege'], dict) and out['siege'].get('id') else None
     out['sending'] = out['sending'] if isinstance(out['sending'], dict) and out['sending'].get('delivery_id') else None
     out['watch'] = normalize_watch(out['watch'])
-    out['history'] = [h for h in out['history'] if isinstance(h, dict)][:HISTORY] if isinstance(out['history'], list) else []
+    rows = [h for h in out['history'] if isinstance(h, dict)] if isinstance(out['history'], list) else []
+    out['history'] = [h for i, h in enumerate(rows) if i < HISTORY or not h.get('town_collected')]
     slain = out['slain'] if isinstance(out['slain'], dict) else {}
     out['slain'] = {str(k): v for k, v in slain.items() if type(v) is int and v > 0}
     out['schema'] = SCHEMA
@@ -160,7 +167,7 @@ def set_health(town: dict, walls: dict, keep: float, at) -> None:
 def repair_now(town: dict, camp: dict, stone: int, at=None) -> dict:
     """Spend camp stone out of a siege: the walls first (most hurt first), then the keep."""
     at = at or C.now_utc()
-    if town.get('siege'):
+    if under_siege(town):
         raise ValueError('The town is under siege: repair between its waves instead.')
     lim = limits(camp)
     if type(stone) is not int or stone <= 0:
@@ -284,7 +291,7 @@ def _finish_check(town, camp, lim, plan, blockers) -> dict:
         blockers.append('already being built')
     if len(town['queue']) >= lim['sites']:
         blockers.append('the Siege Workshop is busy')
-    if town.get('siege'):
+    if under_siege(town):
         blockers.append('the town is under siege')
     missing = C.afford(camp, plan['cost']) + _stock_missing(camp, plan['materials'])
     if missing:
@@ -349,7 +356,7 @@ def arrange(town: dict, tower_id: str, place=None, priority=None, perk=None) -> 
     t = town['towers'].get(tower_id)
     if not t:
         raise ValueError('No such tower.')
-    if town.get('siege') and place is not None and place != t['place']:
+    if under_siege(town) and place is not None and place != t['place']:
         raise ValueError('Towers cannot move during a siege.')
     if place is not None:
         if place not in F.PLACES:

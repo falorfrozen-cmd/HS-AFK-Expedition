@@ -49,7 +49,7 @@ REGEN_PER_SECOND = 0.02
 VAMPIRIC_PER_SECOND = 0.015
 FROZEN_AURA = 0.15         # towers of a side lose 15% damage while a frozen group is within 40 of its wall
 FROZEN_RANGE = 40.0
-ENRAGE_BELOW = 0.5
+ENRAGE_BELOW = 0.5         # once a group has lost half its health, its survivors enrage
 ENRAGE_MULT = 1.5
 JUGGERNAUT_MULT = 2.0
 DISPEL_MULT = 3.0
@@ -72,7 +72,7 @@ def _num(value, default=0.0) -> float:
 def group(spec: dict) -> dict:
     """A monster group's live state from its spec (see defense.py for the fields)."""
     n = max(0, int(spec.get('count', 0)))
-    hp = max(1.0, _num(spec.get('hp'), 1.0))
+    hp = max(1e-6, _num(spec.get('hp'), 1.0))       # a minion may be a tenth of a Common monster
     shield_each = max(0.0, _num(spec.get('shield')))
     return dict(
         id=str(spec['id']), side=spec.get('side', 'north') if spec.get('side') in SIDES else 'north',
@@ -102,9 +102,9 @@ def _distance(g: dict, src: dict) -> float:
 
 
 def _can_hit(g: dict, src: dict) -> bool:
-    if 'flying' in g['flags'] and not g['inside']:
+    if 'flying' in g['flags']:
         if not src.get('air'):
-            return False
+            return False          # a flyer at the keep still flies: only what hits flyers can hit it
     elif not src.get('ground', True):
         return False
     side = src.get('side')
@@ -212,6 +212,8 @@ def _child(g: dict, suffix: str, count: int, hp_share: float, t: float, name: st
     c['spawned'] = True
     c['pos'] = g['pos'] if g['pos'] is not None else 0.0
     c['inside'] = g['inside']
+    if 'flying' in g['flags']:
+        c['flags'].add('flying')      # a flyer's spawn flies on (over the town, it would otherwise be put back outside)
     return c
 
 
@@ -329,7 +331,8 @@ def fight(wave: dict, town: dict) -> dict:
             if 'splitting' in g['flags'] and g['loot']:
                 seq += 1
                 groups.append(_child(g, f'c{seq}', dead * 2, SPLIT_HP, when, f"{g['name']} spawn"))
-            if 'exploding' in g['flags'] and not g['inside'] and g['pos'] is not None and g['pos'] <= EXPLODE_RANGE:
+            if ('exploding' in g['flags'] and 'flying' not in g['flags'] and not g['inside'] and g['pos'] is not None
+                    and g['pos'] <= EXPLODE_RANGE):
                 _hit_wall(walls, g['side'], dead * g['hp'] * EXPLODE_WALL, highlights, when, breached)
         deaths.clear()
         live = [g for g in groups if _live(g)]
@@ -345,7 +348,7 @@ def fight(wave: dict, town: dict) -> dict:
                 g['pool'] = min(g['alive'] * g['hp'], g['pool'] + heal * g['hp'] * g['alive'] * STEP)
         # ---- monsters hit the walls and the keep
         for g in live:
-            mult = ENRAGE_MULT if ('enraged' in g['flags'] and g['pool'] < ENRAGE_BELOW * g['alive'] * g['hp']) else 1.0
+            mult = ENRAGE_MULT if ('enraged' in g['flags'] and g['pool'] < ENRAGE_BELOW * g['n'] * g['hp']) else 1.0
             if 'juggernaut' in g['flags']:
                 mult *= JUGGERNAUT_MULT
             if 'thief' in g['flags']:

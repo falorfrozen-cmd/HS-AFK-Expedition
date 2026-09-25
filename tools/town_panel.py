@@ -60,7 +60,7 @@ WATCH_LOOKBACK_HOURS = 24
 WATCH_WAITING = 8
 TOWN_LOCAL = ('fort_build', 'fort_upgrade', 'fort_plating', 'fort_arrange', 'wall_repair', 'defense_start', 'defense_repair',
               'defense_retreat', 'defense_watch', 'trade_send', 'trade_unload', 'market_buy', 'market_sell')
-TOWN_GAME = ('coffer_deposit', 'coffer_collect', 'defense_collect', 'stock_send')
+TOWN_GAME = ('coffer_deposit', 'coffer_collect', 'defense_collect', 'stock_send', 'stock_close_partial')
 TOWN_ACTIONS = TOWN_LOCAL + TOWN_GAME
 
 
@@ -76,10 +76,11 @@ def _whole(value, low, high, what) -> int:
 
 class TownPanel:
     # ------------------------------------------------------------------ state
-    def town_load(self, at=None, persist=False) -> dict:
+    def town_load(self, at=None, persist=True) -> dict:
         """workers.json with the town's sections ready and everything due settled.
 
-        ``persist``: write what settled (actions and the monitor only, never a page)."""
+        ``persist``: write what settled; only actions and the monitor (between actions)
+        load this way. A page loads with ``persist=False`` and can never save the result."""
         at = at or datetime.now(timezone.utc).replace(microsecond=0)
         state = workers.load(self.data, at)
         state['town'] = town.normalize(state.get('town'))
@@ -92,6 +93,7 @@ class TownPanel:
         changed |= self.defense_settle(state, at, persist)
         if persist:
             changed |= self.defense_watch_step(state, at)
+        state['_writable'] = persist
         if persist and changed:
             self.town_save(state)
         return state
@@ -111,12 +113,17 @@ class TownPanel:
                 self.note(f'The town could not be brought up to date: {error}')
 
     def town_save(self, state) -> None:
-        workers.save(self.data, state)
+        if not state.pop('_writable', False):
+            raise RuntimeError('a page tried to write the town; only actions and the monitor may')
+        try:
+            workers.save(self.data, state)
+        finally:
+            state['_writable'] = True
 
     # ------------------------------------------------------------------ views
     def town_view(self) -> dict:
         at = datetime.now(timezone.utc).replace(microsecond=0)
-        state = self.town_load(at)
+        state = self.town_load(at, persist=False)
         out = town.view(state['town'], state['camp'], at)
         out['coffer'] = state['trade']['coffer']
         out['stock'] = [dict(key=k, name=goods.name(k), category=goods.category(k), count=n, value=goods.value(k) if goods.known(k) else None)
@@ -131,7 +138,7 @@ class TownPanel:
 
     def defense_view(self) -> dict:
         at = datetime.now(timezone.utc).replace(microsecond=0)
-        state = self.town_load(at)
+        state = self.town_load(at, persist=False)
         siege = state['town'].get('siege')
         record = self.defense_record(siege) if siege else None
         watch = camp.effects(state['camp'])['scout']
@@ -155,7 +162,7 @@ class TownPanel:
                     affixes={str(k): dict(v) for k, v in defense.AFFIXES.items()}, towers=[dict(t) for t in F.TOWERS])
 
     def bestiary_view(self, room: str) -> dict:
-        state = self.town_load()
+        state = self.town_load(persist=False)
         entries = bestiary.region(room)
         _require(entries, 'The bestiary knows no monster of that region yet.')
         slain = state['town']['slain']
@@ -169,19 +176,19 @@ class TownPanel:
 
     def trade_view(self) -> dict:
         at = datetime.now(timezone.utc).replace(microsecond=0)
-        state = self.town_load(at)
+        state = self.town_load(at, persist=False)
         return trade.view(state['trade'], state['camp'], at)
 
     def market_view(self) -> dict:
         at = datetime.now(timezone.utc).replace(microsecond=0)
-        state = self.town_load(at)
+        state = self.town_load(at, persist=False)
         out = merchants.view(state['market'], state['camp'], at)
         out['coffer'] = state['trade']['coffer']
         return out
 
     def defense_forecast(self, args: dict) -> dict:
         """What a siege at a level usually looks like for the town as it stands now (simulated)."""
-        state = self.town_load()
+        state = self.town_load(persist=False)
         trial = self.defense_trial(state, args)
         level = args.get('level')
         if level is None:
@@ -197,7 +204,7 @@ class TownPanel:
         """The town in /api/state: the coffer, the siege, wagons home, merchants in town."""
         try:
             at = datetime.now(timezone.utc).replace(microsecond=0)
-            state = self.town_load(at)
+            state = self.town_load(at, persist=False)
             siege = state['town'].get('siege')
             view = None
             if siege and not siege.get('settled'):
@@ -219,7 +226,7 @@ class TownPanel:
             if not isinstance(record, dict) or record.get('id') != plan['defense']['id']:
                 return None
             v = defense.view(record)
-            return dict(ready=v['over'], ready_at=v['ends_at'] if not v['over'] else None,
+            return dict(ready=v['over'], ready_at=v['ends_at'],
                         defense={k: v[k] for k in ('id', 'region', 'level', 'waves_done', 'waves_total', 'wave', 'over', 'outcome')})
         except (OSError, ValueError, KeyError):
             return None
@@ -236,6 +243,8 @@ class TownPanel:
             return self.defense_collect(args.get('siege'), every=args.get('all') is True)
         if name == 'stock_send':
             return self.stock_send(args.get('items'))
+        if name == 'stock_close_partial':
+            return self.stock_close_partial()
         state = self.town_load(at)
         t, c, tr = state['town'], state['camp'], state['trade']
         if name in ('fort_build', 'fort_upgrade', 'fort_plating'):
@@ -371,6 +380,10 @@ class TownPanel:
         entry = state['credits'][request]
         if receipt is None:
             entry.update(state='unknown', error='the game did not answer in time')
+        elif not receipt:
+            # The game answered but left no receipt: a payout may have been made whose receipt
+            # could not be written. Never put it back in the coffer blindly.
+            entry.update(state='review', error='the game answered without a receipt; check the hero\'s gold')
         else:
             entry.update(state='paid' if receipt.get('ok') is True else 'refused',
                          error=receipt.get('error') or (None if receipt else 'no receipt from the game'), receipt=receipt or None)
@@ -391,7 +404,7 @@ class TownPanel:
         return entry
 
     def unanswered_credits(self):
-        return [k for k, v in self.town_load()['credits'].items() if v.get('state') in ('pending', 'unknown')]
+        return [k for k, v in self.town_load(persist=False)['credits'].items() if v.get('state') in ('pending', 'unknown')]
 
     def settle_credits(self):
         for request in self.unanswered_credits():
@@ -452,8 +465,9 @@ class TownPanel:
             _whole(n, 1, 100_000, 'A count')
             _require(self._held(state['camp'], key) >= n, f"The camp has only {self._held(state['camp'], key):,} {goods.name(key)}.")
             items[str(key)] = n
-        pending = state['town'].get('sending')
-        _require(not pending, 'An earlier shipment to the Vault is not finished; send it again to finish it first.')
+        if state['town'].get('sending'):
+            self.log('An earlier shipment to the Vault is not finished; finishing it first (the goods asked now were not taken).')
+            return self.finish_stock_send()
         s = self.fresh()
         _require(not s['replay_running'], 'Wait for reward delivery to finish.')
         ident = 'worker_town_' + datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:6]
@@ -474,28 +488,64 @@ class TownPanel:
         ident, path = sending['delivery_id'], Path(sending['plan'])
         result_path = self.data / 'sessions' / f'{ident}.result.json'
         import panel
-        if not result_path.exists():
+        spool = self.data / 'spool' / f'{ident}.ndjson'
+        if not result_path.exists() and not spool.exists():
             s = self.fresh()
             _require(not s['replay_running'], 'Wait for reward delivery to finish.')
             self.log('The game is making the goods...')
-            for line in afk.Ipc(self.game_bin()).send(f'afk worker deliver {path}', timeout=120) or []:
+            reply = afk.Ipc(self.game_bin()).send(f'afk worker deliver {path}', timeout=120)
+            _require(reply is not None, 'The game did not answer in time. The shipment stays planned: send again to finish it; '
+                     'nothing is made twice and nothing is lost.')
+            for line in reply:
                 self.log(line)
-        result = panel.read(result_path, {}) or {}
-        if not result:
-            if not (self.data / 'spool' / f'{ident}.ndjson').exists():
-                # nothing was made: the goods go back into the stock
+            if not result_path.exists() and not spool.exists():
+                # the game answered and made nothing (it refused the plan): the goods go back into the stock
                 trade.arrive(state['camp'], sending['items'])
                 state['town']['sending'] = None
                 self.town_save(state)
-                raise ValueError('The game made nothing (no result came back). The goods are back in the stock.')
-            raise ValueError('An earlier attempt stopped without a result. What it made stays in its records for review.')
-        _require(result.get('state') == 'done', f"The shipment stopped part way ({result.get('error') or 'no reason given'}). "
-                 'What was made stays in its records; nothing is made twice.')
+                raise ValueError('The game made nothing: ' + ('; '.join(reply) or 'no reason given') + '. The goods are back in the stock.')
+        result = panel.read(result_path, {}) or {}
+        _require(result.get('state') == 'done', 'The shipment stopped part way ('
+                 + (result.get('error') or 'no result came back') + '). Close it as partial: what was made goes to the Vault, '
+                 'the rest back into the stock; nothing is made twice.')
         state['town']['sending'] = None
         self.town_save(state)
         self.log(f"The game made {goods.describe(sending['items'])}; sending them to the Vault...")
         self.transfer_worker_haul(ident, 'Town')
         return result
+
+    def stock_close_partial(self):
+        """Keep what a stopped shipment made (to the Vault) and put the rest back into the stock.
+        Only once the game has worked on it (a result or a spool exists): an unanswered
+        shipment might still be made, so it is never given back."""
+        import panel
+        state = self.town_load()
+        sending = state['town'].get('sending')
+        _require(sending, 'No shipment is waiting.')
+        ident = sending['delivery_id']
+        result_path, spool = self.data / 'sessions' / f'{ident}.result.json', self.data / 'spool' / f'{ident}.ndjson'
+        result = panel.read(result_path, {}) or {}
+        _require(result.get('state') != 'done', 'This shipment finished; send again to take it to the Vault.')
+        _require(result or spool.exists(), 'The game has not worked on this shipment yet: send again to finish it.')
+        made = {}
+        for row in (afk.read_ndjson(spool) if spool.exists() else []):
+            item = row.get('item') or {}
+            if row.get('kind') != 'item' or not isinstance(item, dict):
+                continue
+            d = item.get('itemDefinitionStruct') or {}
+            key = f"{int(item.get('itemType', -1))}:{int(d.get('b', -1))}"
+            made[key] = made.get(key, 0) + int(d.get('o', 1) or 1)
+        back = {k: n - made.get(k, 0) for k, n in sending['items'].items() if n > made.get(k, 0)}
+        trade.arrive(state['camp'], back)
+        afk.write_json(result_path, dict(result, delivery_id=ident, state='partial', partial=True, created=made, settled_by='player',
+                                         settled_at=afk.iso(afk.now_utc())))
+        state['town']['sending'] = None
+        self.town_save(state)
+        self.log(f"The shipment was closed: {goods.describe(made) or 'nothing'} made"
+                 + (f"; {goods.describe(back)} back in the stock" if back else '') + '.')
+        if made:
+            self.transfer_worker_haul(ident, 'Town')
+        return dict(made=made, back=back)
 
     # ------------------------------------------------------------------ sieges
     def defense_record(self, siege) -> dict:
@@ -599,9 +649,15 @@ class TownPanel:
         Pauses (with the reason) instead of failing. True when anything changed."""
         t = state['town']
         watch = t.get('watch')
-        if not watch or watch.get('paused'):
+        if not watch:
             return False
         changed = False
+        if watch.get('paused'):
+            waiting = sum(1 for h in t['history'] if not h.get('town_collected'))
+            if not (watch['paused'].endswith('wait to be collected') and waiting < WATCH_WAITING):
+                return False
+            watch['paused'] = None               # the shares were collected: the watch goes on by itself
+            changed = True
         for _ in range(WATCH_CATCH_UP):
             siege = t.get('siege')
             if siege and not siege.get('settled'):
@@ -627,6 +683,9 @@ class TownPanel:
             changed = True
             if not self.defense_settle(state, at, True):
                 break
+            if t['history'] and t['history'][0].get('outcome') == 'fell':
+                watch['paused'] = 'the keep fell in the last siege: lower the level or strengthen the town, then keep watch again'
+                return True
         return changed
 
     def defense_begin(self, state, room, level, hours, heroes, stone, at, watch=False) -> dict:
@@ -697,6 +756,7 @@ class TownPanel:
         siege = state['town'].get('siege')
         if not siege or siege.get('settled'):
             return False
+        watch = state['town'].get('watch')
         try:
             record = self.defense_record(siege)
         except ValueError:
@@ -709,8 +769,7 @@ class TownPanel:
         town.set_health(state['town'], final['walls'], final['keep'], defense.ends_at(record))
         stone_back = int(final.get('stone', record['stone_budget'])) if rows else int(record['stone_budget'])
         camp.give_back(state['camp'], dict(stone=stone_back))
-        spoils = sum(r['spoils'] for r in rows)
-        kept = camp.add(state['camp'], dict(spoils=spoils))
+        kept = camp.add(state['camp'], dict(spoils=defense.spoils(rows)))
         for r in rows:
             for g in r['groups']:
                 if g.get('entry') and g['killed']:
@@ -722,7 +781,11 @@ class TownPanel:
                      spoils=kept.get('spoils', 0), stone_back=stone_back, ended_at=afk.iso(defense.ends_at(record)), record=new,
                      town_collected=False)
         entry['watch'] = bool(record.get('watch'))
+        if not defense.shares(record)['town']:
+            entry['town_collected'] = True        # nothing for the town to replay: no trip needed
         state['town']['history'] = town.keep_history(state['town']['history'], entry)
+        if watch and outcome == 'fell' and record.get('watch') and not watch.get('paused'):
+            watch['paused'] = 'the keep fell in the last siege: lower the level or strengthen the town, then keep watch again'
         siege['settled'] = True
         if persist:
             self.note(f"The siege of level {record['level']} {'held' if outcome == 'held' else 'fell' if outcome == 'fell' else 'ended in a retreat'} "
