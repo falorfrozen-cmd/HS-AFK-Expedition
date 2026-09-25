@@ -26,10 +26,11 @@ Standard library only.
 """
 from __future__ import annotations
 
+import os
 import statistics
-from pathlib import Path
 
 import afk
+import packet_facts
 
 RANKS = (1, 2, 3, 4)
 # The game's kill counters are Common, Champion, Ancient and Legion, and on the
@@ -38,12 +39,12 @@ RANKS = (1, 2, 3, 4)
 # the in-game label of ranks 3 and 4 is not yet checked on screen).
 RANK_NAMES = {1: 'Common', 2: 'Champion', 3: 'Ancient', 4: 'Legion'}
 # Runtime affix slots from 40 up are flags (zones, states), not affixes.
-MAX_AFFIX = 40
+MAX_AFFIX = packet_facts.MAX_AFFIX
 # Monsters a special event spawned carry `specialType` (MEASURED 2026-09-25):
 # 9 and 10 died within two minutes before an Abyss chest opened; 4 are the
 # Unholy Siege's (Summoning Portal) monsters; 1 is most likely a Chaos Pillar's
 # pack (unconfirmed); 3 is unknown.
-ORIGINS = {9: 'abyss', 10: 'abyss', 4: 'unholy', 1: 'pillar', 3: 'special'}
+ORIGINS = packet_facts.ORIGINS
 ORIGIN_NAMES = dict(ordinary='', abyss='Abyssal', unholy='Unholy', pillar='Chaos', special='Marked')
 MIN_UNIT_SAMPLES = 1
 _CACHE: dict = {}
@@ -71,49 +72,26 @@ def _weights(room: str) -> dict:
     return out
 
 
-def read_packet(path: Path) -> dict | None:
-    """One packet's bestiary facts, or None when it cannot attack the town."""
-    d = afk.read_json(path)
-    if not isinstance(d, dict) or not d.get('monster_key') or d.get('rank') not in RANKS:
-        return None
-    if not str(d.get('script') or '').endswith('DropItem'):
-        return None                                    # DropRiftItems, synthetic research calls
-    obj = str(d.get('self_object') or '')
-    if 'Chest' in obj or obj.startswith('Goblin_'):
-        return None
-    prot = d.get('protected') if isinstance(d.get('protected'), dict) else {}
-    idx = afk.packet_entry(d)
-    if not prot or not idx.get('complete'):
-        return None
-    snap = d.get('self_snapshot') if isinstance(d.get('self_snapshot'), dict) else {}
-    hp = _num(prot.get('max_hp')) or _num(prot.get('maxHpUnscaled'))
-    if not hp or hp <= 0:
-        return None
-    affixes = [int(a) for a in (snap.get('affixList') or []) if _num(a) is not None and 0 <= a < MAX_AFFIX]
-    special = snap.get('specialType')
-    origin = ORIGINS.get(int(special), 'special') if _num(special) and special > 0 else 'ordinary'
-    return dict(hash=d.get('packet_hash') or path.stem, room=d.get('room'), build=d.get('game_build_id'),
-                monster_key=str(d['monster_key']), object=obj, rank=int(d['rank']), name=str(snap.get('name') or d['monster_key']),
-                hp=hp, damage=_num(prot.get('damage')), speed=_num(snap.get('moveSpeed')) or 0.0,
-                ranged=_flag(snap.get('isRanged')), fire=_flag(snap.get('fireImmune')), cold=_flag(snap.get('coldImmune')),
-                poison=_flag(snap.get('poisonImmune')), affixes=sorted(set(affixes)), exp=idx.get('exp'), origin=origin)
-
-
 def index(build: str | None = None) -> dict:
-    """{room: {entry key: entry}} for the running build, cached by the packets' stamp."""
+    """{room: {entry key: entry}} for the running build, from packet_facts' cache,
+    worked out again only when the packets or the calibrations change."""
     build = build if build is not None else current_build()
-    files = sorted(afk.PACKETS.glob('*.json'))
-    prof = sorted((afk.DATA / 'profiles').glob('*.json'))
-    stamp = (str(afk.PACKETS), build, len(files), max((f.stat().st_mtime_ns for f in files), default=0),
-             len(prof), max((f.stat().st_mtime_ns for f in prof), default=0))
+    facts, version = packet_facts.facts()
+    prof = afk.DATA / 'profiles'
+    try:
+        stats = [e.stat() for e in os.scandir(prof) if e.name.endswith('.json') and e.is_file()]
+    except FileNotFoundError:
+        stats = []
+    stamp = (str(afk.PACKETS), build, version, len(stats), max((s.st_mtime_ns for s in stats), default=0))
     if _CACHE.get('stamp') == stamp:
         return _CACHE['value']
     rooms: dict = {}
-    for f in files:
-        facts = read_packet(f)
-        if not facts or not build or facts['build'] != build or not facts['room']:
+    for f in facts.values():
+        m = f.get('monster')
+        if not m or not build or f['build'] != build or not f['room']:
             continue
-        rooms.setdefault(facts['room'], []).append(facts)
+        rooms.setdefault(f['room'], []).append(dict(m, hash=f['hash'], room=f['room'], build=f['build'], monster_key=f['monster_key'],
+                                                    object=f['object'], rank=int(f['rank']), exp=f['exp']))
     value = {room: _entries(room, packets) for room, packets in sorted(rooms.items())}
     _CACHE.update(stamp=stamp, value=value)
     return value
