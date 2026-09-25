@@ -134,7 +134,23 @@ class TownPanel:
                                   for k, v in state['credits'].items() if v.get('state') in ('pending', 'unknown', 'refused', 'review')][-5:]
         out['goods'] = goods.catalog()
         out['category_names'] = goods.CATEGORY_NAMES
+        out['sending'] = self._sending_view(state['town'].get('sending'))
         return out
+
+    def _sending_view(self, sending) -> dict | None:
+        """A shipment to the Vault still under way, for the page (no local paths).
+
+        `stage`: `waiting` (the game has not worked on it: sending again finishes it),
+        `stopped` (it stopped part way: close it as partial) or `done` (made: sending
+        again takes it to the Vault)."""
+        if not sending:
+            return None
+        ident = sending['delivery_id']
+        result = afk.read_json(self.data / 'sessions' / f'{ident}.result.json', {}) or {}
+        worked = bool(result) or (self.data / 'spool' / f'{ident}.ndjson').exists()
+        stage = 'done' if result.get('state') == 'done' else 'stopped' if worked else 'waiting'
+        return dict(delivery_id=ident, at=sending.get('at'), stage=stage,
+                    items=[dict(key=k, name=goods.name(k), count=n) for k, n in sorted(sending['items'].items())])
 
     def defense_view(self) -> dict:
         at = datetime.now(timezone.utc).replace(microsecond=0)
@@ -456,18 +472,22 @@ class TownPanel:
     # ------------------------------------------------------------------ goods to the Vault
     def stock_send(self, raw):
         """Goods from the camp's stock to the Vault: the game makes each stack with its
-        ground-drop routine (a ``worker_town_`` delivery), then the Vault takes them in."""
-        _require(isinstance(raw, dict) and raw, 'Choose the goods to send to the Vault.')
+        ground-drop routine (a ``worker_town_`` delivery), then the Vault takes them in.
+
+        A shipment still under way is finished first, with or without new goods: the goods
+        asked for then are not taken (an empty stock can finish it too)."""
         state = self.town_load()
+        if state['town'].get('sending'):
+            self.log('An earlier shipment to the Vault is not finished; finishing it first'
+                     + (' (the goods asked now were not taken).' if raw else '.'))
+            return self.finish_stock_send()
+        _require(isinstance(raw, dict) and raw, 'Choose the goods to send to the Vault.')
         items = {}
         for key, n in raw.items():
             _require(goods.known(key), f'{goods.name(key)} is not a town good.')
             _whole(n, 1, 100_000, 'A count')
             _require(self._held(state['camp'], key) >= n, f"The camp has only {self._held(state['camp'], key):,} {goods.name(key)}.")
             items[str(key)] = n
-        if state['town'].get('sending'):
-            self.log('An earlier shipment to the Vault is not finished; finishing it first (the goods asked now were not taken).')
-            return self.finish_stock_send()
         s = self.fresh()
         _require(not s['replay_running'], 'Wait for reward delivery to finish.')
         ident = 'worker_town_' + datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:6]
