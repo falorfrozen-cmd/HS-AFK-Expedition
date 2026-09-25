@@ -700,6 +700,12 @@ AFK FARM value in gold: the anchor its prices move around.
 - `stock` [{`key`, `name`, `category`, `count`, `value`}].
 - `pending_credits`, `goods` (the whole list: `key`, `name`, `category`, `value`)
   and `category_names`.
+- `sending`: a shipment to the Vault still under way, or null: {`delivery_id`,
+  `at`, `items` [{`key`, `name`, `count`}], `stage`}. `stage` is one of:
+  - `waiting`: the game has not worked on it yet. `stock_send` finishes it, with or
+    without `items`.
+  - `stopped`: it stopped part way. Use `stock_close_partial`.
+  - `done`: it was made. `stock_send` takes it to the Vault.
 
 A *plan* is {`to`, `cost` {`gold`, `stone`, `spoils`, `dust`}, `hours`,
 `materials` [{`key`, `name`, `count`}], `blockers` [text]}. `to` is null at the
@@ -992,9 +998,10 @@ For `stock_send`, the game makes each stack with its ground-drop routine (a
 `worker_town_` delivery), then the Vault takes them. What can happen:
 - **The game refused the plan.** Nothing was made, and the goods go back into
   the stock.
-- **The game did not answer in time.** The shipment stays planned (`town.sending`)
-  and is never given back while the game may still make it. The next
-  `stock_send` finishes it first; the goods asked for then are not taken.
+- **The game did not answer in time.** The shipment stays planned (`/api/town`
+  `sending`) and is never given back while the game may still make it. The next
+  `stock_send` finishes it first, with or without `items`, so an empty stock can
+  finish it too. Goods asked for then are not taken.
 - **It stopped part way.** `stock_close_partial` sends what was made to the Vault
   and puts the rest back into the stock.
 

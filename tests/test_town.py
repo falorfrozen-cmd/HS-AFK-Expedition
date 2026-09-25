@@ -622,6 +622,25 @@ class ShipmentTests(TownFolder):
         self.assertEqual((st['camp']['stock'], st['town']['sending']), ({'13:1': 2}, None))
         transfer.assert_called_once()
 
+    def test_the_town_page_shows_a_shipment_under_way_and_an_empty_stock_can_finish_it(self):
+        self.edit(lambda st: st['camp']['stock'].update({'13:1': 3}))
+        silent = FakeGame(self.d)
+        silent.send = lambda line, timeout=30: silent.commands.append(line) or None   # the game does not answer in time
+        with patch.object(afk, 'Ipc', silent):
+            with self.assertRaisesRegex(ValueError, 'did not answer in time'):
+                self.app.action('stock_send', dict(items={'13:1': 3}))
+        self.assertEqual(self.state()['camp']['stock'].get('13:1', 0), 0, 'every unit went into the shipment')
+        view = self.app.town_view()['sending']
+        self.assertEqual((view['stage'], [(i['key'], i['count']) for i in view['items']]), ('waiting', [('13:1', 3)]))
+        self.assertNotIn('plan', view, 'no local paths on a page')
+        with patch.object(self.app, 'transfer_worker_haul') as transfer:
+            self.act('stock_send')                          # no new goods: the shipment under way is finished
+        self.assertIsNone(self.state()['town']['sending'])
+        self.assertIsNone(self.app.town_view()['sending'])
+        transfer.assert_called_once()
+        with self.assertRaisesRegex(ValueError, 'Choose the goods'):
+            self.act('stock_send')                          # nothing under way and nothing asked for
+
     def test_a_shipment_the_game_refused_gives_the_goods_back(self):
         self.edit(lambda st: st['camp']['stock'].update({'13:1': 5}))
         refusing = FakeGame(self.d)
@@ -646,6 +665,7 @@ class ShipmentTests(TownFolder):
         with patch.object(afk, 'Ipc', stopping):
             with self.assertRaisesRegex(ValueError, 'stopped part way.*Close it as partial'):
                 self.app.action('stock_send', dict(items={'13:1': 3, '15:2': 4}))
+        self.assertEqual(self.app.town_view()['sending']['stage'], 'stopped')
         with patch.object(self.app, 'transfer_worker_haul') as transfer:
             done = self.act('stock_close_partial')
         self.assertEqual((done['made'], done['back']), ({'13:1': 2}, {'13:1': 1, '15:2': 4}))
