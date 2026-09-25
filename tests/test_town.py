@@ -6,6 +6,7 @@ Editor, Task Scheduler or the player's data.
 import json, sys, tempfile, unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 import os
 os.environ['AFK_NOTIFY_DISABLED'] = '1'   # tests never schedule real Windows tasks or toasts
@@ -226,7 +227,7 @@ class FortificationTests(TownFolder):
 
 class SiegeTests(TownFolder):
     def start(self, heroes=(), level=3, hours=0.5, stone=100, **levels):
-        self.fund(gold=0, stone=1_000, walls=2, hq=2, workshop=1, **levels)
+        self.fund(gold=0, stone=1_000, **dict(dict(walls=2, hq=2, workshop=1), **levels))
         self.edit(lambda st: st['town']['towers'].update(t1=dict(id='t1', kind='ballista', level=3, place='keep', priority=None, perk=None)))
         return self.act('defense_start', room=ROOM, level=level, hours=hours, heroes=list(heroes), stone=stone)
 
@@ -294,6 +295,38 @@ class SiegeTests(TownFolder):
         self.assertTrue(all(p['hash'] in own for p in claim['packets']), "a hero replays only its own calibration's packets")
         self.assertTrue(all(p['exp'] > 0 for p in claim['packets']))
         self.assertEqual(claim['defense_claim']['level'], 6)
+
+    def test_a_hero_with_nothing_to_claim_is_simply_freed(self):
+        self.start(heroes=[dict(slot=1, stance='north')], level=2)
+        record = self.age(40)
+        path = Path(self.state()['town']['siege']['path'])
+        record = json.loads(path.read_text(encoding='utf-8'))
+        for row in record['timeline']:
+            row['drops'] = {k: v for k, v in row['drops'].items() if not k.startswith('hero:')}   # the hero slew nothing
+        afk.write_json(path, record)
+        armed = list(afk.load_state(self.d / 'state.json')['expeditions'].values())[0]
+        args = SimpleNamespace(expedition=armed['expedition_id'], dry_run=False, speed='normal', filtered='keep', no_ingest=True,
+                               anywhere=False, forgepact_ignore=False, game_bin=str(self.d))
+        with patch.object(afk, 'run_plan', side_effect=AssertionError('nothing to replay')):
+            afk.cmd_claim(args)
+        st = afk.load_state(self.d / 'state.json')
+        self.assertEqual(st['expeditions'], {}, 'the hero is free again')
+        self.assertEqual(st['last_claim']['expedition_id'], armed['expedition_id'] + '_claim')
+
+    def test_two_heroes_take_their_posts_in_one_write(self):
+        second = dict(HERO, slot=3, name='Kara', **{'class': 3})
+        prof = dict(hero_profile(), character=second, profile_id='p2')
+        afk.write_json(self.d / 'profiles' / f'{ROOM}--p2.json', prof)
+        self.app.refresh_profiles()
+        self.start(heroes=[dict(slot=1), dict(slot=3, stance='west')], hq=4)
+        armed = sorted(afk.load_state(self.d / 'state.json')['expeditions'].values(), key=lambda a: a['expedition_id'])
+        self.assertEqual([a['hero'] for a in armed], [afk.hero_key(HERO), afk.hero_key(second)])
+        record = json.loads(Path(self.state()['town']['siege']['path']).read_text(encoding='utf-8'))
+        self.assertEqual([(h['slot'], h['stance'], h['shooter']['class_name']) for h in record['heroes']],
+                         [(1, 'roam', 'Viking'), (3, 'west', 'Marksman')])
+        self.edit(lambda s: s['town'].update(siege=None))
+        with self.assertRaisesRegex(ValueError, 'has 2 hero posts'):
+            self.act('defense_start', room=ROOM, level=1, hours=0.25, heroes=[dict(slot=1), dict(slot=3), dict(slot=4)], stone=0)
 
     def test_the_towns_share_is_collected_once_in_the_region(self):
         self.start(level=4)
@@ -450,7 +483,29 @@ class MonitorSafetyTests(TownFolder):
         self.assertNotEqual((self.d / 'workers.json').read_bytes(), before, 'between actions the rolled candidates are kept')
 
 
+class RackTests(TownFolder):
+    def test_basic_keys_bought_from_a_merchant_hang_on_the_key_rack(self):
+        self.fund(gold=100_000, market=1)
+        ident = f"keymaster@{merchants.watch_of(datetime.now(timezone.utc))}"
+        visit = dict(id=ident, merchant='keymaster', name='Keymaster Brann', text='', arrives_at='2026-09-25T00:00:00Z',
+                     leaves_at='2099-01-01T00:00:00Z', offers=[dict(key='12:0', side='sell', qty=10, price=1_000.0)])
+        with patch.object(merchants, 'find', return_value=visit):
+            self.act('market_buy', visit=ident, good='12:0', count=4)
+        st = self.state()
+        self.assertEqual((st['camp']['keys'].get('0'), st['camp']['stock'].get('12:0')), (4, None))
+
+
 class ShipmentTests(TownFolder):
+    def test_a_shipment_the_game_made_nothing_of_gives_the_goods_back(self):
+        self.edit(lambda st: st['camp']['stock'].update({'13:1': 5}))
+        silent = FakeGame(self.d)
+        silent.send = lambda line, timeout=30: silent.commands.append(line) or None   # the game never answers
+        with patch.object(afk, 'Ipc', silent):
+            with self.assertRaisesRegex(ValueError, 'made nothing.*back in the stock'):
+                self.app.action('stock_send', dict(items={'13:1': 3}))
+        st = self.state()
+        self.assertEqual((st['camp']['stock'], st['town']['sending']), ({'13:1': 5}, None))
+
     def test_goods_reach_the_vault_as_items_the_game_makes(self):
         self.edit(lambda st: st['camp']['stock'].update({'15:17': 3, '14:64': 2}))
         with patch.object(self.app, 'transfer_worker_haul') as transfer:
