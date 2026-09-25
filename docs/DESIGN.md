@@ -1,4 +1,4 @@
-# AFK FARM 0.7.0 — measured-kill product
+# AFK FARM 0.9.0 — measured-kill product
 
 The earlier combat-reconstruction project is archived outside the active tree.
 The product uses empirical kills per region-second and native reward replay.
@@ -316,3 +316,108 @@ own target and delivery; synergies and auras are multipliers, nothing more.
 Chest openings were also taken out of expedition and Siege plans (0.7.x): they
 had scaled like breakables and opened rare Abyss chests and locked chests
 without keys.
+
+## 0.9: the town (defense, trade, merchants)
+
+The camp becomes a town with three systems. Each is AFK FARM's own layer, and
+each touches the game only where the earlier versions already did.
+
+### Town defense
+
+A siege brings the monsters of one region against the town, for 15 minutes to
+8 hours. A wave comes every 5 minutes, from one to four sides. The town answers
+with:
+- its walls, keep and towers (`fortifications.py`, `town.py`);
+- up to three stationed heroes.
+
+`battle.py` resolves each wave in one-second steps.
+- Monster groups walk in, stop at the wall or at their reach, fly over it, dig
+  under it or blink past it, and hit the wall, then the keep once it is breached.
+- Towers and heroes pick targets by priority and reach.
+- Shields, resistances, slows, regeneration and the affixes' behaviours apply.
+- The walls carry their damage from wave to wave. The masons and the siege's
+  stone budget mend them in between.
+- A siege is drawn once, from a stored seed, and each wave has its own seed. So
+  a repair or a retreat between waves re-draws only the waves still to come, and
+  a page never shows a wave before its time.
+
+**The monsters are the player's.** The bestiary (`bestiary.py`) is built from
+recorded kill packets of the running build, region by region: every monster the
+player killed while AFK FARM recorded.
+- **What each group is.** A group is one packet: that monster's real name and
+  rank, movement speed, range, fire, cold and poison immunities, and elite
+  affixes (the game's affix list, named from ForgePact's live checks).
+- **Special content.** The monsters that special content spawned carry
+  `specialType`. The Abyss chest's pack (9, 10), the Unholy Siege's (4) and a
+  Chaos Pillar's pack (1, likely) come as special waves in their own region.
+- **Loot.** Each kill is paid out by replaying that very packet. A Fallen Angel
+  Legion's replays can therefore drop Angelic Keys, like the real one.
+- **Rank names.** The game's kill counters (Common, Champion, Ancient, Legion)
+  add up to the total in rank order 1-4 on the busiest save. That is how ranks 3
+  and 4 are named, though not yet checked on screen.
+- **Health and damage by rank** are the measured medians of recorded pairs of the
+  same monster in the same room: health ×1.84 / 2.98 / 4.23 and damage
+  ×1.27 / 1.53 / 1.90 for ranks 2 / 3 / 4.
+- **Tiers above Legion** are AFK FARM's: Ascended from level 15, Primordial from
+  30, and the Warlord of the 25th and last waves. Each drop is one more replay of
+  the same Legion packet.
+
+**The heroes' power is measured.** A stationed hero clears, per second:
+the kills per minute of its own calibration in that region × the health of the
+ranks it killed there.
+- Its class sets the rest (AFK FARM's layer): damage type, reach, targets, hitting
+  flyers, and how much wall damage a melee hero holds off.
+- A hero needs a usable calibration in the siege's region. Headquarters sets
+  how many heroes can be stationed (0, 1, 1, 2, 3).
+
+**Rewards go through the existing claim paths:**
+- **Heroes.** Each hero is armed as an expedition with `mode: 'defense'`. When the
+  siege is over, its normal claim replays its kills with XP (`claim_plan_for` →
+  `defense.claim_from_plan`). The packets come from its own calibration, which
+  carries its native XP. A monster it met under another packet maps onto its own
+  packets of that monster and rank, split by weight.
+- **The town.** Every other kill is the town's share: a `worker_defense_*` replay
+  plan with no XP, collected with `afk.py worker-replay` by any offline hero
+  standing in the region, like an adventurer's haul.
+- **Magic Find:** +2% per level on the heroes' claims.
+- **When the siege ends:** its spoils (1 per 20 kills) and the unused stone come
+  back once, and so does the walls' damage.
+
+**Balance** (measured with `suggest_level` on the recorded Act 2-5, 3-3 and 6-1
+bestiaries). The level a town usually holds for 12 waves:
+
+| Town | Level held |
+| --- | --- |
+| One level-1 ballista | about 6 |
+| Two level-2 towers | about 14 |
+| Six level-5 towers | about 29 |
+| Ten level-10 towers on fully plated level-5 walls | about 52-55 |
+| A hero with 780 kills a minute, alone | about 22-26 |
+
+### Merchants, trade and the coffer
+
+- **The coffer.** The town keeps its own gold. Gold moves between it and the game
+  only through receipts:
+  - a deposit is the purchase path (`deposit`);
+  - a payout is `afk worker credit` (plugin 0.9.0-town), which mirrors a payment:
+    sale mode, cap check, exact rise, save, and a take-back if the save fails.
+  - A payout's amount leaves the coffer when it is asked for. A refusal puts it
+    back. A refusal after which the hero's gold rose anyway stays out, marked
+    `review`, so nothing is ever paid twice.
+- **The stock.** It holds every town good (`goods.py`, 226 stackable kinds; the
+  plugin's `TownGoods.hpp` is generated from it). Goods come in from the Vault
+  through the Item Editor's afk-take. They leave for the Vault only as stacks the
+  game makes: a `worker_town_*` delivery through `LootGroundCreate`.
+- **Markets.** Every market is `economy.py`'s stock model:
+  - price = value × (target / stock)^0.5;
+  - a trade is the integral over the units, so splitting an order never pays;
+  - margin and tariff on both sides, so a round trip always loses;
+  - stocks relax to their target with an 18-hour half-life.
+- **Merchants** (`merchants.py`) arrive by six-hour watches at the Market Square.
+  Who comes, when, for how long and with what is drawn from the camp's founding
+  time and the watch.
+- **Trade** (`trade.py`). Wagons from the Trading Post sell cargo and buy orders at
+  ten towns. Each town has its taste, development (it grows with prosperity), your
+  standing (tariffs fall) and daily news.
+- **Pages never write.** Settling (builds, wagons, a finished siege) happens in
+  memory for a page and is persisted by actions and the monitor, between actions.

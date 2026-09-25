@@ -1,4 +1,4 @@
-# AFK FARM 0.7.0 beta
+# AFK FARM 0.9.0 beta
 
 Timed offline expeditions using your hero's measured farming pace and the game's
 native reward system. Windows only. The interface is entirely in English.
@@ -378,3 +378,91 @@ work, everyone earns 10% more experience, and some crews help each other:
 Goblin Patrol (miner and goblin hunter), Treasure Trail (adventurer and goblin
 hunter), On-site Cutting (miner and jeweler), Deep Vein (adventurer and miner),
 and all four trades together (Full Caravan).
+
+## The town (0.9)
+
+Your camp grows into a town: walls and towers, sieges that bring the monsters you
+fought against it, travelling merchants, and wagons that trade with ten other
+towns. Everything the town earns becomes real game items or gold, made by the game
+itself.
+
+### The coffer and the stock
+
+The town keeps its own gold, the **coffer**. Towers, merchants and wagons pay
+from it and earn into it, so the town keeps working while the game is closed.
+Moving gold between the coffer and the game needs the game open with an offline
+hero loaded:
+- **Deposit** takes gold from that hero into the coffer.
+- **Collect gold** pays it out to that hero.
+
+Every transfer has one receipt, and nothing is ever paid twice.
+
+The **stock** holds the town's goods: ores, jewelcrafting materials, dusts,
+Satanic Crystals, Destiny Shards, keys, shards, tarot cards, runes, gems, jewels
+and orbs.
+- **In:** take them from the Vault with the Item Editor (2.16.1) open.
+- **Out:** send them to the Vault. The game makes each stack, like a worker's
+  haul.
+
+### Walls and towers
+
+- **Walls.** The Walls building sets each side's wall and how many towers you can
+  build. **Plate** a side with ore (Copper, Iron, Gold, Jade, then Tarethium) for
+  more health and armor.
+- **Towers.** The Siege Workshop builds them. Place each at a wall or at the keep,
+  which covers every side, farther back. Each kind has a job:
+  - **Ballista:** tough single targets.
+  - **Mortar:** packs far away.
+  - **Fire Brazier:** packs at the wall.
+  - **Frost Spire:** slows the enemy.
+  - **Storm Coil:** chain lightning, and it hits flyers.
+  - **Plague Totem:** poison.
+  - **Sky Harpoon:** flyers only.
+  - **Arcane Obelisk:** holy fire no monster resists; it breaks shields.
+- **Levels and costs.** Levels 1-10 raise the damage. At level 5 a tower picks one
+  of two specialisations. They cost gold from the coffer, camp resources, and ores
+  and stones of their element from the stock.
+
+### Sieges
+
+1. **Start one.** Pick a region, a level and a length. You can only pick regions
+   where AFK FARM recorded monsters. Station heroes if Headquarters allows, and
+   set a stone budget for repairs.
+2. **The waves.** A wave comes every 5 minutes, from more sides at higher levels.
+   Special waves:
+   - every 5th: elite;
+   - every 7th: the region's special monsters (the Abyss chest's pack, the Unholy
+     Siege, Chaos Pillars), if you recorded them there;
+   - every 10th: loot goblins that try to slip past;
+   - the 25th and the last: a Warlord.
+3. **The monsters** are the ones you killed, with their real affixes and
+   immunities. A fire-immune monster laughs at your Fire Brazier. Above Legion
+   come Ascended and Primordial monsters, with more affixes and several drops
+   each.
+4. **During the siege.** Between waves you can repair with stone, or sound the
+   retreat.
+5. **When it ends:**
+   - each stationed hero claims its own kills like an expedition (items, XP,
+     gold), standing in that region;
+   - the town's share (every other kill) is collected by any offline hero there,
+     with no XP.
+
+The Watchtower scouts the next wave. Use **Suggest level** to see how high your
+town usually holds.
+
+### Merchants
+
+The Market Square draws a travelling merchant now and then. Each stays a few hours
+and sells what the game's vendors never do: Angelic and dungeon keys, runes, tarot
+cards, Satanic Crystals, jewels and orbs. Each also buys certain goods, often above
+a town's price. Every unit you buy raises the next one's price.
+
+### Trade wagons
+
+The Trading Post sends wagons to ten towns, from a fishing village to the royal
+capital. Each town makes some goods cheaply and pays well for others. Its prices
+move as you trade and recover by the hour. It has news some days, and trading
+there raises your standing (lower tariffs) and grows the town (more goods).
+
+A wagon sells the goods you load, buys what you order with its purse and the
+takings, and brings everything home.
