@@ -136,6 +136,9 @@ From a source checkout, run `py -3 -B tools/panel.py` with Python 3.13 (stdlib o
 `py -3 -B tools/build_release.py` creates the portable package using local Python 3.13.
 Run `py -3 -B -m unittest discover -s tests -p "test_*.py"` and
 `tests/build_and_run.bat` for regression checks.
+`tools/game_session.py` (and the panel through it) needs the Python `hs-game-sdk`.
+Set `HS_GAME_SDK` to a checkout, or keep one beside this repository as the hub does;
+see [test sessions](docs/TEST_SESSIONS.md).
 Frontend state regressions use `node --test tests/test_panel_ui.cjs` (Node is a
 development test tool only, not a product dependency). The isolated manual browser
 fixture is `py -3 -B tests/serve_panel_fixture.py`; it serves port 9567 and writes

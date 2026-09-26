@@ -80,6 +80,7 @@ Browser-check desktop and narrow layouts and the real states (empty, stale, offl
 Live startup, close and normal Act/town travel are authorized by the user for testing;
 use game_session through the single IPC channel, without taking mouse/keyboard control.
 Close test games normally afterward. Do not change gear/skills to simplify tests.
+Judge a close by its reported exit code (`clean_exit`), never by a missing crash dump.
 A successful teleport does not prove that an activity was cleared or unlocked.
 Keep a report that distinguishes tested paths from untested real reward delivery.
 
