@@ -725,11 +725,16 @@ static std::string CaptureKill(const RValue& inst, const std::vector<RValue>& ar
     return hash;
 }
 
-namespace DefenseLab { static void OnDropItem(CInstance* self, int argc, RValue** args); }   // research R2 (DefenseLab.inl)
+namespace DefenseLab {   // research R2 (DefenseLab.inl)
+static bool OnDropItem(CInstance* self, int argc, RValue** args);
+static void EndDrop();
+static void OnCreateItem();
+}
 static RValue& Hook_DropItem(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
     ++g_DropItemCalls;
-    DefenseLab::OnDropItem(S, argc, A);
+    if (DefenseLab::OnDropItem(S, argc, A)) return R;   // the lab already dropped for this tower kill
+    struct LabDropScope { ~LabDropScope() { DefenseLab::EndDrop(); } } labDropScope;
     if (g_ReplayActive.load()) {
         // our own replay call: context was set by the caller
         if (g_OrigDropItem) return g_OrigDropItem(S, O, R, argc, A);
@@ -822,6 +827,7 @@ static RValue& Hook_CreateItemNew(CInstance* S, CInstance* O, RValue& R, int arg
 {
     RValue* r = &R;
     if (g_OrigCreateItemNew) r = &g_OrigCreateItemNew(S, O, R, argc, A);
+    DefenseLab::OnCreateItem();
     if (g_CtxKind != "none") {
         try {
             const RValue& it = *r;

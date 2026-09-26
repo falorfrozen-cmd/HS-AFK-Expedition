@@ -16,7 +16,7 @@
 //   def var <index> <variable>
 //   def set <index|all> <variable> <number|'text|true|false>
 //   def hit <index|all> <amount|pct%>
-//   def tower start <pct-of-max-hp> [range=350] [period=30] [xp=1] [fx=1] | tower stop
+//   def tower start <pct-of-max-hp> [range=350] [period=30] [xp=1] [fx=1] [drop=1] | tower stop
 //   def gate <radius> | gate off        (a monster that reaches it has broken through)
 //   def stats                           (deaths, drops and experience by who killed)
 //   def perf start | show | stop
@@ -26,12 +26,14 @@
 // (commands, the frame callback and the DropItem hook all run there).
 namespace DefenseLab {
 
-struct Spawned { RValue id; std::string object; int rank; bool tower = false; bool breached = false; };
+struct Spawned { RValue id; std::string object; int rank; bool tower = false; bool breached = false; uint64_t born = 0; };
+static uint64_t g_Frame = 0;                 // frames since the plugin loaded (the lab's own clock)
+static const uint64_t TOWER_MIN_AGE = 60;    // frames: the game builds the drop table a few frames after creation
 static std::vector<Spawned> g_Monsters;
 static uint64_t g_DropsAtFirstSpawn = 0;
 
 struct TowerState {
-    bool on = false; double pct = 0; double range = 350; int period = 30; int frame = 0; bool xp = true; bool fx = true;
+    bool on = false; double pct = 0; double range = 350; int period = 30; int frame = 0; bool xp = true; bool fx = true; bool drop = true;
     double ax = 0, ay = 0; int hits = 0; int kills = 0; int failed = 0; int zeroSkipped = 0;
 };
 static TowerState g_Tower;
@@ -40,12 +42,14 @@ struct GateState { bool on = false; double radius = 0; double ax = 0, ay = 0; };
 static GateState g_Gate;
 
 struct Stats {
-    uint64_t towerDrops = 0, otherDrops = 0;
+    uint64_t towerDrops = 0, otherDrops = 0, suppressed = 0, towerItems = 0, otherItems = 0, allItems = 0;
     std::string towerArgs, otherArgs;
     int xpCalls = 0, xpFailed = 0; double xpSum = 0;
     int breaches = 0, fxMade = 0, fxFailed = 0;
 };
 static Stats g_Stats;
+static bool g_LabDropping = false;   // the lab's own DropItem call for a tower kill is under way
+static int g_DropContext = 0;        // while a DropItem runs: 1 = a tower kill, 2 = another kill of ours
 
 struct PerfState { bool on = false; std::vector<double> ms; std::chrono::steady_clock::time_point last{}; bool primed = false; };
 static PerfState g_Perf;
@@ -192,7 +196,7 @@ static void Spawn(const std::vector<std::string>& t)
             }
         } catch (...) {}
         if (!ApplyAffixes(id, affixes)) ++affixFailed;
-        g_Monsters.push_back({ id, t[0], (int)rank });
+        g_Monsters.push_back({ id, t[0], (int)rank, false, false, g_Frame });
         ++made;
     }
     std::string affixText;
@@ -278,6 +282,28 @@ static void CreditExperience(const Spawned& m)
     } catch (...) { ++g_Stats.xpFailed; }
 }
 
+// The tower's own drop for a kill: the game's DropItem on the live monster, as
+// a hero kill calls it. MEASURED 2026-09-26 (R2b): a hero kill passes
+// (rank, 0, x, y, 1, extraMagicFind, dropTable, exclusiveDrops, 0, 0, 0, true);
+// SyntheticDropArgs builds the first eleven, the last one says "the player
+// killed it". The death's own roll is suppressed afterwards (OnDropItem).
+static bool TowerDrop(const Spawned& m)
+{
+    RValue pid; double px, py;
+    if (!PlayerAt(pid, px, py)) return false;
+    CInstance* self = ResolveInstance(m.id);
+    CInstance* player = ResolveInstance(pid);
+    if (!self || !player) return false;
+    std::vector<RValue> args = SyntheticDropArgs(m.id);
+    args[11] = RValue(true);
+    g_LabDropping = true;
+    bool ok = false;
+    try { RValue res; ok = AurieSuccess(g_Yytk->CallGameScriptEx(res, "gml_Script_DropItem", self, player, args)); } catch (...) { ok = false; }
+    g_LabDropping = false;
+    try { g_Yytk->CallBuiltin("variable_instance_set", { m.id, RValue("afkLabDropped"), RValue(1.0) }); } catch (...) {}
+    return ok;
+}
+
 // A built-in spark where the tower hits (visual only; the real towers will use
 // the game's projectile sprites).
 static void Effect(double x, double y, double depth)
@@ -290,7 +316,7 @@ static void Effect(double x, double y, double depth)
 
 // One hit: pct of max health, or a flat amount. A killing hit credits the
 // monster's experience first (optional) and marks the monster as a tower kill.
-static bool Hit(Spawned& m, double amount, bool pct, bool creditXp, bool& killed)
+static bool Hit(Spawned& m, double amount, bool pct, bool creditXp, bool dropLoot, bool& killed)
 {
     RValue hHp, hMax; double hp = 0, mx = 0;
     if (!ProtectedNumber(m.id, "enemy_hp", hHp, hp)) return false;
@@ -301,6 +327,7 @@ static bool Hit(Spawned& m, double amount, bool pct, bool creditXp, bool& killed
     if (killed) {
         m.tower = true;
         try { g_Yytk->CallBuiltin("variable_instance_set", { m.id, RValue("afkLabTower"), RValue(1.0) }); } catch (...) {}
+        if (dropLoot) TowerDrop(m);
         if (creditXp) CreditExperience(m);
     }
     return SetProtected(hHp, next);
@@ -319,7 +346,7 @@ static void HitCommand(const std::vector<std::string>& t)
         if (t[0] != "all" && t[0] != std::to_string(i)) continue;
         if (!Alive(g_Monsters[i].id)) continue;
         bool k = false;
-        if (Hit(g_Monsters[i], amount, pct, true, k)) { ++hits; if (k) ++killed; } else ++failed;
+        if (Hit(g_Monsters[i], amount, pct, true, true, k)) { ++hits; if (k) ++killed; } else ++failed;
     }
     Out("def hit: " + std::to_string(hits) + " hit, " + std::to_string(killed) + " brought to zero, " + std::to_string(failed) + " failed");
 }
@@ -339,8 +366,10 @@ static void TowerCommand(const std::vector<std::string>& t)
     g_Tower.on = true; g_Tower.pct = pct; g_Tower.range = range; g_Tower.period = period < 1 ? 1 : (int)period; g_Tower.ax = px; g_Tower.ay = py;
     if (Option(t, "xp", opt)) g_Tower.xp = opt != "0";
     if (Option(t, "fx", opt)) g_Tower.fx = opt != "0";
+    if (Option(t, "drop", opt)) g_Tower.drop = opt != "0";
     Out("def tower: on at " + Fixed(px) + "," + Fixed(py) + ", " + Fixed(pct, 1) + "% of max health every " + std::to_string(g_Tower.period)
-        + " frames, range " + Fixed(range) + ", experience " + (g_Tower.xp ? "credited" : "off") + ", sparks " + (g_Tower.fx ? "on" : "off"));
+        + " frames, range " + Fixed(range) + ", experience " + (g_Tower.xp ? "credited" : "off") + ", sparks " + (g_Tower.fx ? "on" : "off")
+        + ", loot " + (g_Tower.drop ? "dropped as a hero kill" : "left to the death"));
 }
 
 static void TowerTick()
@@ -349,7 +378,7 @@ static void TowerTick()
     g_Tower.frame = 0;
     Spawned* best = nullptr; double bestDistance = 1e18, bx = 0, by = 0;
     for (auto& m : g_Monsters) {
-        if (m.tower || m.breached || !Alive(m.id)) continue;
+        if (m.tower || m.breached || g_Frame - m.born < TOWER_MIN_AGE || !Alive(m.id)) continue;
         const double x = GetVarNumber(m.id, "x", NAN), y = GetVarNumber(m.id, "y", NAN);
         const double d = std::hypot(x - g_Tower.ax, y - g_Tower.ay);
         if (!std::isfinite(d) || d > g_Tower.range || d >= bestDistance) continue;
@@ -359,7 +388,7 @@ static void TowerTick()
     }
     if (!best) return;
     bool killed = false;
-    if (Hit(*best, g_Tower.pct, true, g_Tower.xp, killed)) {
+    if (Hit(*best, g_Tower.pct, true, g_Tower.xp, g_Tower.drop, killed)) {
         ++g_Tower.hits; if (killed) ++g_Tower.kills;
         if (g_Tower.fx) Effect(bx, by, GetVarNumber(best->id, "depth", 0.0) - 1);
     } else ++g_Tower.failed;
@@ -397,28 +426,48 @@ static void StatsCommand()
     }
     auto rate = [](uint64_t drops, int deaths) { return deaths > 0 ? Fixed(100.0 * (double)drops / deaths, 1) + "%" : std::string("-"); };
     Out("def stats: tracked " + std::to_string(g_Monsters.size()) + ", alive " + std::to_string(alive) + ", breached " + std::to_string(breached));
-    Out("  tower kills: " + std::to_string(towerDead) + " deaths, " + std::to_string(g_Stats.towerDrops) + " DropItem calls (" + rate(g_Stats.towerDrops, towerDead) + ")"
+    auto per = [](uint64_t items, int deaths) { return deaths > 0 ? Fixed((double)items / deaths, 2) : std::string("-"); };
+    Out("  tower kills: " + std::to_string(towerDead) + " deaths, " + std::to_string(g_Stats.towerDrops) + " DropItem calls (" + rate(g_Stats.towerDrops, towerDead) + "), "
+        + std::to_string(g_Stats.towerItems) + " items (" + per(g_Stats.towerItems, towerDead) + " a kill), " + std::to_string(g_Stats.suppressed) + " death rolls suppressed"
         + "; experience credited " + std::to_string(g_Stats.xpCalls) + " times, sum " + Fixed(g_Stats.xpSum) + ", failed " + std::to_string(g_Stats.xpFailed));
-    Out("  other kills (the hero): " + std::to_string(otherDead) + " deaths, " + std::to_string(g_Stats.otherDrops) + " DropItem calls (" + rate(g_Stats.otherDrops, otherDead) + ")");
+    Out("  other kills (the hero): " + std::to_string(otherDead) + " deaths, " + std::to_string(g_Stats.otherDrops) + " DropItem calls (" + rate(g_Stats.otherDrops, otherDead) + "), "
+        + std::to_string(g_Stats.otherItems) + " items (" + per(g_Stats.otherItems, otherDead) + " a kill)");
     Out("  first tower drop args: " + (g_Stats.towerArgs.empty() ? std::string("-") : g_Stats.towerArgs));
     Out("  first hero drop args:  " + (g_Stats.otherArgs.empty() ? std::string("-") : g_Stats.otherArgs));
+    Out("  items the game created while the lab ran (any cause, the loot filter's hidden ones included): " + std::to_string(g_Stats.allItems));
     Out("  sparks made " + std::to_string(g_Stats.fxMade) + ", failed " + std::to_string(g_Stats.fxFailed));
 }
 
 // Called from the DropItem hook for every drop call: counts the lab's own
 // monsters by who killed them, and keeps the first call's arguments of each.
-static void OnDropItem(CInstance* self, int argc, RValue** args)
+// Returns true when the call must not run: the death's own roll for a monster
+// the tower already dropped for.
+static bool OnDropItem(CInstance* self, int argc, RValue** args)
 {
-    if (g_Monsters.empty() || !self) return;
+    g_DropContext = 0;
+    if (g_Monsters.empty() || !self) return false;
     try {
         const RValue me = self->ToRValue();
-        if (!IsNumberKind(GetVar(me, "afkLab"))) return;
+        if (!IsNumberKind(GetVar(me, "afkLab"))) return false;
         const bool tower = IsNumberKind(GetVar(me, "afkLabTower"));
+        if (tower && !g_LabDropping && IsNumberKind(GetVar(me, "afkLabDropped"))) { ++g_Stats.suppressed; return true; }
+        g_DropContext = tower ? 1 : 2;
         (tower ? g_Stats.towerDrops : g_Stats.otherDrops)++;
         std::string& sample = tower ? g_Stats.towerArgs : g_Stats.otherArgs;
         if (sample.empty())
             for (int i = 0; i < argc && i < 12; ++i) sample += (i ? " | " : "") + (args && args[i] ? Stringify(*args[i]).substr(0, 28) : std::string("?"));
     } catch (...) {}
+    return false;
+}
+
+static void EndDrop() { g_DropContext = 0; }
+
+// CreateItemNew runs inside DropItem for each item the drop makes.
+static void OnCreateItem()
+{
+    if (!g_Monsters.empty()) ++g_Stats.allItems;
+    if (g_DropContext == 1) ++g_Stats.towerItems;
+    else if (g_DropContext == 2) ++g_Stats.otherItems;
 }
 
 static void PerfTick()
@@ -485,6 +534,7 @@ static void Command(const std::string& verb, const std::string& first, std::istr
 
 static void Frame()
 {
+    ++g_Frame;
     PerfTick();
     if (g_Tower.on) { try { TowerTick(); } catch (...) { ++g_Tower.failed; } }
     if (g_Gate.on) { try { GateTick(); } catch (...) {} }
