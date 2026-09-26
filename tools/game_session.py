@@ -18,7 +18,46 @@ import time
 import uuid
 
 ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT.parent/'hs-game-sdk/python'))
+SDK_ENV='HS_GAME_SDK'
+
+
+class SdkMissing(ImportError):pass
+
+
+def sdk_folder(environ=os.environ,root=ROOT):
+    """The folder that holds the hs_game_sdk package, or None to import an installed one.
+
+    HS_GAME_SDK (an hs-game-sdk checkout or its python folder) comes first, then the
+    hs-game-sdk checkout beside this repository (the hub layout and the release zip).
+    Without either, an installed package or PYTHONPATH has to provide hs_game_sdk.
+    """
+    configured=environ.get(SDK_ENV)
+    if configured:
+        base=Path(configured).resolve()
+        for folder in (base,base/'python'):
+            if (folder/'hs_game_sdk/__init__.py').is_file():return folder
+        raise SdkMissing(f'{SDK_ENV}={configured} holds no hs_game_sdk package; '
+                         'point it at an hs-game-sdk checkout or its python folder')
+    sibling=root.parent/'hs-game-sdk/python'
+    return sibling if (sibling/'hs_game_sdk/__init__.py').is_file() else None
+
+
+def load_sdk(environ=os.environ,root=ROOT):
+    folder=sdk_folder(environ,root)
+    if folder is not None and sys.path[:1]!=[str(folder)]:sys.path.insert(0,str(folder))
+    try:import hs_game_sdk
+    except ModuleNotFoundError as error:
+        if error.name!='hs_game_sdk':raise
+        raise SdkMissing(f'hs_game_sdk not found. Set {SDK_ENV} to an hs-game-sdk checkout (or its python folder), '
+                         f'keep the checkout beside this repository ({root.parent/"hs-game-sdk"}), '
+                         'or provide hs_game_sdk as an installed package or on PYTHONPATH') from None
+    return hs_game_sdk
+
+
+try:load_sdk()
+except SdkMissing as error:
+    if __name__=='__main__':raise SystemExit(str(error)) from None
+    raise
 from hs_game_sdk import GameObject, GameScript, GameRoom
 from afk import Ipc, DATA, CONFIG
 
@@ -143,6 +182,56 @@ def running(exe):
     return pids[0] if pids else None
 
 
+SW_SHOWMINNOACTIVE=7
+# A child inherits its parent's error mode. Git Bash runs with SEM_NOGPFAULTERRORBOX,
+# so a game started from it would crash (e.g. an exit-time abort) with no WER report
+# and no dump. The game gets the system default instead.
+CREATE_DEFAULT_ERROR_MODE=getattr(subprocess,'CREATE_DEFAULT_ERROR_MODE',0x04000000)
+
+
+def launch(command,cwd):
+    """Start a program minimized, without activation and with the default error mode."""
+    startup=subprocess.STARTUPINFO();startup.dwFlags|=subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow=SW_SHOWMINNOACTIVE  # Request a background launch.
+    return subprocess.Popen(command,cwd=cwd,startupinfo=startup,creationflags=CREATE_DEFAULT_ERROR_MODE)
+
+
+def close_window(pid,exe):
+    """Close the process normally through its main window; its exit code, or None if unreadable.
+
+    Never forces the process. .NET reads the exit code of a process it did not start
+    only through a handle opened before the exit, so the handle is taken first; without
+    it PowerShell yields null (never a made-up 0).
+    """
+    quoted="'"+str(exe).replace("'","''")+"'"
+    raw=powershell("$ErrorActionPreference='Stop'; "
+        f"$game=Get-Process -Id {int(pid)}; if($game.Path -ne {quoted}){{throw 'Process changed'}}; "
+        "$held=$null -ne $game.Handle; "
+        "if(-not $game.CloseMainWindow()){throw 'Normal close not accepted'}; "
+        "if(-not $game.WaitForExit(20000)){throw 'Normal close timed out; not forced'}; "
+        "$code=$null; if($held){$code=$game.ExitCode}; "
+        "ConvertTo-Json -Compress -InputObject @{exit_code=$code}")
+    try:code=json.loads(raw.splitlines()[-1])['exit_code']
+    except (IndexError,KeyError,TypeError,ValueError):return None
+    return code&0xFFFFFFFF if type(code) is int else None  # .NET reports a signed Int32.
+
+
+# NTSTATUS exit codes of a crashed process, named in close results and receipts.
+EXIT_STATUS={0xC0000005:'STATUS_ACCESS_VIOLATION',0xC00000FD:'STATUS_STACK_OVERFLOW',
+             0xC0000374:'STATUS_HEAP_CORRUPTION',
+             0xC0000409:'STATUS_STACK_BUFFER_OVERRUN: a fast fail, e.g. abort() in ucrtbase',
+             0xE06D7363:'unhandled C++ exception'}
+
+
+def exit_fields(code):
+    """A close result's exit code fields; a nonzero code is flagged, never hidden."""
+    if code is None:
+        return dict(exit_code=None,exit_code_hex=None,clean_exit=None,exit_status='exit code unavailable')
+    fields=dict(exit_code=code,exit_code_hex=f'0x{code:08X}',clean_exit=code==0)
+    if code:fields['exit_status']=EXIT_STATUS.get(code,'nonzero exit code')
+    return fields
+
+
 class Session:
     def __init__(self,bin_dir,data=DATA):
         self.bin=bin_dir.resolve();self.data=data
@@ -185,11 +274,9 @@ class Session:
         require(hashlib.sha256(self.exe.read_bytes()).hexdigest()==EXE_SHA256,'Executable changed; verify build before automatic setup')
         pid=running(self.exe)
         if pid is None:
-            startup=subprocess.STARTUPINFO();startup.dwFlags|=subprocess.STARTF_USESHOWWINDOW
-            startup.wShowWindow=7  # SW_SHOWMINNOACTIVE: request a background launch.
-            proc=subprocess.Popen([str(self.exe)],cwd=self.bin,startupinfo=startup)
+            proc=launch([str(self.exe)],self.bin)
             pid=proc.pid
-            self.events.append(dict(launched_pid=pid))
+            self.events.append(dict(launched_pid=pid,default_error_mode=True))
             deadline=time.monotonic()+min(timeout,60)
             while time.monotonic()<deadline:
                 require(proc.poll() is None,'Game exited during startup')
@@ -238,16 +325,12 @@ class Session:
 
     def close(self):
         pid=running(self.exe)
-        if pid is None:return dict(closed=True,already_closed=True)
+        if pid is None:return dict(closed=True,already_closed=True,exit_code=None)
         s=self.state(pid)
         require(s.get('replay_running') is False,'Active replay: close refused')
-        quoted="'"+str(self.exe).replace("'","''")+"'"
-        powershell("$ErrorActionPreference='Stop'; "
-            f"$game=Get-Process -Id {pid}; if($game.Path -ne {quoted}){{throw 'Process changed'}}; "
-            "if(-not $game.CloseMainWindow()){throw 'Normal close not accepted'}; "
-            "if(-not $game.WaitForExit(20000)){throw 'Normal close timed out; not forced'}")
+        code=close_window(pid,self.exe)
         require(running(self.exe) is None,'Game closure not confirmed')
-        return dict(closed=True,pid=pid,forced=False)
+        return dict(closed=True,pid=pid,forced=False,**exit_fields(code))
 
     def save_receipt(self,result):
         folder=self.data/'models/test-sessions';folder.mkdir(parents=True,exist_ok=True)
@@ -284,6 +367,9 @@ def main(argv=None):
             raise SessionError(f'{error}; diagnostics: {receipt}') from error
         receipt=session.save_receipt(result)
         print(json.dumps(dict(result=result,receipt=str(receipt)),ensure_ascii=True))
+        if result.get('clean_exit') is False:
+            # The close itself worked, so the command still succeeds; the crash is the finding.
+            print(f"warning: the game exited with {result['exit_code_hex']} ({result['exit_status']})",file=sys.stderr)
         return 0
     except (SessionError,OSError,ValueError) as error:
         print(str(error),file=sys.stderr);return 1

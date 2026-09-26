@@ -24,6 +24,13 @@ py -3 -B tools/game_session.py status
 py -3 -B tools/game_session.py close
 ```
 
+The helper needs the Python `hs_game_sdk` package. It looks in `HS_GAME_SDK` (an
+`hs-game-sdk` checkout or its `python` folder) first, then in the `hs-game-sdk`
+checkout beside this repository (the hub layout; the release zip ships the same
+folder), then in an installed package or `PYTHONPATH`. When none has it, the helper
+stops with one message naming these three ways. If `HS_GAME_SDK` is set but holds no
+package, the helper stops rather than trying the other places.
+
 The current test target defaults to Suh, saved slot **2** (zero-based), class 8.
 The game directory comes from the AFK config or `HS_GAME_BIN`; an explicit
 `--game-bin` overrides it. Other targets require all three identity fields:
@@ -32,13 +39,32 @@ The game directory comes from the AFK config or `HS_GAME_BIN`; an explicit
 py -3 -B tools/game_session.py prepare --slot 2 --name Suh --class-id 8
 ```
 
-The helper requests a minimized launch without activation. The game can still
-create its own windows; this is background control, not a headless game build.
+The helper requests a minimized launch without activation, and it gives the game
+the system's default error mode (`CREATE_DEFAULT_ERROR_MODE`). A child process
+otherwise inherits its parent's error mode. Git Bash runs with error mode 0x3,
+which includes `SEM_NOGPFAULTERRORBOX`, so a game started from it crashed without
+a WER report or a dump in `%LOCALAPPDATA%\CrashDumps`, even when the crash came at
+close. A game started some other way keeps the error mode its launcher gave it.
+The game can still create its own windows; this is background control, not a
+headless game build.
 When ready, `prepare` exits and leaves the game waiting in town. Calling it again
 checks the existing character and takes a fresh snapshot without repeating menu
-actions. `close` requests normal window closure and verifies process exit. It
-never force-terminates a process. After a test, close the game when it is no
-longer needed, as requested by the user.
+actions. `close` requests normal window closure, verifies process exit and
+reports the game's exit code. It never force-terminates a process. The result and
+the receipt carry these fields:
+
+- `exit_code`: the exit code, unsigned.
+- `exit_code_hex`: the same code in hex.
+- `clean_exit`: `true` for exit code 0.
+
+A nonzero code also gets an `exit_status` name and a warning on stderr. For example,
+`0xC0000409` (3221226505) is `STATUS_STACK_BUFFER_OVERRUN`: a fast fail, such as an
+exit-time `abort()`. The command still exits 0, because the close itself worked;
+the crash is a finding about the game or a mod. The exit code is `null` when the
+game was already closed. It is also `null` when Windows gave the helper no handle
+to the process; the helper never reports a guessed 0. Judge a close by its exit
+code, not by a missing dump. After a test, close the game when it is no longer
+needed, as requested by the user.
 
 `travel --room <SDK-room-name>` uses the existing `afk goto` command, which calls
 the game's `RoomGoto` with the controller instance. It requires an already
@@ -86,7 +112,8 @@ Commands use the existing single-writer AFK IPC channel. Do not run other IPC
 clients during preparation. A pending command is refused, not overwritten.
 Each action is sent at most once per invocation; an uncertain result stops or
 times out instead of repeatedly activating menu callbacks. Diagnostic receipts
-are saved under `models/test-sessions/` on success and failure.
+are saved under `models/test-sessions/` on success and failure. A close receipt
+keeps the exit code fields. A launch event records `default_error_mode`.
 
 ## Scope and verification
 
@@ -106,6 +133,10 @@ test without opening the game:
 ```powershell
 py -3 -B -m unittest discover -s tests -p test_game_session.py -v
 ```
+
+The launch and close tests start small `pythonw` stand-in processes, never the
+game. `tests/close_stand_in.py` is an off-screen window that exits with a chosen
+code when it is closed.
 
 Historical startup and cross-act travel receipts are in the external research
 archive under `verification/background-session-20260921` and
