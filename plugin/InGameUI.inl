@@ -22,6 +22,9 @@
 //   ui after on|off                  draw after the hooked event's own code instead of before
 //   ui sprites <name part> | ui fonts | ui font <font name>
 //   ui npc here [sprite] [dx] | ui npc off     default Guild_Master_NPC_spr, dx 140
+//   ui live <name part>              objects with live instances: count, first position, depth, sprite
+//   ui tex <sprite>                  the sprite's texture group, its load status, texture_is_ready
+//   ui mark <sprite> <dx> <dy> <depth> [prefetch] | ui marks off   layer-sprite markers around the hero
 // F6 toggles the window while the lab is enabled (any `ui` command enables it).
 //
 // Nothing runs until a `ui` command enables the lab. Drawing, input handling
@@ -302,6 +305,90 @@ static void NpcHere(const std::string& sprite, double dx)
         + "; layer depth " + Int(depth) + " (the hero's), element " + (exists ? "exists" : "MISSING"));
 }
 
+// `ui mark`: layer-sprite markers around the hero, each on its own layer.
+struct Mark { RValue layer, element; std::string room; };
+static std::vector<Mark> g_Marks;
+
+static void MarksOff()
+{
+    const std::string room = CurrentRoomName();
+    for (const Mark& m : g_Marks) if (m.room == room) { Call("layer_sprite_destroy", { m.element }); Call("layer_destroy", { m.layer }); }
+    g_Marks.clear();
+}
+
+static std::string SpriteName(const RValue& spr)
+{
+    if (!(Num("sprite_exists", { spr }) > 0.5)) return "-";
+    const RValue n = Get("sprite_get_name", { spr });
+    return n.m_Kind == VALUE_STRING ? n.ToString() : std::string("?");
+}
+
+static void TextureInfo(const std::string& sprite)
+{
+    const RValue spr = AssetIndexCached(sprite);
+    if (!(Num("sprite_exists", { spr }) > 0.5)) { Out("ui tex: no sprite named " + sprite); return; }
+    const double index = spr.ToDouble();
+    const RValue tex = Get("sprite_get_texture", { spr, RValue(0.0) });
+    std::string group = "(not found)", status = "?";
+    const RValue names = Get("texturegroup_get_names");
+    const int groups = names.m_Kind == VALUE_ARRAY ? (int)Num("array_length", { names }) : -1;
+    for (int g = 0; g < groups && group == "(not found)"; ++g) {
+        const RValue gname = Get("array_get", { names, RValue((double)g) });
+        if (gname.m_Kind != VALUE_STRING) continue;
+        const RValue sprites = Get("texturegroup_get_sprites", { gname });
+        const int n = sprites.m_Kind == VALUE_ARRAY ? (int)Num("array_length", { sprites }) : 0;
+        for (int i = 0; i < n; ++i) {
+            if (Get("array_get", { sprites, RValue((double)i) }).ToDouble() != index) continue;
+            group = gname.ToString();
+            status = Int(Num("texturegroup_get_status", { gname }));
+            break;
+        }
+    }
+    Out("ui tex " + sprite + " (index " + Int(index) + "): texture_is_ready " + Int(Num("texture_is_ready", { tex })) + ", texture group " + group
+        + " status " + status + " (0 unloaded, 1 loading, 2 loaded, 3 fetched), " + std::to_string(groups) + " groups");
+}
+
+static void MarkHere(const std::string& sprite, double dx, double dy, double depth, bool prefetch)
+{
+    RValue pid; double px = 0, py = 0;
+    if (!DefenseLab::PlayerAt(pid, px, py)) { Out("ui mark: no player in the room " + CurrentRoomName()); return; }
+    const RValue spr = AssetIndexCached(sprite);
+    if (!(Num("sprite_exists", { spr }) > 0.5)) { Out("ui mark: no sprite named " + sprite); return; }
+    const double pre = prefetch ? Num("sprite_prefetch", { spr }) : NAN;
+    Mark m;
+    m.layer = Get("layer_create", { RValue(depth) });
+    m.element = Get("layer_sprite_create", { m.layer, RValue(px + dx), RValue(py + dy), spr });
+    Call("layer_sprite_speed", { m.element, RValue(1.0) });
+    m.room = CurrentRoomName();
+    const bool ok = Num("layer_sprite_exists", { m.layer, m.element }) > 0.5;
+    g_Marks.push_back(m);
+    Out("ui mark " + std::to_string(g_Marks.size()) + ": " + sprite + " at hero" + (dx >= 0 ? "+" : "") + Int(dx) + "," + (dy >= 0 ? "+" : "") + Int(dy)
+        + " = " + Int(px + dx) + "," + Int(py + dy) + ", depth " + Int(depth) + (prefetch ? ", sprite_prefetch -> " + Int(pre) : "")
+        + ", element " + (ok ? "exists" : "MISSING"));
+}
+
+// `ui live`: objects with live instances whose name contains the part.
+static void LiveObjects(const std::string& part)
+{
+    const std::string want = Lower(part);
+    int misses = 0, shown = 0, total = 0;
+    for (int i = 0; i < 20000 && misses < 200; ++i) {
+        if (!(Num("object_exists", { RValue((double)i) }) > 0.5)) { ++misses; continue; }
+        misses = 0;
+        const double n = Num("instance_number", { RValue((double)i) });
+        if (!(n > 0)) continue;
+        const RValue nm = Get("object_get_name", { RValue((double)i) });
+        const std::string name = nm.m_Kind == VALUE_STRING ? nm.ToString() : std::string("?");
+        if (!want.empty() && Lower(name).find(want) == std::string::npos) continue;
+        ++total;
+        if (++shown > 70) continue;
+        const RValue id = Get("instance_find", { RValue((double)i), RValue(0.0) });
+        Out("  " + name + " x" + Int(n) + ": " + Int(GetVarNumber(id, "x", NAN)) + "," + Int(GetVarNumber(id, "y", NAN)) + " depth " + Int(GetVarNumber(id, "depth", NAN))
+            + " sprite " + SpriteName(GetVar(id, "sprite_index")) + " visible " + Int(GetVarNumber(id, "visible", NAN)));
+    }
+    Out("  " + std::to_string(total) + " objects with live instances match" + (total > 70 ? " (first 70 shown)" : ""));
+}
+
 // `ui selftest`: presses and keys posted to the game's own window, one step a
 // frame; the window message arrives on the next frame.
 static int g_Test = 0, g_TestWait = 0, g_TestClicks0 = 0, g_TestSwallowed0 = 0, g_TestToggles0 = 0;
@@ -552,6 +639,15 @@ static void Command(const std::string& verb, const std::string& first, std::istr
                 Out("ui font: no font named '" + first + "' (list them with: ui fonts)"); return;
             }
             g_Font = f; g_HasFont = true; g_FontName = first; Out("ui font: " + first); return;
+        }
+        if (verb == "live") { Out("ui live '" + first + "':"); LiveObjects(first); return; }
+        if (verb == "tex") { TextureInfo(first); return; }
+        if (verb == "marks") { MarksOff(); Out("ui marks: removed"); return; }
+        if (verb == "mark") {
+            std::string sdy, sdepth, sopt; rest >> sdy >> sdepth >> sopt;
+            double dx = 0, dy = 0, depth = -411;
+            try { dx = std::stod(second); dy = std::stod(sdy); depth = std::stod(sdepth); } catch (...) { Out("ui mark: usage -> ui mark <sprite> <dx> <dy> <depth> [prefetch]"); return; }
+            MarkHere(first, dx, dy, depth, sopt == "prefetch"); return;
         }
         if (verb == "npc") {
             if (first == "off") { NpcRemove(); Out("ui npc: removed"); return; }
